@@ -1158,6 +1158,8 @@ class SimWorker:
         ego_kind = str(getattr(cfg, "ego_kind", "policy") or "policy")
         if ego_kind in common.EGO_PLANNER_KINDS:
             need_rl = True                         # the ego itself drives the line
+        if ego_kind == "aurorus" or any(sl.driver.external == "aurorus" for sl in (slots or [])):
+            need_rl = True                         # an AuRoRus car follows the line too
         if skind == "teacher":
             need_rl = True                         # the teacher's space-time car channel reads the line's speed profile
 
@@ -1395,6 +1397,9 @@ class SimWorker:
                 _sc = float(getattr(cfg, "plan_speed_scale", 1.0) or 1.0)
                 if ego_kind in common.EGO_PLANNER_KINDS and _sc != 1.0:
                     stack_params = dict(stack_params or {}, speed_scale=_sc)      # the same knob as our policy's
+                if ego_kind == "aurorus" and _sc != 1.0:
+                    from ..learn.aurorus_opponent import SOLO_SCALE
+                    ego_opts = dict(ego_opts, scale=float(ego_opts.get("scale", SOLO_SCALE)) * _sc)
                 drv = common.build_ego_driver(env, ego_kind, ego_w, ego_opts, rls=ego_rls, limits=ego_lim,
                                               stack_params=stack_params)
             except Exception as exc:

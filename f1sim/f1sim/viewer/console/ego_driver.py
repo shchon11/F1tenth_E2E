@@ -21,7 +21,7 @@ from .widgets import label
 #: Mirrors `learn.common.EGO_PLANNER_KINDS` / `EGO_EXTERNAL_KINDS` (the GUI process does not import
 #: `learn`; a test keeps the two equal).
 PLANNERS = ("raceline", "forzaeth", "forzaeth_pred", "lane_switch")
-EXTERNALS = ("tinylidarnet", "end2race", "ftg", "disparity")
+EXTERNALS = ("tinylidarnet", "end2race", "ftg", "disparity", "aurorus")
 #: A planner's line: the session's training line, or a faster one (its global planner's ax/ay --
 #: the pace knob the evaluation tuned; cached for ICCAS, Korea 2026 and ICRA 2022).
 LINES = (("학습 라인 7/6.5/4", None), ("빠른 라인 8/7/5", [8.0, 7.0, 5.0]),

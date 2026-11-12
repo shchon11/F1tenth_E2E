@@ -363,7 +363,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         names = {"forzaeth_pred": "ForzaETH 예측 spliner", "forzaeth": "ForzaETH spliner",
                  "lane_switch": "lane-switch (고정 레인 바꾸기)", "interactive": "interactive 티처 (예측 보고 추월)",
                  "layout": "layout 티처 (장애물 피하는 최소시간 라인)", "raceline": "raceline 티처 (레이싱 라인만, 장애물 못 봄)",
-                 "ftg": "Follow-the-Gap (라이다만)", "disparity": "Disparity Extender (라이다만)"}
+                 "ftg": "Follow-the-Gap (라이다만)", "disparity": "Disparity Extender (라이다만)",
+                 "aurorus": "AuRoRus 회피 주행 (자기 선 + 라이다로 비켜 감)"}
         for name in ("forzaeth_pred", "forzaeth", "lane_switch", "interactive", "layout", "raceline"):
             k = osl.KIND_BY_NAME.get(name)
             if k is not None and k.available:
@@ -371,7 +372,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         for key, label_, mix, note in osl.KIND_MIXES:
             if key == "planners" and all(osl.KIND_BY_NAME[n].available for n in mix):
                 out.append((f"mix:{key}", "혼합 · 플래너 4종 (레이스마다 무작위)", {"kind_mix": list(mix)}, note))
-        for name in ("ftg", "disparity"):
+        for name in ("ftg", "disparity", "aurorus"):
             k = osl.KIND_BY_NAME.get(name)
             if k is not None and k.available:
                 out.append((name, names[name], {"kind": name}, k.note))

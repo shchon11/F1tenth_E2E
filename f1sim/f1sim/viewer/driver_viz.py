@@ -268,6 +268,54 @@ def sensor_overlay(drv, scan_m, speed: float, cmd, pose, mount, range_max: float
     return command_arc(pose, steer, v, wheelbase), drv_fr
 
 
+# ----------------------------------------------------------------------------------- a driver with its own record
+def draws_itself(drv) -> bool:
+    """A driver that keeps what its last cycle saw and chose (`aurorus_opponent.AurorusDriver.viz_tensors`)."""
+    return hasattr(drv, "viz_tensors")
+
+
+def aurorus_overlay(drv, flat: np.ndarray, pose, wheelbase: float):
+    """(path (k, 3) world [x, y, v], overlay dict) for an AuRoRus car on the focus car: its own line ahead, the scan
+    points it took for obstacles, the path it chose around them and the point it steers at."""
+    kind, title = kind_title(drv)
+    d = drv.viz_decode(flat)
+    x, y, yaw = (float(v) for v in pose)
+    lines: List[dict] = []
+    points: List[dict] = []
+    ahead, path = d["ahead"], d["path"]
+    legend = title
+    if d["avoiding"] and len(path) >= 2:
+        ribbon = np.concatenate([path, np.full((len(path), 1), d["speed"])], 1)
+        if len(ahead) >= 2:
+            lines.append({"xy": ahead[:, :2].astype(np.float32), "rgba": REF_LINE, "w": 1.5})
+        legend += " · 색 띠 = 장애물을 비켜 가려고 고른 경로 · 회색 = 자기 선"
+        if not d["free"]:
+            legend += " · 안 닿는 경로가 없어 가장 멀리 가는 것을 고름"
+    elif len(ahead) >= 2:
+        ribbon = ahead
+        legend += f" · 색 띠 = 자기 선 (선 속도의 {d['scale']:.2f}배)"
+    else:
+        ribbon = command_arc(pose, 0.0, 0.0, wheelbase)
+    if len(d["obstacles"]):
+        points.append({"xy": d["obstacles"].astype(np.float32), "rgba": DETECTION, "px": 6.0})
+    legend += f" · 노란 점 = 자기 LiDAR에서 장애물로 본 점 {len(d['obstacles'])}개"
+    if d["seen"] and not d["lost"] and np.isfinite(d["target"]).all():
+        # the bearing it steers by is taken from one wheelbase behind the centre of gravity (`steering.rs`)
+        origin = np.array([[x - wheelbase * math.cos(yaw), y - wheelbase * math.sin(yaw)]])
+        lines.append({"xy": np.vstack([origin, d["target"][None]]).astype(np.float32), "rgba": TARGET_LINE, "w": 2.0})
+        points.append({"xy": d["target"][None].astype(np.float32), "rgba": TARGET, "px": 13.0})
+        legend += " · 큰 점 = 겨눈 점"
+    if d["seen"] and d["gain"] < 0.99:
+        legend += f" · 속도 x{d['gain']:.2f}"
+    if d["seen"] and np.isfinite(d["reach"]):
+        legend += f" · 막힘: {d['reach']:.1f} m 앞에서 설 수 있는 속도"
+    if d["lost"]:
+        legend += " · 선에서 너무 벗어나 멈춤"
+    legend += " · 자기 위치는 참값 (oracle), 상자·다른 차 위치는 받지 않음"
+    drv_fr = {"kind": kind, "title": title, "legend": legend, "lines": lines, "points": points}
+    return ribbon.astype(np.float32), drv_fr
+
+
 class DriverViz:
     """The worker's side: which rows an external driver drives, and their overlay for the focus car."""
 
@@ -287,12 +335,16 @@ class DriverViz:
         drv = self.driver(row)
         if drv is None:
             return []
+        if draws_itself(drv):
+            return drv.viz_tensors(self.env, int(row))
         if is_planner(drv):
             return planner_tensors(drv, self.env, row)
         return [self.env.last_result.odom[int(row), 3:4].float()]
 
     def decode(self, row: int, flat: np.ndarray, *, pose, mount, scan_m, cmd):
         drv = self.driver(row)
+        if draws_itself(drv):
+            return aurorus_overlay(drv, flat, pose, self.wheelbase)
         if is_planner(drv):
             return planner_overlay(drv, flat)
         return sensor_overlay(drv, scan_m, float(flat[0]), cmd, pose, mount, self.range_max, self.wheelbase)

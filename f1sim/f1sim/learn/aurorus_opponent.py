@@ -31,6 +31,20 @@ What is not the original's, plainly:
   * the scanner sits ahead of the centre of gravity (`mount_x`) where the original's template car has it on it, and
     the scan is this simulator's (noise, beams of one sweep taken while moving). The beam angles used are the
     nominal ones: a randomized scanner yaw (`mount_yaw`, +-0.015 rad) is not known to the car;
+  * each beam is placed from where the car was when that beam was taken (`sweep`: the car's pose a cycle ago and
+    the scanner's timing, `Lidar.time_frac`), where the original places every beam from the cycle's one pose (its
+    own simulator casts them all from one pose too). Measured 11-12: this is NOT what made the port see obstacles
+    on an empty track -- placed as the original does, placed like this, or with the simulator's sweep switched off,
+    it was avoiding 36 / 30 / 35 % of the time;
+  * returns from the floor can be dropped (`FloorGate` with `TiltEstimate`; `AurorusOpponents(floor="gate")`). The
+    original takes every return on free space for an obstacle and its simulator's scanner is flat. Here the body
+    rolls 1.7 deg/g with the scan plane 11 cm above the floor, so in a corner the beams of the low side meet the
+    floor inside 4.35 m: on the real map without one box all 5566 obstacle points of a run were floor returns, and
+    every wall contact of the solo record came while it was avoiding them. The gate uses what the car has: its gyro
+    and speed for the body's tilt, and how its scanner is mounted;
+  * `AurorusOpponents(drive="physics")` sends the steering and speed through the simulator's car (tyres, command
+    delay, servo, motor), as the original's go to a car. "exact" is the kinematic execution the learner's plans get,
+    which has no tyre limit: at the line's full speed the port cornered at up to 14 m/s^2 there;
   * free space = `TrackTensors.sample_edt` > 0.2 m (nearest-cell look-up of the distance to the nearest mapped wall);
   * its own pose is the simulator's (the original's `pose_source = 1`, its simulation-only ground-truth mode; on the
     car it localises). Other cars and boxes come from its LiDAR only;
@@ -49,6 +63,7 @@ import numpy as np
 import torch
 
 from .. import dynamics as dyn
+from ..lidar import HIT_GROUND
 
 
 @dataclass
@@ -108,6 +123,53 @@ def fov_window(n: int, fov: float, want: float) -> Tuple[int, int]:
 def stopping_speed(distance: torch.Tensor, margin: float, max_decel: torch.Tensor) -> torch.Tensor:
     """the speed from which the car stops `margin` short of `distance`"""
     return torch.sqrt(2.0 * max_decel.clamp_min(0.0) * (distance - margin).clamp_min(0.0))
+
+
+@dataclass
+class FloorGate:
+    """Which returns are the floor (not the original's; see the module notes). A beam of a scan plane that is not level
+    meets the floor at (the scanner's height) / (how steeply the beam points down); a return at or beyond that range,
+    with the tilt taken `tol` [rad] worse than estimated, is not an obstacle.
+    height: the scanner above the floor [m]; roll / pitch: how it sits on the car [rad], + = right side down / nose
+    down as `lidar.Lidar.rays` has them. Floats or (n,) tensors."""
+    height: object
+    roll: object = 0.0
+    pitch: object = 0.0
+    tol: float = 0.01
+
+
+class TiltEstimate:
+    """The body's roll and pitch [rad] from the car's own gyro and speed, for `FloorGate`: the gyro's roll and pitch
+    rates integrated, pulled with time constant `tau` toward where the suspension settles under the car's own
+    acceleration (sideways = speed x yaw rate, along = the change of speed) by the car's gains [rad per g]:
+    `roll_per_g`, `pitch_per_g` under throttle, `dive_per_g` under braking (floats or (n,) tensors).
+    The VESC's own attitude estimate is no use for this: it leans on the accelerometer, which reads a corner as tilt."""
+
+    G = 9.81
+
+    def __init__(self, n: int, roll_per_g, pitch_per_g, dive_per_g, tau: float = 0.3, device=None, dtype=torch.float64):
+        f = lambda v: (v.to(device=device, dtype=dtype) if torch.is_tensor(v) else torch.full((n,), float(v), dtype=dtype, device=device))
+        self.c_roll, self.c_pitch, self.c_dive, self.tau = f(roll_per_g), f(pitch_per_g), f(dive_per_g), float(tau)
+        self.tilt = torch.zeros(n, 2, dtype=dtype, device=device)
+        self.v_prev = torch.full((n,), float("nan"), dtype=dtype, device=device)
+
+    def reset(self, mask: torch.Tensor) -> None:
+        self.tilt[mask] = 0.0
+        self.v_prev[mask] = float("nan")
+
+    def update(self, speed: torch.Tensor, yaw_rate: torch.Tensor, rates: Optional[torch.Tensor], ts: float, dt: float) -> torch.Tensor:
+        """One cycle of every car. speed (n,) [m/s]; yaw_rate (n,) [rad/s]; rates (n, K, 2): the gyro's roll and pitch
+        rates of this cycle's K samples, `ts` apart (None or K = 0: none came); dt: the cycle. -> roll, pitch (n, 2)"""
+        ft = self.tilt.dtype
+        v, r = speed.to(ft), yaw_rate.to(ft)
+        ax = torch.where(torch.isnan(self.v_prev), torch.zeros_like(v), (v - self.v_prev) / dt)
+        self.v_prev = v.clone()
+        settle = torch.stack([self.c_roll * v * r / self.G, -torch.where(ax > 0, self.c_pitch, self.c_dive) * ax / self.G], 1)
+        t = self.tilt
+        if rates is not None and rates.shape[1] > 0:
+            t = t + rates.to(ft).sum(1) * ts
+        self.tilt = t + min(dt / self.tau, 1.0) * (settle - t)
+        return self.tilt
 
 
 class Line:
@@ -201,11 +263,17 @@ class AurorusCore:
     line: `Line`; free(xy (..., 2), tid (R,)) -> bool (...): the map's free space (see the module notes);
     n_beams / fov / range_min / range_max: the scanner, beam i at -fov/2 + i fov/(n_beams-1);
     mount: the scanner's place ahead / left of the centre of gravity [m] (floats or (n,) tensors);
-    wheelbase, max_steer: the car's; dt: the cycle [s] (the switch counts cycles)."""
+    wheelbase, max_steer: the car's; dt: the cycle [s] (the switch counts cycles);
+    sweep (n_beams,): how long before the scan's time each beam was taken, in cycles -- each beam's end is then placed
+    from where the car was at that moment (between the last cycle's pose and this one's). None = every beam from this
+    cycle's pose, as the original does;
+    floor: `FloorGate` -- with the body's tilt handed to `cycle`, returns from the floor are not obstacle points. None
+    = every return on free space is one, as the original has it."""
 
     def __init__(self, line: Line, free: Callable, n: int, n_beams: int, fov: float, wheelbase: float, max_steer: float,
                  mount=(0.0, 0.0), dt: float = 0.025, range_min: float = 0.02, range_max: float = 10.0,
-                 cfg: Optional[AurorusConfig] = None, device=None, chunk: int = 128):
+                 cfg: Optional[AurorusConfig] = None, device=None, chunk: int = 128, sweep: Optional[torch.Tensor] = None,
+                 floor: Optional[FloorGate] = None):
         self.cfg = cfg = cfg or AurorusConfig()
         self.line, self.free, self.n = line, free, int(n)
         self.dev = dev = torch.device(device) if device is not None else line.P.device
@@ -219,6 +287,13 @@ class AurorusCore:
         f = np.float32                                                 # `LidarScan::ray_angle_rad` works in f32
         ang = -f(fov) / f(2.0) + self.beams.cpu().numpy().astype(f) * f(fov) / f(n_beams - 1)
         self.beam_angle = torch.as_tensor(ang.astype(np.float64), dtype=ft, device=dev)
+        self.sweep = None if sweep is None else sweep.to(dev)[self.beams].to(ft)
+        self.pose_prev = torch.zeros(n, 3, dtype=ft, device=dev)       # last cycle's pose, where `has_prev`
+        self.floor = floor
+        if floor is not None:
+            g = lambda v: (v.to(device=dev, dtype=ft) if torch.is_tensor(v) else torch.full((n,), float(v), dtype=ft, device=dev))
+            self.fl_h, self.fl_roll, self.fl_pitch = g(floor.height), g(floor.roll), g(floor.pitch)
+        self.has_prev = torch.zeros(n, dtype=torch.bool, device=dev)
         # elapsed cycles after which `now - since >= wait` first holds
         self.n_on = int(math.ceil(cfg.switch_on_s / dt - 1e-9))
         self.n_off = int(math.ceil(cfg.hysteresis_s / dt - 1e-9))
@@ -257,6 +332,7 @@ class AurorusCore:
         self.blocked_gain[mask] = 1.0
         self.prev_err[mask] = float("nan")
         self.lost[mask] = False
+        self.has_prev[mask] = False
 
     def _mount(self, idx: torch.Tensor):
         mx, my = self.mount
@@ -264,26 +340,57 @@ class AurorusCore:
         my = my[idx].to(self.dtype) if torch.is_tensor(my) else torch.full((idx.numel(),), float(my), dtype=self.dtype, device=self.dev)
         return mx, my
 
-    def obstacle_points(self, pose: torch.Tensor, scan: torch.Tensor, tid: torch.Tensor, mx: torch.Tensor, my: torch.Tensor):
-        """`find_obstacles`: -> points (R, M, 2) in the world and which of them count (R, M)"""
+    def floor_range(self, tilt: torch.Tensor, idx: torch.Tensor, mx: torch.Tensor, my: torch.Tensor) -> torch.Tensor:
+        """the range (R, M) from which a return of each read beam is taken for the floor: the body of cars `idx` rolled
+        and pitched by tilt (R, 2), the beam pointing down `tol` more than that says (`lidar.Lidar.rays`' geometry).
+        inf where the beam does not point down"""
+        phi = (tilt[:, 0] + self.fl_roll[idx])[:, None]
+        th = (tilt[:, 1] + self.fl_pitch[idx])[:, None]
+        ca, sa = torch.cos(self.beam_angle)[None], torch.sin(self.beam_angle)[None]
+        down = ca * torch.sin(th) - sa * torch.sin(phi) * torch.cos(th) + self.floor.tol
+        oz = -mx[:, None] * torch.sin(th) + (my[:, None] * torch.sin(phi) + self.fl_h[idx][:, None] * torch.cos(phi)) * torch.cos(th)
+        return torch.where(down > 0, oz / down.clamp_min(1e-9), torch.full_like(down, float("inf")))
+
+    def obstacle_points(self, pose: torch.Tensor, scan: torch.Tensor, tid: torch.Tensor, mx: torch.Tensor, my: torch.Tensor,
+                        prev: Optional[torch.Tensor] = None, tilt: Optional[torch.Tensor] = None,
+                        idx: Optional[torch.Tensor] = None):
+        """`find_obstacles`: -> points (R, M, 2) in the world and which of them count (R, M).
+        prev (R, 3): the pose a cycle ago, used with `sweep` to place each beam from where the car was when it was taken;
+        tilt (R, 2) with the cars' numbers idx (R,): the body's roll and pitch, used with `floor` to drop floor returns"""
         cfg = self.cfg
         r = scan[:, self.beams]
         ok = torch.isfinite(r) & (r > self.range_min) & (r < self.range_max) & (r < cfg.max_path_length_m)
+        self.n_floor = None
+        if self.floor is not None and tilt is not None:
+            fl = ok & (r >= self.floor_range(tilt, idx, mx, my))
+            self.n_floor = fl.sum(1)
+            ok = ok & ~fl
         r = torch.where(ok, r, torch.zeros_like(r))
-        c, s = torch.cos(pose[:, 2]), torch.sin(pose[:, 2])
-        ox = pose[:, 0] + mx * c - my * s
-        oy = pose[:, 1] + mx * s + my * c
-        ang = pose[:, 2:3] + self.beam_angle[None]
-        pts = torch.stack([ox[:, None] + r * torch.cos(ang), oy[:, None] + r * torch.sin(ang)], -1)
+        if self.sweep is None or prev is None:
+            c, s = torch.cos(pose[:, 2]), torch.sin(pose[:, 2])
+            ox = pose[:, 0] + mx * c - my * s
+            oy = pose[:, 1] + mx * s + my * c
+            ang = pose[:, 2:3] + self.beam_angle[None]
+            pts = torch.stack([ox[:, None] + r * torch.cos(ang), oy[:, None] + r * torch.sin(ang)], -1)
+        else:
+            f = self.sweep[None]                                       # (1, M)
+            yaw = pose[:, 2:3] - f * wrap(pose[:, 2] - prev[:, 2])[:, None]
+            x = pose[:, 0:1] - f * (pose[:, 0:1] - prev[:, 0:1])
+            y = pose[:, 1:2] - f * (pose[:, 1:2] - prev[:, 1:2])
+            c, s = torch.cos(yaw), torch.sin(yaw)
+            ang = yaw + self.beam_angle[None]
+            pts = torch.stack([x + mx[:, None] * c - my[:, None] * s + r * torch.cos(ang),
+                               y + mx[:, None] * s + my[:, None] * c + r * torch.sin(ang)], -1)
         ok = ok & self.free(pts, tid)
         return pts, ok
 
     @torch.no_grad()
     def cycle(self, pose: torch.Tensor, speed: torch.Tensor, scan: torch.Tensor, tid: torch.Tensor, a_brake: torch.Tensor,
-              scale: torch.Tensor, live: Optional[torch.Tensor] = None):
+              scale: torch.Tensor, live: Optional[torch.Tensor] = None, tilt: Optional[torch.Tensor] = None):
         """One control cycle. pose (n, 3) = x, y, heading of the centre of gravity; speed (n,) forward [m/s];
         scan (n, n_beams) ranges [m] (inf = no return); tid (n,); a_brake (n,) [m/s^2]; scale (n,): each car's multiple
-        of the line's speeds; live (n,) bool: cars this drives now (the others get 0, 0 and keep their state).
+        of the line's speeds; live (n,) bool: cars this drives now (the others get 0, 0 and keep their state);
+        tilt (n, 2): the body's roll and pitch [rad] as the car estimates them (`TiltEstimate`), for `floor`.
         -> steering [rad] (n,), speed [m/s] (n,)"""
         cfg, line, dev, ft = self.cfg, self.line, self.dev, self.dtype
         self.k += 1
@@ -297,7 +404,10 @@ class AurorusCore:
         seg, s0, npt, dist = line.nearest(t, p[:, :2], self.hint[idx], 1.5 * look + 1.0)
         lost = dist > cfg.max_cross_track_m
         mx, my = self._mount(idx)
-        pts, ok = self.obstacle_points(p, scan[idx].to(ft), t, mx, my)
+        prev = torch.where(self.has_prev[idx, None], self.pose_prev[idx], p)
+        pts, ok = self.obstacle_points(p, scan[idx].to(ft), t, mx, my, prev, None if tilt is None else tilt[idx].to(ft), idx)
+        self.has_prev.zero_()                                          # a car not driven this cycle has no last pose next time
+        self.pose_prev[idx] = p; self.has_prev[idx] = True
         obst = ok.any(1)
         # the switch (`ObstacleSwitch::update`): a change of state has to hold for a time, counted here in cycles
         av, since = self.avoiding[idx], self.since[idx]
@@ -346,8 +456,10 @@ class AurorusCore:
         self.blocked_gain[idx] = torch.where(lost, torch.ones_like(blocked), blocked)
         self.prev_err[idx] = torch.where(lost, torch.full_like(err, float("nan")), err)
         self.lost[idx] = lost
+        # `pts` / `ok`: the scan points and which of them it took for obstacles; `plan_rows`: the rows (into `idx`) that
+        # planned a path -- `last_plan` holds the last chunk of them; `pose` / `npt`: the car and its nearest line point
         self.last = dict(idx=idx, target=target, s0=s0, dist=dist, obst=obst, n_obst=ok.sum(1), reach=reach_all, gain=gain_all,
-                         look=look, ref=ref)
+                         look=look, ref=ref, pts=pts, ok=ok, plan_rows=plan_rows, pose=p, npt=npt, n_floor=self.n_floor)
         return steer_out, v_out
 
     def _plan(self, tid, pose, s0, npt, look, obs, obs_ok, d_weight, blocked):
@@ -439,13 +551,27 @@ class AurorusOpponents:
     control steps (`plan` / `command` / `stepped` / `after`, as `plan_rl.SelfOpponents`).
 
     Each race, with probability `share`, the other car is this driver's (else the scripted one's), at a speed multiple
-    drawn from `scale` (lo, hi). Its steering and speed are driven exactly (`env.ideal_cmd`, `env.ideal_extra`: the
-    kinematic execution the learner's plans get, with the car's steering-rate and acceleration limits and no tyre
-    limit). Inputs: its own row's scan (`env.last_result.scan`) and the simulator's pose and speed of that row."""
+    drawn from `scale` (lo, hi). Inputs: its own row's scan (`env.last_result.scan`) and the simulator's pose and speed
+    of that row.
+    drive: "exact" -- its steering and speed are driven exactly (`env.ideal_cmd`, `env.ideal_extra`: the kinematic
+      execution the learner's plans get, with the car's steering-rate and acceleration limits and no tyre limit);
+      "physics" -- they are the command to the simulator's car (`env.ext_cmd`, `env.ext_mask`: tyres, command delay,
+      servo, motor). For rows of the learner this needs the env's exact execution off: `env.ideal_cmd = None` and
+      `env.sim.ideal_rows.zero_()` IN PLACE (a GPU env's captured physics graph keeps reading that tensor; setting the
+      attribute to None leaves those rows exact).
+    floor: "off" -- every return on free space is an obstacle point, as the original has it;
+      "gate" -- returns at the range where the car's own tilt estimate (gyro + speed, `TiltEstimate` with the nominal
+      car's gains) puts the floor are dropped (`FloorGate`: the car's scanner height, a mount assumed level, `floor_tol`
+      [rad] for what it does not know: the mount's tilt is randomized +-0.02 rad, the car's roll gain x0.6-1.6);
+      "oracle" -- returns the SIMULATOR knows are the floor are dropped (`scan_type`): no car has that, a reference
+      for the gate only."""
 
     def __init__(self, env, share: float = 1.0, scale=(0.6, 1.0), seed: int = 0, cfg: Optional[AurorusConfig] = None,
-                 rows: Optional[torch.Tensor] = None):
+                 rows: Optional[torch.Tensor] = None, deskew: bool = True, drive: str = "exact", floor: str = "off",
+                 floor_tol: float = 0.03):
+        assert drive in ("exact", "physics") and floor in ("off", "gate", "oracle"), (drive, floor)
         self.env, self.share = env, float(share)
+        self.drive, self.floor = drive, floor
         self.scale_range = (float(scale[0]), float(scale[1]))
         self.rows = torch.nonzero(~env.learner).flatten() if rows is None else rows
         dev = env.device
@@ -458,18 +584,28 @@ class AurorusOpponents:
         cl = env.cfg.lidar
         mx = P["mount_x"] if "mount_x" in P else torch.full((env.B,), float(cl.mount_x), device=dev)
         my = P["mount_y"] if "mount_y" in P else torch.full((env.B,), float(cl.mount_y), device=dev)
+        gate, self.tilt = None, None
+        if floor == "gate":
+            mz = P["mount_z"] if "mount_z" in P else torch.full((env.B,), float(cl.mount_z), device=dev)
+            gate = FloorGate(height=mz[self.rows], tol=float(floor_tol))
+            cv = env.cfg.vehicle
+            self.tilt = TiltEstimate(Bo, cv.roll_per_g, cv.pitch_per_g, cv.dive_per_g, device=dev)
+            self.imu_ts = 1.0 / float(env.cfg.imu.imu_rate)
         self.core = AurorusCore(
             Line(env.teacher.xy, env.teacher.v), lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear,
             Bo, int(env.last_result.scan.shape[1]), float(env.cfg.lidar.fov), float(P["lf"][r0] + P["lr"][r0]), float(P["s_max"][r0]),
             mount=(mx[self.rows].float(), my[self.rows].float()), dt=float(env.sim.control_dt),
-            range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev)
+            range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
+            sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
+            floor=gate)
+        self._row_ids = self.rows.tolist()
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by this driver this race
         self.scale = torch.ones(Bo, device=dev)
         self.gen = torch.Generator(device="cpu"); self.gen.manual_seed(int(seed) + 9173)
         self.restarted = torch.zeros(Bo, dtype=torch.bool, device=dev)
         self.live = self.on.clone()
         self.xy = env.sim.state[self.rows, :2].clone()
-        if getattr(env, "ideal_extra", None) is None:
+        if drive == "exact" and getattr(env, "ideal_extra", None) is None:
             env.ideal_extra = torch.zeros(env.B, dtype=torch.bool, device=dev)
         self.draw(torch.arange(Bo, device=dev))
 
@@ -490,7 +626,13 @@ class AurorusOpponents:
         lo, hi = self.scale_range
         self.on[rows] = u[:, 0] < self.share
         self.scale[rows] = lo + (hi - lo) * u[:, 1]
+        self._reset(rows)
+
+    def _reset(self, rows: torch.Tensor) -> None:
+        """rows (indices or a mask over the opponent rows) start anew"""
         self.core.reset(rows)
+        if self.tilt is not None:
+            self.tilt.reset(rows)
 
     def _moved(self) -> None:
         """a car put somewhere else between decisions (`state_rl.OppRestart`): its nearest-point hint and switch are of
@@ -498,7 +640,7 @@ class AurorusOpponents:
         xy = self.env.sim.state[self.rows, :2]
         moved = (xy - self.xy).norm(dim=1) > 2.0
         if bool(moved.any()):
-            self.core.reset(moved)
+            self._reset(moved)
         self.xy = xy.clone()
 
     def plan(self) -> None:
@@ -506,23 +648,40 @@ class AurorusOpponents:
         self._moved()
         self.live = self.on & ~env.sim.absent[self.rows] if getattr(env.sim, "absent_any", False) else self.on.clone()
         self.restarted.zero_()
-        env.sim.ideal_vcap[self.rows[self.live]] = 1e3
-        env.ideal_extra[self.rows] = self.live
+        if self.drive == "physics":
+            # the env's own book of externally commanded rows (`set_external_command`), kept for many rows at once
+            env.ext_mask[self.rows] = self.live
+            env._ext_ids.difference_update(self._row_ids)
+            env._ext_ids.update(self.rows[self.live].tolist())
+            if getattr(env, "ideal_extra", None) is not None:
+                env.ideal_extra[self.rows] = False
+        else:
+            env.sim.ideal_vcap[self.rows[self.live]] = 1e3
+            env.ideal_extra[self.rows] = self.live
 
     def command(self, j: int) -> None:
         env, rows = self.env, self.rows
+        res = env.last_result
         st = env.sim.state[rows]
         pose = torch.stack([st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW]], -1)
-        steer, v = self.core.cycle(pose, st[:, dyn.IVX], env.last_result.scan[rows], env.sim.tid[rows],
-                                   env.sim.P["a_brake"][rows], self.scale, self.live & ~self.restarted)
-        env.ideal_cmd[rows, 0] = steer.to(env.ideal_cmd.dtype)
-        env.ideal_cmd[rows, 1] = v.to(env.ideal_cmd.dtype)
+        scan, tilt = res.scan[rows], None
+        if self.floor == "oracle":
+            scan = torch.where(res.scan_type[rows] == HIT_GROUND, torch.full_like(scan, float("inf")), scan)
+        elif self.floor == "gate":
+            imu = getattr(res, "imu", None)
+            tilt = self.tilt.update(st[:, dyn.IVX], st[:, dyn.IR], None if imu is None else imu[rows][:, :, :2], self.imu_ts,
+                                    self.core.dt)
+        steer, v = self.core.cycle(pose, st[:, dyn.IVX], scan, env.sim.tid[rows], env.sim.P["a_brake"][rows], self.scale,
+                                   self.live & ~self.restarted, tilt)
+        out = env.ext_cmd if self.drive == "physics" else env.ideal_cmd
+        out[rows, 0] = steer.to(out.dtype)
+        out[rows, 1] = v.to(out.dtype)
 
     def stepped(self, done: torch.Tensor) -> None:
         d = done[self.rows]
         self.restarted |= d
         if bool(d.any()):
-            self.core.reset(d)
+            self._reset(d)
 
     def after(self) -> None:
         self._moved()
@@ -532,3 +691,189 @@ class AurorusOpponents:
     def share_on(self) -> float:
         pres = ~self.env.sim.absent[self.rows] if getattr(self.env.sim, "absent_any", False) else torch.ones_like(self.on)
         return float((self.on & pres).float().sum() / pres.float().sum().clamp_min(1.0))
+
+
+# ----------------------------------------------------------------- one driver of an env's external rows (the console)
+#: the speed multiple of a lone AuRoRus car when none is named (the console's 내 차): the fastest of 0.6 / 0.8 / 1.0 that
+#: stayed off the walls on the tyres (Korea 2025, 2026-11-12 solo record: at 1.0 the car slides wide on corner exits)
+SOLO_SCALE = 0.8
+#: [m] of its own line drawn ahead of the car, and the points along it
+VIZ_AHEAD_M = 8.0
+VIZ_AHEAD_POINTS = 33
+
+
+def build_core(env, rows: torch.Tensor, line: Line, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
+               floor: str = "off", floor_tol: float = 0.03):
+    """`AurorusCore` for the cars `rows` of `env` on `line`, and what `floor="gate"` needs besides.
+    -> core, the tilt estimate (None unless "gate"), the IMU's sample time [s] (None unless "gate")"""
+    dev = env.device
+    Bo = int(rows.numel())
+    P = env.sim.P
+    r0 = int(rows[0]) if Bo else 0
+    track = env.sim.track
+    clear = (cfg or AurorusConfig()).wall_clearance_m
+    # the scanner's place as `gym_env._lidar_pose` has it: per car when randomized, else the configured one
+    cl = env.cfg.lidar
+    mx = P["mount_x"] if "mount_x" in P else torch.full((env.B,), float(cl.mount_x), device=dev)
+    my = P["mount_y"] if "mount_y" in P else torch.full((env.B,), float(cl.mount_y), device=dev)
+    gate, tilt, imu_ts = None, None, None
+    if floor == "gate":
+        mz = P["mount_z"] if "mount_z" in P else torch.full((env.B,), float(cl.mount_z), device=dev)
+        gate = FloorGate(height=mz[rows], tol=float(floor_tol))
+        cv = env.cfg.vehicle
+        tilt = TiltEstimate(Bo, cv.roll_per_g, cv.pitch_per_g, cv.dive_per_g, device=dev)
+        imu_ts = 1.0 / float(env.cfg.imu.imu_rate)
+    core = AurorusCore(
+        line, lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear,
+        Bo, int(env.last_result.scan.shape[1]), float(env.cfg.lidar.fov), float(P["lf"][r0] + P["lr"][r0]), float(P["s_max"][r0]),
+        mount=(mx[rows].float(), my[rows].float()), dt=float(env.sim.control_dt),
+        range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
+        sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
+        floor=gate)
+    return core, tilt, imu_ts
+
+
+def driver_line(env, rls=None, limits: Optional[dict] = None) -> Line:
+    """The line an `AurorusDriver` follows in `env`: from the race lines `rls` (one per track) with the speed profile's
+    limits `limits` (`common.teacher_limits`); without `rls`, the line the env's own scripted cars drive."""
+    if rls:
+        from .common import make_teacher
+        t = make_teacher(rls, env, **(limits or {}))
+    else:
+        t = getattr(env, "teacher", None)
+        if t is None or not hasattr(t, "xy"):
+            raise ValueError("an AuRoRus car follows a race line: none was given (rls) and this env has none of its own")
+    return Line(t.xy, t.v)
+
+
+class AurorusDriver:
+    """`AurorusCore` as an external driver of an env (`gym_env.set_ego_driver` / `set_external_drivers`: the console's
+    내 차 or an opponent slot). One command per control cycle, sent through the car's calibration and normal physics by
+    the env, as every external driver's is.
+
+    What it reads: its own row's scan and gyro, and the SIMULATOR's pose and speed of its car -- the original's
+    `pose_source = 1` (its simulation mode); on the real car the original localizes itself, which is not ported. It is
+    told nothing about boxes or other cars.
+    scale: the multiple of the line's speeds it asks for (`SOLO_SCALE` when none is named); an opponent slot's own
+      draw for the race (`OpponentSlot.speed_scale`, `env.slot_scale`) multiplies it, so a slot's 1.0 is this driver's
+      own full pace as it is a scripted car's.
+    floor: as `AurorusOpponents` ("gate" here: the simulator's LiDAR sees the floor when the body tilts, and the
+      original, written for a flat 2D scanner, takes those returns for obstacles)."""
+
+    KIND = kind = "aurorus"
+    needs_speed = False
+
+    def __init__(self, line: Line, scale: Optional[float] = None, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
+                 floor: str = "gate", floor_tol: float = 0.03):
+        assert floor in ("off", "gate", "oracle"), floor
+        self.line, self.scale, self.cfg = line, float(SOLO_SCALE if scale is None else scale), cfg
+        self.deskew, self.floor, self.floor_tol = bool(deskew), floor, float(floor_tol)
+        self.rows = None                                              # `set_ego_driver` fills it; else the first command's
+        self.core = None
+        self.tilt, self.imu_ts = None, None
+        self.xy = None
+        self.last_cmd = None
+        self._at = {}
+
+    def bind_scanner(self, **kw) -> None:
+        """the scanner is read from the env when the first command is asked (`build_core`)"""
+
+    def _build(self, env, rows: torch.Tensor) -> None:
+        self.rows = rows
+        self.core, self.tilt, self.imu_ts = build_core(env, rows, self.line, self.cfg, self.deskew, self.floor, self.floor_tol)
+        self.xy = env.sim.state[rows, :2].clone()
+        self._at = {int(r): j for j, r in enumerate(rows.tolist())}
+
+    def _reset(self, rows) -> None:
+        self.core.reset(rows)
+        if self.tilt is not None:
+            self.tilt.reset(rows)
+
+    def reset(self, mask=None) -> None:
+        """mask: which of its rows start a new race (the env's bool array over them); None = all"""
+        if self.core is None:
+            return
+        n = self.core.n
+        m = torch.ones(n, dtype=torch.bool) if mask is None else torch.as_tensor(np.asarray(mask, bool))
+        self._reset(m.to(self.core.dev))
+
+    def command_env(self, env, rows: torch.Tensor) -> torch.Tensor:
+        """(R, 2) steering [rad], speed [m/s] for its env rows `rows` (the same rows every call)"""
+        if self.core is None:
+            self._build(env, rows)
+        res = env.last_result
+        st = env.sim.state[rows]
+        pose = torch.stack([st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW]], -1)
+        moved = (pose[:, :2] - self.xy).norm(dim=1) > 2.0             # put somewhere else: its line hint is of the old place
+        if bool(moved.any()):
+            self._reset(moved)
+        self.xy = pose[:, :2].clone()
+        scan, tilt = res.scan[rows], None
+        if self.floor == "oracle":
+            scan = torch.where(res.scan_type[rows] == HIT_GROUND, torch.full_like(scan, float("inf")), scan)
+        elif self.floor == "gate":
+            imu = getattr(res, "imu", None)
+            tilt = self.tilt.update(st[:, dyn.IVX], st[:, dyn.IR], None if imu is None else imu[rows][:, :, :2], self.imu_ts,
+                                    self.core.dt)
+        scale = self.scale * env.slot_scale[rows]
+        live = ~env.sim.absent[rows] if getattr(env.sim, "absent_any", False) else None
+        steer, v = self.core.cycle(pose, st[:, dyn.IVX], scan, env.sim.tid[rows], env.sim.P["a_brake"][rows], scale, live, tilt)
+        self.last_cmd = torch.stack([steer, v], -1)
+        return self.last_cmd
+
+    # ---- its picture (`viewer.driver_viz`): what the last cycle saw and chose for one car
+    def viz_tensors(self, env, row: int) -> list:
+        """Flat tensors of env row `row` for the host: `viz_decode` reads them back (all blank before its first command)"""
+        core, j = self.core, self._at.get(int(row))
+        L = None if core is None else core.last
+        nan = float("nan")
+        if j is None or not L:
+            self._viz_shape = (0, 0, 0)
+            return [torch.full((10,), nan, device=env.device)]
+        dev, K, NB = core.dev, core.K, int(core.beams.numel())
+        head = torch.full((10,), nan, device=dev)
+        path = torch.full((K, 2), nan, device=dev)
+        obs = torch.full((NB, 2), nan, device=dev)
+        ahead = torch.full((VIZ_AHEAD_POINTS, 3), nan, device=dev)
+        hit = torch.nonzero(L["idx"] == j).flatten()
+        if hit.numel():
+            a = int(hit[0])
+            sc = float(self.scale * env.slot_scale[int(row)])
+            pj = L["plan_rows"]
+            pos = torch.nonzero(pj == a).flatten()
+            n_path = 0
+            LP = core.last_plan if pos.numel() else None
+            if LP is not None:
+                k = int(pos[0]) - (int(pj.numel()) - int(LP["P"].shape[0]))   # `last_plan`: the last chunk of planning rows
+                if k >= 0:
+                    c = int(LP["chosen"][k])
+                    n_path = int(LP["points"][c])
+                    path[:n_path] = LP["P"][k, c, :n_path].float()
+                    head[9] = float(LP["free"][k])
+            tid = env.sim.tid[int(row)].view(1)
+            s = L["s0"][a] + torch.linspace(0.0, VIZ_AHEAD_M, VIZ_AHEAD_POINTS, dtype=core.dtype, device=dev)
+            pa, va = core.line.at(tid, s[None])
+            ahead[:, :2] = pa[0].float(); ahead[:, 2] = sc * va[0].float()
+            obs = torch.where(L["ok"][a][:, None], L["pts"][a].float(), obs)
+            cmd_v = float(self.last_cmd[j, 1]) if self.last_cmd is not None else nan
+            head[:9] = torch.tensor([float(bool(core.avoiding[j])), float(n_path), float(L["target"][a, 0]), float(L["target"][a, 1]),
+                                     cmd_v, float(L["gain"][a]), float(L["reach"][a]), float(bool(core.lost[j])), sc], device=dev)
+        self._viz_shape = (K, NB, VIZ_AHEAD_POINTS)
+        return [head, path.flatten(), obs.flatten(), ahead.flatten()]
+
+    def viz_decode(self, flat: np.ndarray) -> dict:
+        """`viz_tensors` on the host -> avoiding, lost (bool), path (n, 2) its chosen path (empty unless avoiding),
+        free (a path clear of every obstacle point existed), target (2,), speed (commanded) [m/s], gain, reach [m]
+        (inf = no stop needed), scale, obstacles (m, 2) the scan points it took for obstacles, ahead (k, 3) its line
+        ahead with the speed it asks for there"""
+        K, NB, A = self._viz_shape
+        f = np.asarray(flat, np.float64)
+        h = f[:10]; i = 10
+        path = f[i:i + 2 * K].reshape(K, 2); i += 2 * K
+        obs = f[i:i + 2 * NB].reshape(NB, 2); i += 2 * NB
+        ahead = f[i:i + 3 * A].reshape(A, 3)
+        seen = np.isfinite(h[0])
+        return dict(seen=bool(seen), avoiding=bool(seen and h[0] > 0.5), lost=bool(seen and h[7] > 0.5),
+                    path=path[:int(h[1])] if seen else path[:0], free=bool(seen and h[9] > 0.5), target=h[2:4],
+                    speed=float(h[4]), gain=float(h[5]), reach=float(h[6]), scale=float(h[8]),
+                    obstacles=obs[np.isfinite(obs[:, 0])], ahead=ahead[np.isfinite(ahead[:, 0])])

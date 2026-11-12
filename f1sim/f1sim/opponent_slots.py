@@ -192,6 +192,12 @@ KINDS: Tuple[DriverKind, ...] = (
                "UNC 의 Disparity Extender (CPSWeek 2019 우승) 를 원저자 설명대로 구현. 라이다만 봅니다. "
                "옵션 top_speed.",
                external="disparity", prop_aware=True, module="f1sim.learn.baselines"),
+    DriverKind("aurorus", "AuRoRus 회피 주행",
+               "AuRoRus (2025-26 공개 F1TENTH 스택) 의 회피 주행을 옮긴 것. 자기 선을 따라가다가 자기 LiDAR 에서 "
+               "장애물로 본 점이 있으면 옆으로 비킨 후보 경로 63개 가운데 하나를 고르고, 막히면 멈출 수 있는 속도로 줄입니다. "
+               "상자·다른 차의 참 위치는 받지 않습니다. 자기 위치는 시뮬레이터 참값입니다 (원본의 시뮬레이션 모드; oracle). "
+               "속도 배율 1.0 = 자기 선 속도의 0.8배 (타이어로 벽에 안 닿은 가장 빠른 값). 옵션 scale, floor.",
+               external="aurorus", prop_aware=True, module="f1sim.learn.aurorus_opponent"),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
                checkpoint=True),

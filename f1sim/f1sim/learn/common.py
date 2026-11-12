@@ -307,7 +307,7 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
         from .opponent_pool import attach     # local: that module imports this one for the obs spec
         attach(env, device=env.device)
     if getattr(env, "external_slot_rows", None):
-        env.set_external_drivers(external_drivers(env))
+        env.set_external_drivers(external_drivers(env, rls=rls, limits=teacher_limits, tracks=tracks))
     # the call, so `make_twin` can build the same world again (twin worlds, `learn.twin_progress`)
     env._make_call = dict(tracks=tracks, device=device, env_cfg=env_cfg, cfg=cfg, seed=seed, rls=rls,
                           teacher_grip=teacher_grip, teacher_recover_time=teacher_recover_time,
@@ -325,11 +325,13 @@ def make_twin(env, num_envs: int):
     return make_env(c.pop("tracks"), int(num_envs), c.pop("device"), c.pop("env_cfg"), cfg=c.pop("cfg"), **c)
 
 
-def external_drivers(env) -> dict:
+def external_drivers(env, rls=None, limits: Optional[dict] = None, tracks=None) -> dict:
     """grid slot -> a `learn.baselines` driver for every external slot of `env.slots`, bound to the
     simulator's own scanner (its beam count, field of view and range), as `baseline_node` binds to
     the car's `LaserScan`. End2Race's repo is the vendored checkout next to this one unless the slot
-    names another."""
+    names another.
+    An "aurorus" slot (`aurorus_opponent.AurorusDriver`) follows a race line: `rls` with the speed profile's `limits`,
+    else the default line of each of `tracks`, else the env's own scripted cars' line."""
     import os as _os
     from . import baselines
     lid = env.cfg.lidar
@@ -338,6 +340,12 @@ def external_drivers(env) -> dict:
         if not sl.external_driven:
             continue
         opts = dict(sl.options or {})
+        if sl.driver.external == "aurorus":
+            from .aurorus_opponent import AurorusDriver, driver_line
+            if rls is None and tracks is not None and getattr(env, "teacher", None) is None:
+                rls = [Raceline.build_cached(t) for t in tracks]
+            out[i] = AurorusDriver(driver_line(env, rls, limits), **opts)
+            continue
         if sl.driver.external == "end2race":
             opts.setdefault("repo", _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
                                                   "external", "baselines", "End2Race"))
@@ -645,7 +653,7 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
 
 #: Kinds that may drive the ego car in place of a checkpoint (the console's "내 차", 2026-10-17).
 EGO_PLANNER_KINDS = ("raceline", "forzaeth", "forzaeth_pred", "lane_switch")
-EGO_EXTERNAL_KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
+EGO_EXTERNAL_KINDS = ("tinylidarnet", "end2race", "ftg", "disparity", "aurorus")
 
 
 class PlannerEgoDriver:
@@ -864,6 +872,12 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
         drv = PlannerEgoDriver(planner, kind, stack, ref=ref, tracker=tracker)
         drv.speed_scale = float(sp.get("speed_scale", 1.0))
         return drv
+    if kind == "aurorus":
+        # its own line follower and avoidance on the line `rls` (`aurorus_opponent.AurorusDriver`); options: scale, floor
+        from .aurorus_opponent import AurorusDriver, driver_line
+        if not rls:
+            raise ValueError("ego 'aurorus' drives a raceline, and this session has none")
+        return AurorusDriver(driver_line(env, rls, limits), **dict(options or {}))
     if kind in EGO_EXTERNAL_KINDS:
         from . import baselines
         opts = dict(options or {})

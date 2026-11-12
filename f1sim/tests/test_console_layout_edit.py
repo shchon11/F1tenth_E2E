@@ -157,7 +157,9 @@ def test_the_layout_file_round_trips_and_refuses_what_it_cannot_place(tmp_path):
     data = LF.load(path)
     assert data["map"] == "real/korea26" and data["seed_origin"] == 4417
     back = LF.from_portable(data["pieces"], cat)
-    assert [p["sid"] for p in back] == [p["sid"] for p in pieces]
+    # the file names a shape, not a catalogue slot: two slots can hold the same shape (12 and 31 are both the 42x34 cm crate)
+    shape = {e["id"]: (e["style"], e["dims"]) for e in cat}
+    assert [shape[p["sid"]] for p in back] == [shape[p["sid"]] for p in pieces]
     assert back[1]["yaw"] == pytest.approx(math.atan2(math.sin(4.0), math.cos(4.0)))
     bad = dict(data["pieces"][0], style="piano")
     with pytest.raises(ValueError, match="목록에 없는"):
