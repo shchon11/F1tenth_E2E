@@ -18,7 +18,10 @@ MAP이 받는 구간별 곡률·속도는 그대로. 기록에 그 각(dlt, 결�
 F1SIM_EXAM_SLIP_FRAME=table + F1SIM_EXAM_SLIP_TABLE=표npz: 같은 일을 참 옆속도 없이, 차가 스스로 아는 값(속도 x 회전 속도 = 옆가속도, 속도)으로
 표(ay, v, beta[rad])에서 읽은 미끄럼 각으로 함 (속도와 회전 속도는 시뮬레이터의 참값: 센서 잡음은 안 넣음). 참 옆속도(vy)는 기록에만 남김.
 F1SIM_EXAM_SPEED_LEAD=초 (제어기 쪽 진단, 시험 점수가 아님): MAP이 속도 명령으로 plan의 첫 0.1 s 구간 속도 대신 그 초만큼 뒤의 속도를 냄
-(속도 루프가 명령을 시간 상수 0.2 s로 따라가서, 첫 구간 속도를 그대로 주면 plan이 낸 가속의 절반도 안 나옴)."""
+(속도 루프가 명령을 시간 상수 0.2 s로 따라가서, 첫 구간 속도를 그대로 주면 plan이 낸 가속의 절반도 안 나옴).
+F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반복되는거에서 특정 구간을 뭔가 이용할 수는 없나"): 결정마다 policy가 읽은
+특징(스캔 인코더 출력 + 정규화한 상태 입력; 기억이 읽는 것)과 그 결정 뒤의 기억 상태를 `출력_mem.npz`(feat, mem; float16)에 따로 남김.
+주행·기록은 그대로."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -33,6 +36,7 @@ OPP_RESTART_S = 2.0
 SLIP = os.environ.get("F1SIM_EXAM_SLIP_FRAME", "")
 assert SLIP in ("", "oracle", "table"), SLIP
 LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
+SAVE_MEM = os.environ.get("F1SIM_EXAM_SAVE_MEM", "") == "1"
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -42,7 +46,7 @@ count = sys.argv[5] if len(sys.argv) > 5 else "max2"
 secs = float(sys.argv[6]) if len(sys.argv) > 6 else 90.0
 rm_t = float(sys.argv[7]) if len(sys.argv) > 7 else 50.0
 assert mode in ("map", "track", "ideal"), mode
-dev = torch.device("cuda")
+dev = torch.device(os.environ.get("F1SIM_EXAM_DEVICE", "cuda"))      # "cpu": a handful of sessions for a quick look
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 assert ck.get("format") == "plan_steps2", ck.get("format")
 # the checkpoint's own scanner place and tyre-limit margin, set before anything reads them
@@ -70,7 +74,7 @@ from f1sim.lidar import HIT_CAR
 from f1sim import props as _props
 
 a = argparse.Namespace(**json.load(open(WORLD)))
-a.envs, a.seed, a.device = n_env, SEED, "cuda"
+a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
 a.prop_bank, a.prop_count = BANK, count
@@ -196,6 +200,9 @@ def snap():
     R["orem"].append(pr.goal.remaining(env.sim.state[others, :2].float(), env.sim.tid[others]).float().cpu())
 
 
+MEM = {"feat": [], "mem": []}
+if SAVE_MEM:
+    assert getattr(actor, "memory", 0), "이 checkpoint에는 기억이 없습니다"
 t0 = time.time()
 for kd in range(T):
     snap()
@@ -204,7 +211,11 @@ for kd in range(T):
         R["dlt"].append(turn.float().cpu()); R["vy"].append(st[:, dyn.IVY].float().cpu())
         st[:, dyn.IYAW] = st[:, dyn.IYAW] + turn            # the plan starts in the frame its scan was taken in
         obs.turn = turn
+    if SAVE_MEM:
+        MEM["feat"].append(torch.cat([actor.enc(obs.scans), actor.norm(obs.state())], 1).half().cpu())
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
+    if SAVE_MEM:
+        MEM["mem"].append(obs.mem_h.half().cpu())
     x, y, psi = plan_world(p, st)
     pc = pr.plan_cost(x, y, psi, p["v"])
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
@@ -264,6 +275,8 @@ for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
+if SAVE_MEM:
+    np.savez(out_npz[:-4] + "_mem.npz", feat=torch.stack(MEM["feat"]).numpy(), mem=torch.stack(MEM["mem"]).numpy())
 c = D["cnt"][-1].sum(0)
 print(f"[{EXAM}{' · 진행 방향 틀(' + SLIP + ')' if SLIP else ''} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
       f"{int(D['rs'].sum())}번, 선 상대 차 다시 출발 {restarter.count if restarter is not None else 0}번 | 누적: "

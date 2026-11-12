@@ -85,3 +85,55 @@ class Rec:
 
 def trk_name(t):
     return "원래 트랙" if t == 0 else f"변형 트랙 {t}"
+
+
+def along_track(z, T):
+    """(T, B) place along the track [m, 0 at the line] from the record's walls-only distance to go (the reward's field; a wall /
+    off-grid sample holds the last value) and the lap index. For lining laps up in ANALYSIS only -- never a policy input."""
+    L = float(z["lapL"][int(z["tid"][0, 0])])
+    rem = z["rem"].astype(float)
+    for t in range(1, rem.shape[0]):
+        bad = ~np.isfinite(rem[t]); rem[t, bad] = rem[t - 1, bad]
+    rem[~np.isfinite(rem)] = 0.0
+    s = np.mod(L - rem[:T], L)
+    d = np.mod(rem[:-1] - rem[1:] + 0.5 * L, L) - 0.5 * L
+    B = rem.shape[1]
+    lap = np.floor((s[0][None] + np.concatenate([np.zeros((1, B)), np.cumsum(d, 0)], 0)[:T]) / L).astype(int)
+    return s, lap, L
+
+
+def auc(score, y):
+    """share of (positive, negative) pairs the score puts in the right order (0.5 = no information)"""
+    y = np.asarray(y).astype(bool)
+    if y.all() or (~y).all():
+        return float("nan")
+    r = np.argsort(np.argsort(score)) + 1.0
+    return float((r[y].sum() - y.sum() * (y.sum() + 1) / 2) / (y.sum() * (~y).sum()))
+
+
+def auc_se(a, n1, n0):
+    """Hanley-McNeil standard error of an AUC from n1 positives and n0 negatives"""
+    if not np.isfinite(a) or n1 < 2 or n0 < 2:
+        return float("nan")
+    q1, q2 = a / (2 - a), 2 * a * a / (1 + a)
+    return float(np.sqrt(max(a * (1 - a) + (n1 - 1) * (q1 - a * a) + (n0 - 1) * (q2 - a * a), 0.0) / (n1 * n0)))
+
+
+def probe_auc(X, y, g, lam=0.1):
+    """a linear read-out of y from X (ridge to +-1, classes balanced, inputs standardized), fit on the even groups `g` and
+    scored on the odd ones and the other way round: (mean AUC of the two halves, its standard error). Groups = sessions, so
+    nothing of a scored session was seen in the fit."""
+    X = np.asarray(X, np.float64); y = np.asarray(y).astype(bool); g = np.asarray(g)
+    res = []
+    for h in (0, 1):
+        tr, te = (g % 2 == h), (g % 2 != h)
+        if X.shape[1] == 0 or y[tr].all() or (~y[tr]).all() or y[te].all() or (~y[te]).all():
+            return float("nan"), float("nan")
+        mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-4
+        A = (X[tr] - mu) / sd
+        w = np.where(y[tr], 0.5 / y[tr].mean(), 0.5 / (1 - y[tr].mean()))
+        t = np.where(y[tr], 1.0, -1.0)
+        coef = np.linalg.solve((A * w[:, None]).T @ A / w.sum() + lam * np.eye(A.shape[1]), (A * w[:, None]).T @ (t - (w * t).sum() / w.sum()) / w.sum())
+        a = auc(((X[te] - mu) / sd) @ coef, y[te])
+        res.append((a, auc_se(a, int(y[te].sum()), int((~y[te]).sum()))))
+    return float(np.mean([r[0] for r in res])), float(np.sqrt(sum(r[1] ** 2 for r in res)) / 2)
