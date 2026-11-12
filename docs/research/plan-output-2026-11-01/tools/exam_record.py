@@ -21,6 +21,8 @@ F1SIM_EXAM_SPEED_LEAD=초 (제어기 쪽 진단, 시험 점수가 아님): MAP�
 (속도 루프가 명령을 시간 상수 0.2 s로 따라가서, 첫 구간 속도를 그대로 주면 plan이 낸 가속의 절반도 안 나옴).
 F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반복되는거에서 특정 구간을 뭔가 이용할 수는 없나"): 결정마다 policy가 읽은
 특징(스캔 인코더 출력 + 정규화한 상태 입력; 기억이 읽는 것)과 그 결정 뒤의 기억 상태를 `출력_mem.npz`(feat, mem; float16)에 따로 남김.
+F1SIM_EXAM_SAVE_SCAN=1 (11-13, policy가 상자를 보고도 왜 그대로 가는지 policy 안에서 보는 분석용): 결정마다 policy가 읽은 가장 새 스캔
+(range_max로 나눈 값, float16; 입력은 이것과 앞 두 결정의 스캔)과 빔마다 맞은 것(lidar.HIT_*)을 `출력_scan.npz`(scan, typ, range_max, angles)에 남김.
 주행·기록은 그대로.
 F1SIM_EXAM_OPP_SLOT=JSON (11-12, 시험 점수가 아니라 상대 차 하나를 따로 보는 기록): 상대 차 자리 설정에 덮어씀(state_rl.build_env의
 `--opp-slot`과 같음). 예: AuRoRus 포팅본만 상대로 `{"kind": "aurorus", "kind_mix": [], "reactive": {}, "events": [], "event_rate": 0.0,
@@ -45,6 +47,7 @@ SLIP = os.environ.get("F1SIM_EXAM_SLIP_FRAME", "")
 assert SLIP in ("", "oracle", "table"), SLIP
 LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
 SAVE_MEM = os.environ.get("F1SIM_EXAM_SAVE_MEM", "") == "1"
+SAVE_SCAN = os.environ.get("F1SIM_EXAM_SAVE_SCAN", "") == "1"   # the newest scan the policy read + what each beam hit
 OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
 REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
 HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent starts half a lap away (the user's events)
@@ -180,6 +183,11 @@ ii = PT_IDX.to(dev)
 T = int(round(secs / PS.DT))
 R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors",
                      "rem", "orem")}
+TWO = getattr(actor, "branches", 1) == 2
+if TWO:
+    # a two-plan policy (11-13): which plan was driven, both logits, and the plan NOT driven (world points, as "pl")
+    R["br"] = []; R["logit"] = []; R["pl_other"] = []
+    obs.prev_branch = torch.zeros(Bl, device=dev)           # the state input exists from the first decision on
 act0 = torch.zeros(env.B, env.act_dim, device=dev)
 kk = torch.zeros(env.B, PS.N_STEP, device=dev); vv = torch.zeros(env.B, PS.N_STEP, device=dev)
 turn = torch.zeros(Bl, device=dev)                          # the frame the newest scan was taken in (SLIP)
@@ -220,6 +228,7 @@ def snap():
 MEM = {"feat": [], "mem": []}
 if SAVE_MEM:
     assert getattr(actor, "memory", 0), "이 checkpoint에는 기억이 없습니다"
+SCN = {"scan": [], "typ": []}
 t0 = time.time()
 for kd in range(T):
     snap()
@@ -230,10 +239,20 @@ for kd in range(T):
         obs.turn = turn
     if SAVE_MEM:
         MEM["feat"].append(torch.cat([actor.enc(obs.scans), actor.norm(obs.state())], 1).half().cpu())
+    if SAVE_SCAN:
+        SCN["scan"].append(obs.scans[:, 0].half().cpu()); SCN["typ"].append(env.last_result.scan_type[lid].to(torch.uint8).cpu())
+    cmd_d0 = obs.cmd_d.clone()
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
     if SAVE_MEM:
         MEM["mem"].append(obs.mem_h.half().cpu())
     x, y, psi = plan_world(p, st)
+    if TWO:
+        br = actor.branch_out
+        p_o = PS.roll(torch.tanh(actor.means_out[torch.arange(Bl, device=dev), 1 - br]),
+                      v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), cmd_d0, lim)
+        xo, yo, _ = plan_world(p_o, st)
+        R["br"].append(br.to(torch.int8).cpu()); R["logit"].append(actor.logits_out.float().cpu())
+        R["pl_other"].append(torch.stack([xo[:, ii], yo[:, ii]], -1).cpu())
     pc = pr.plan_cost(x, y, psi, p["v"])
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
     if mode == "map":
@@ -294,6 +313,9 @@ os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
     np.savez(out_npz[:-4] + "_mem.npz", feat=torch.stack(MEM["feat"]).numpy(), mem=torch.stack(MEM["mem"]).numpy())
+if SAVE_SCAN:
+    np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
+                        range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
 c = D["cnt"][-1].sum(0)
 print(f"[{EXAM}{' · 진행 방향 틀(' + SLIP + ')' if SLIP else ''} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
       f"{int(D['rs'].sum())}번, 선 상대 차 다시 출발 {restarter.count if restarter is not None else 0}번 | 누적: "

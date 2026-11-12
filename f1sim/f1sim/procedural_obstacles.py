@@ -1125,6 +1125,21 @@ class ProceduralObstacles:
                                                     torch.zeros_like(self.sh_mass[sid_k]))[src])
         self.p_vel.index_copy_(0, dst, torch.zeros_like(self.p_vel[:D])[src])
 
+    # ------------------------------------------------------------------ a layout kept and put back
+    #: the tensors that are a row's layout (every reader takes them live, row by row)
+    _LAYOUT = ("p_poses", "p_n", "p_d", "p_zlo", "p_zhi", "p_mass", "p_sid", "slot_pattern")
+
+    def snapshot(self, rows: torch.Tensor) -> dict:
+        """A copy of the layouts standing in `rows`, slot for slot (`restore` puts them back, in any rows)."""
+        return {k: getattr(self, k)[rows].clone() for k in self._LAYOUT}
+
+    def restore(self, rows: torch.Tensor, snap: dict) -> None:
+        """Put layouts taken by `snapshot` into `rows` (one per row, same order), every piece at rest. In place: the
+        compiled step reads these tensors, not the attributes."""
+        for k in self._LAYOUT:
+            getattr(self, k)[rows] = snap[k].to(getattr(self, k).dtype)
+        self.p_vel[rows] = 0.0
+
     # ------------------------------------------------------------------ being pushed
     #: How many consecutive env rows share one prop set: the cars of a race (`SimParams.props_per_race`,
     #: set by `F1VecEnv`). Every row keeps its own copy -- every reader indexes by env row and is left as it

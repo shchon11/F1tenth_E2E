@@ -995,6 +995,8 @@ class F1VecEnv:
         self.race, self.slot = ar // self.M, ar % self.M
         #: prioritized level replay (`learn.level_replay.LevelReplay`, one seat per race); None = off
         self.level_replay = None
+        #: races restarting from a stored scene instead of a fresh grid (`learn.scene_replay.SceneReplay`); None = off
+        self.scene_replay = None
         #: (B,) the level seed each row's race is playing (-1: not drawn through a level replay)
         self.level_seed = torch.full((self.B,), -1, dtype=torch.long, device=self.device)
         if e.opponent not in OPPONENT_MODES:
@@ -2270,7 +2272,17 @@ class F1VecEnv:
         race that resets whole is reset on its own, with the simulator's generator set to the level seed
         the replay chooses for that race seat -- which makes the seed name the whole level: venue variant,
         layout, opponents, grid, physics. The main stream is restored after each, so the rest of the
-        batch draws exactly as it would have. Off (None): exactly the reset it always was."""
+        batch draws exactly as it would have. Off (None): exactly the reset it always was.
+
+        With a `scene_replay` (`learn.scene_replay`): the ordinary reset first, so every per-episode quantity is in its
+        fresh state; then the scene is written over the races the store picks (whole-race resets of its own races
+        only); then one scan from where the cars now stand."""
+        if getattr(self, "scene_replay", None) is not None and ids.numel():
+            if getattr(self, "level_replay", None) is not None:
+                raise RuntimeError("scene_replay and level_replay both set: one way of choosing a restart at a time")
+            self._reset_envs_core(ids, fill=False)
+            self.scene_replay.apply(self, ids)
+            return self._fill_scans(ids, self.sim.odom.state[ids, 3])
         if getattr(self, "level_replay", None) is None or ids.numel() == 0:
             return self._reset_envs_core(ids)
         M = self.M
@@ -2525,6 +2537,17 @@ class F1VecEnv:
             speed = torch.where(is_full & empty, torch.zeros_like(speed), speed)
         if self.M > 1:
             self._note_spawn_formation(ids, abreast_rows)
+        self._reset_bookkeeping(ids, speed)
+        if not fill:
+            return None
+        return self._fill_scans(ids, speed)
+
+    def _reset_bookkeeping(self, ids: torch.Tensor, speed: torch.Tensor) -> None:
+        """What a reset sets that follows from where the cars now stand and how fast (`sim.reset` done, seats parked):
+        the odometry's speed, the held action, the follower, the opponents' drivers, the contact latches, the episode
+        counters. A function of its own since 11-13: a scene restart (`learn.scene_replay`) places the cars a second
+        time and calls it again, so nothing here can be left describing the grid the scene replaced."""
+        e = self.ecfg
         self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
@@ -2593,9 +2616,6 @@ class F1VecEnv:
             L_ = self.sim.track.length[self.sim.tid[ids]].clamp_min(1e-6)
             self.sector_idx[ids] = (s_new / L_ * self.sector_lim.shape[1]).long().clamp_(0, self.sector_lim.shape[1] - 1)
             self.sector_t0[ids] = 0.0; self.sector_valid[ids] = False; self.s_prev[ids] = s_new
-        if not fill:
-            return None
-        return self._fill_scans(ids, speed)
 
     def restart_cars(self, ids: torch.Tensor, far: bool = True) -> None:
         """Respawn these cars now, between two steps, in the race they are in (same track, same layout, same driver):

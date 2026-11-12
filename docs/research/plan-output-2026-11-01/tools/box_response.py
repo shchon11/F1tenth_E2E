@@ -34,6 +34,8 @@ lid = env.learner_ids; Bl = int(lid.numel())
 actor = load_actor2(ck, dev)
 pr = PlanReward(env, float(A.get("gamma", 0.995)), dev)
 obs = PlanObs2(env, lim, pr.goal)
+if getattr(actor, "branches", 1) == 2:
+    obs.prev_branch = torch.zeros(Bl, device=dev)   # a two-plan policy's input exists before the first decision (state_in below)
 drv = PR.Driver(env, lim, pr, obs)
 po = env.procedural
 rm_p = float(getattr(world, "removal_p", 0.0))

@@ -133,7 +133,9 @@ class PlanObs:
 
     def set_plan(self, xy: torch.Tensor, v: torch.Tensor, rows: Optional[torch.Tensor] = None) -> None:
         if rows is None:
-            self.plan_xy, self.plan_v = xy, v
+            # its own copies: `reset_rows` writes rows in place, and the caller's plan must not change under it (until 11-13
+            # a restart zeroed the caller's plan speeds: the tail's speed targets of the decision before an episode's end)
+            self.plan_xy, self.plan_v = xy.clone(), v.clone()
         else:
             self.plan_xy = torch.where(rows[:, None, None], xy, self.plan_xy)
             self.plan_v = torch.where(rows[:, None], v, self.plan_v)
@@ -237,6 +239,8 @@ class PlanRunner:
                 print(f"[plan] LiDAR {mx:.3f} m ahead of the CoG (the checkpoint's)", flush=True)
             self.actor = load_actor2(ck, device, check_mount=False)
             self.obs = PlanObs2(env, self.lim, None)
+            if self.actor.branches == 2:
+                self.obs.prev_branch = torch.zeros(int(self.lid.numel()), device=device)
         else:
             self.actor = load_actor(ck, device)
             self.obs = PlanObs(env, self.lim, None)
@@ -301,10 +305,13 @@ class PlanRunner:
             elif self.v2:
                 h_old = getattr(self.obs, "mem_h", None)
                 h_old = h_old.clone() if h_old is not None else None
+                b_old = self.obs.prev_branch.clone() if self.obs.prev_branch is not None else None
                 _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 if h_old is not None and getattr(self.actor, "memory", 0):
                     # a memory steps once per decision: rows not deciding now keep theirs
                     self.obs.mem_h = torch.where(due[:, None], self.obs.mem_h, h_old)
+                if b_old is not None:
+                    self.obs.prev_branch = torch.where(due, self.obs.prev_branch, b_old)
                 self.v_hat = v_hat
             else:
                 mean, _ = self.actor(self.obs.scans, self.obs.state())
@@ -393,20 +400,41 @@ class Actor2(nn.Module):
     `mem_keep_s` > 0 (11-12, at the start only): the GRU's update gate begins holding, each value's keep time spread over
     0.2 s .. this long (Tallec & Ollivier 2018; `mem_keep_log`: as many values per octave, so half of them stay short).
     PyTorch's default starts every value at ~0.2 s: the learning signal a lap back was 1e-12, and the value-like target
-    above left the memory at 0.56 (= no memory) without this."""
+    above left the memory at 0.56 (= no memory) without this.
+    `branches` = 2 (11-13, the user: "2는 괜찮네."): two plans and a choice between them. Measured on plan25y u125
+    (`tools/side_flip.py`, `box_react.py`): before a box it hits hard the plan aims within 0.3 m of the box's centre in 44 %
+    of the decisions beyond 1.5 m (clean passes 14 %) and settles its side at 1.9 m (clean 3.1 m) -- one Gaussian between
+    "left of it" and "right of it" has its mean on the box. `pi` gives two means (`all_heads`), `choice` two logits. The
+    two are told apart by one thing only: the first step's turn of plan 0 is never right of plan 1's (their middle and a
+    gap >= 0, softplus -- so the two cannot swap roles from state to state, and where one way is right the gap goes to 0);
+    every other output is each plan's own. The speed estimate and the noise are shared. Driving takes the plan with the
+    larger logit; training samples the choice (plan_rl --branches). The state gets one more input, the plan chosen last
+    (`PlanObs2.prev_branch`: +1 plan 0, -1 plan 1, 0 at a start), so a side once taken can be kept. `heads` returns the
+    chosen plan in the one-plan shape and leaves `branch_out`, `logits_out`, `means_out` for those who want both."""
+
+    GAP0 = 0.5                # the gap between the two plans' first-step turn at the start (the action before its tanh)
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
-                 mem_keep_log: bool = False):
+                 mem_keep_log: bool = False, branches: int = 1):
         super().__init__()
-        sd = STATE_DIM2 if state_dim is None else int(state_dim)
+        self.branches = int(branches)
+        if self.branches not in (1, 2):
+            raise ValueError("branches: 1 or 2")
+        sd = (STATE_DIM2 + (1 if self.branches == 2 else 0)) if state_dim is None else int(state_dim)
         self.mem_front = bool(mem_front) and int(memory) > 0
         self.enc = ScanEncoder(beams)
         self.norm = RunningNorm(sd)
         self.trunk = nn.Sequential(nn.Linear(256 + sd + (int(memory) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
-        self.pi = nn.Linear(hidden, PS.ACT_DIM)
+        self.pi = nn.Linear(hidden, self.branches * PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
+        if self.branches == 2:
+            self.choice = nn.Linear(hidden, 2)
+            nn.init.zeros_(self.choice.weight); nn.init.zeros_(self.choice.bias)       # both plans as likely at the start
+            with torch.no_grad():
+                self.pi.bias[PS.ACT_DIM] = math.log(math.expm1(self.GAP0))
+        self.branch_out = self.logits_out = self.means_out = None
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
         self.memory = int(memory)
@@ -430,8 +458,23 @@ class Actor2(nn.Module):
         return x if self.mem_front else self.trunk(x)
 
     def heads(self, f: torch.Tensor):
+        if self.branches == 2:
+            means, logits, log_std, v_hat = self.all_heads(f)
+            br = logits.argmax(1)
+            self.branch_out, self.logits_out, self.means_out = br, logits, means
+            return means[torch.arange(f.shape[0], device=f.device), br], log_std, v_hat
         log_std = torch.maximum(self.log_std, self.log_std_floor)
         return self.pi(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
+
+    def all_heads(self, f: torch.Tensor):
+        """two plans: (means (B, 2, 20), the choice's logits (B, 2), log_std (B, 20), the speed estimate (B,)). Plan 0's
+        first-step turn is the middle + gap / 2, plan 1's the middle - gap / 2 (a larger turn output steers left)"""
+        raw = self.pi(f).view(-1, 2, PS.ACT_DIM)
+        mid, gap = raw[:, 0, 0], nn.functional.softplus(raw[:, 1, 0])
+        first = torch.stack([mid + 0.5 * gap, mid - 0.5 * gap], 1)
+        means = torch.cat([first[:, :, None], raw[:, :, 1:]], 2)
+        log_std = torch.maximum(self.log_std, self.log_std_floor)
+        return means, self.choice(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
 
     def keep_init(self, keep_s: float, log: bool = False) -> None:
         """the update gate's bias so that value k of the memory, left alone, keeps 1 - 1/T_k of itself per decision"""
@@ -442,14 +485,18 @@ class Actor2(nn.Module):
             self.gru.bias_ih[n: 2 * n] = torch.log(t - 1.0).to(self.gru.bias_ih)
             self.gru.bias_hh[n: 2 * n] = 0.0
 
-    def memory_alone(self, f_seq: torch.Tensor, h: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+    def memory_alone(self, f_seq: torch.Tensor, h: torch.Tensor, done: torch.Tensor,
+                     h_start: Optional[torch.Tensor] = None) -> torch.Tensor:
         """the memory's states along a replayed sequence on features it cannot move: (L, n, F) from the state `h` each began
         with -> (L * n, memory). What the training's read-outs (`aux`, `v_mem`) learn from: they teach the memory and leave
-        what feeds it -- the LiDAR part, the policy's -- alone. `done` (L, n): a restart clears the state for the decisions after it"""
+        what feeds it -- the LiDAR part, the policy's -- alone. `done` (L, n): a restart clears the state for the decisions
+        after it -- or, with `h_start` (L, n, memory), sets it to the state that decision was driven from (zero after an
+        ordinary restart, a stored scene's memory after a scene restart)"""
         hs = []
         for i in range(f_seq.shape[0]):
             if i > 0:
-                h = h * (1.0 - done[i - 1])[:, None]
+                h = (h * (1.0 - done[i - 1])[:, None] if h_start is None
+                     else torch.where(done[i - 1][:, None] > 0, h_start[i], h))
             h = self.gru(f_seq[i].detach(), h)
             hs.append(h)
         return torch.cat(hs, 0)
@@ -479,6 +526,9 @@ class PlanObs2(PlanObs):
         self.rel_v = torch.zeros(Bl, PS.N_STEP, device=dev)          # its speeds
         self.cmd_d = torch.zeros(Bl, device=dev)                     # its steering / speed 0.1 s in: what was commanded
         self.cmd_v = torch.zeros(Bl, device=dev)
+        # a two-plan actor (`Actor2.branches`): which plan was chosen last, +1 / -1, 0 at a start (B_l,). None = no such
+        # input (every one-plan policy)
+        self.prev_branch = None
         super().__init__(env, lim, goal, rows)
 
     def reset_rows(self, rows: torch.Tensor) -> None:
@@ -488,6 +538,8 @@ class PlanObs2(PlanObs):
         self.rel[rows] = 0.0; self.rel_v[rows] = 0.0; self.cmd_d[rows] = 0.0; self.cmd_v[rows] = 0.0
         if getattr(self, "mem_h", None) is not None:
             self.mem_h[rows] = 0.0                                   # a new episode remembers nothing
+        if self.prev_branch is not None:
+            self.prev_branch[rows] = 0.0
 
     def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
         """the plan just drawn (`plan_steps.roll`, in the frame it was drawn from): kept in its own 0.1 s pose's frame"""
@@ -499,7 +551,7 @@ class PlanObs2(PlanObs):
         rel = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c], -1)
         cd, cv = p["delta"][:, i1], p["v"][:, i1]
         if rows is None:
-            self.rel, self.rel_v, self.cmd_d, self.cmd_v = rel, p["pv"], cd, cv
+            self.rel, self.rel_v, self.cmd_d, self.cmd_v = rel, p["pv"].clone(), cd.clone(), cv.clone()   # its own (see `set_plan`)
         else:
             self.rel = torch.where(rows[:, None, None], rel, self.rel)
             self.rel_v = torch.where(rows[:, None], p["pv"], self.rel_v)
@@ -513,7 +565,8 @@ class PlanObs2(PlanObs):
             imu = r.imu[self.lid].float().mean(1)                  # gyro xyz, accel xyz
         else:
             imu = torch.zeros(Bl, 6, device=self.rel.device)
-        return torch.cat([imu, self.cmd_d[:, None], self.cmd_v[:, None], self.rel.reshape(Bl, -1), self.rel_v], 1)
+        s = torch.cat([imu, self.cmd_d[:, None], self.cmd_v[:, None], self.rel.reshape(Bl, -1), self.rel_v], 1)
+        return s if self.prev_branch is None else torch.cat([s, self.prev_branch[:, None]], 1)
 
     def priv(self) -> torch.Tensor:
         """v1's critic extras and the true speed / steering (training only)"""
@@ -537,7 +590,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
     aux = ck["actor"].get("aux.weight")
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
                    memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,
-                   mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"]).to(device)
+                   mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"],
+                   branches=int(ck["args"].get("branches", 1) or 1)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
@@ -546,7 +600,11 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
 def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False):
     """one decision of a v2 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate and the last
     steering command. A memory actor's state is `obs.mem_h` (made here, cleared by `obs.reset_rows`), stepped once per call:
-    call once per decision."""
+    call once per decision. A two-plan actor (`Actor2.branches`): the plan with the larger logit; `obs.prev_branch` (made
+    here) is the input that says which was chosen last, `actor.means_out` / `logits_out` hold both plans."""
+    two = getattr(actor, "branches", 1) == 2
+    if two and getattr(obs, "prev_branch", None) is None:
+        obs.prev_branch = torch.zeros(obs.scans.shape[0], device=obs.scans.device)
     h = None
     if getattr(actor, "memory", 0):
         h = getattr(obs, "mem_h", None)
@@ -555,6 +613,8 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False):
     mean, log_std, v_hat = actor(obs.scans, obs.state(), h)
     if getattr(actor, "memory", 0):
         obs.mem_h = actor.h_out.detach()
+    if two:
+        obs.prev_branch = 1.0 - 2.0 * actor.branch_out.float()
     u = mean + log_std.exp() * torch.randn_like(mean) if sample else mean
     p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
     return u, mean, log_std, v_hat, p
