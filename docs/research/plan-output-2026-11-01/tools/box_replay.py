@@ -12,8 +12,12 @@
   바뀌는 것(FORCE) - 행 번호나 역할을 담은 것(NEVER). 목록은 로그와 기록(copied)에 남김.
 자기 점검 (BOX_REPLAY_SELFTEST=1): 센서 잡음 매개변수를 모두 0으로 두면 복제는 원본과 끝까지 같은 길을 가야 함. 주기마다 덮어쓰기 직전에
   원본과의 차이를 냄 (차이가 있으면 덮어쓰지 않은 상태가 남았다는 뜻). 끝에 통과/실패와 종료 코드.
+(11-13) 복제 갈래 L / R = 복제 직후 처음 몇 결정 동안만 조향 명령에 왼쪽(+) / 오른쪽(-)으로 몇 도를 더함(그 뒤는 policy 그대로).
+  물음: 상자에 세게 닿는 접근에서 policy는 왼쪽·오른쪽을 정하지 못해 가운데로 가는가(그러면 조금 밀어 준 쪽으로 계속 가서 피함),
+  상자를 늦게 알아채는가(그러면 밀어 줘도 원래 길로 돌아가 똑같이 닿음).
 인자: checkpoint 출력npz [묶음 수 21] [초 90] [주기 초 3.0] [상자 개수 max2|uniform]
-환경 변수: F1SIM_EXAM_DEVICE(cuda|cpu), F1SIM_EXAM_SEED, BOX_REPLAY_ARMS="3,1,1"(A, B, C 복제 수)"""
+환경 변수: F1SIM_EXAM_DEVICE(cuda|cpu), F1SIM_EXAM_SEED, BOX_REPLAY_ARMS="3,1,1"(A, B, C 복제 수, 다섯 개면 + L, R),
+  BOX_REPLAY_NUDGE="2.0,3"(L/R: 조향에 더하는 각 [deg], 복제 뒤 결정 수)"""
 import os, sys, json, argparse, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -24,8 +28,11 @@ sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 BANK = "/home/shchon11/f1sim_runs/prop_banks_exam1"
 SEED = int(os.environ.get("F1SIM_EXAM_SEED", 20261112))
 SELFTEST = os.environ.get("BOX_REPLAY_SELFTEST", "") == "1"
-NA, NB, NC = (int(x) for x in os.environ.get("BOX_REPLAY_ARMS", "3,1,1").split(","))
-K = 1 + NA + NB + NC
+_arms = [int(x) for x in os.environ.get("BOX_REPLAY_ARMS", "3,1,1").split(",")] + [0, 0]
+NA, NB, NC, NL, NR = _arms[:5]
+K = 1 + NA + NB + NC + NL + NR
+_nd = os.environ.get("BOX_REPLAY_NUDGE", "2.0,3").split(",")
+NUDGE_RAD, NUDGE_N = float(_nd[0]) * np.pi / 180.0, int(_nd[1])
 DET_N = 20                                # decisions driven to find what a step changes
 B_BACK, B_POS, B_YAW, B_LAP = 30, 0.5, 0.6, 15   # arm B: >= 3 s back, within 0.5 m / 0.6 rad, the latest such visit
 
@@ -85,7 +92,9 @@ i_hk, i_hx, i_hy, i_hs = (CC.index(k) for k in ("held_kind", "held_x", "held_y",
 act0 = torch.zeros(B, env.act_dim, device=dev)
 kL = torch.arange(Bl, device=dev)
 grp, mem_j = kL // K, kL % K
-arm = torch.where(mem_j == 0, 0, torch.where(mem_j <= NA, 1, torch.where(mem_j <= NA + NB, 2, 3)))
+arm = torch.where(mem_j == 0, 0, torch.where(mem_j <= NA, 1, torch.where(mem_j <= NA + NB, 2, torch.where(
+    mem_j <= NA + NB + NC, 3, torch.where(mem_j <= NA + NB + NC + NL, 4, 5)))))
+nudge_dir = torch.where(arm == 4, 1.0, torch.where(arm == 5, -1.0, 0.0))     # L: + (left), R: -
 dk = torch.nonzero(mem_j != 0)[:, 0]; sk = grp[dk] * K     # replicate rows and their sources (into the learner rows)
 src = torch.arange(G, device=dev) * K
 if SELFTEST:
@@ -162,10 +171,13 @@ def differs(x, y):
     return bool((x != y).any())
 
 
-def decide():
-    """one decision of every learner row, as exam_record.py's ideal mode -> (plan points, restarted)"""
+def decide(nudge=None):
+    """one decision of every learner row, as exam_record.py's ideal mode -> (plan points, restarted). `nudge` (Bl,) [rad] is
+    added to the plan's steering commands (and so to the commands the next decision reads as its last ones)"""
     st = env.sim.state[lid].clone()
     _, _, _, _, p = plan_v2(actor, obs, lim)
+    if nudge is not None:
+        p["cmd_d"] = p["cmd_d"] + nudge[:, None].to(p["cmd_d"].dtype)
     x, y, psi = plan_world(p, st)
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
     env.sim.ideal_vcap[lid] = 1e3
@@ -225,7 +237,7 @@ for p in sorted(set(S0) | set(S1) | set(S2), key=pname):
     (DYN if take else SKIP).append((p, ax))
 missing = sorted(FORCE - {pname(p) for p, _ in DYN})
 del S0, S1, S2
-print(f"B {B} · 학습 차 {Bl} = 묶음 {G} x (원본 1 + A {NA} + B {NB} + C {NC}) · 덮어쓸 텐서 {len(DYN)}개, 안 덮어쓰는 것 {len(SKIP)}개 "
+print(f"B {B} · 학습 차 {Bl} = 묶음 {G} x (원본 1 + A {NA} + B {NB} + C {NC} + L {NL} + R {NR}, L/R {NUDGE_RAD * 180 / np.pi:g} deg x {NUDGE_N}결정) · 덮어쓸 텐서 {len(DYN)}개, 안 덮어쓰는 것 {len(SKIP)}개 "
       f"({time.time() - t_build:.0f} s)", flush=True)
 print("  덮어씀: " + " ".join(pname(p) + ("[1]" if ax else "") for p, ax in DYN), flush=True)
 print("  안 덮어씀: " + " ".join(pname(p) for p, _ in SKIP), flush=True)
@@ -329,7 +341,7 @@ for kd in range(T):
         H_mem[kd] = obs.mem_h[src]
     snap()
     c0 = counts()
-    pts, restarted = decide()
+    pts, restarted = decide(nudge_dir * NUDGE_RAD if (NL + NR > 0 and not SELFTEST and kd % PER < NUDGE_N) else None)
     c1 = counts()
     win_rs |= restarted
     if SELFTEST:
@@ -350,7 +362,8 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          t_res=trk.t_res.cpu().numpy(), t_origin=trk.t_origin.cpu().numpy(),
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT), cols=np.array(COLS),
          name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
-         grp=grp.cpu().numpy(), arm=arm.to(torch.int8).cpu().numpy(), period=np.array(PER), sync_t=np.array(SY["t"]),
+         grp=grp.cpu().numpy(), arm=arm.to(torch.int8).cpu().numpy(), period=np.array(PER),
+         nudge_deg=np.array(NUDGE_RAD * 180.0 / np.pi), nudge_n=np.array(NUDGE_N), sync_t=np.array(SY["t"]),
          div=torch.stack(SY["div"]).numpy(), bvalid=torch.stack(SY["bvalid"]).numpy(), btau=torch.stack(SY["btau"]).numpy(),
          copied=np.array([pname(p) for p, _ in DYN]), selftest=np.array(SELFTEST), seed=np.array(SEED), count=np.array(count),
          bank=np.array(BANK), lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0))

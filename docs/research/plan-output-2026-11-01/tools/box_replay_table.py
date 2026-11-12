@@ -14,8 +14,8 @@ from rec_lib import Rec, plt, C_BOX
 
 NEAR, FAR, AFTER = 1.5, 3.0, 10          # [m] a pass: box within NEAR at the crossing; a new pass needs FAR in between; decisions after
 BINS = [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0), (2.0, 2.9)]
-ARM = {0: "원본", 1: "A 그대로", 2: "B 지난 바퀴 기억", 3: "C 기억 0"}
-COL = {0: "#0b0b0b", 1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a"}
+ARM = {0: "원본", 1: "A 그대로", 2: "B 지난 바퀴 기억", 3: "C 기억 0", 4: "L 왼쪽으로 틂", 5: "R 오른쪽으로 틂"}
+COL = {0: "#0b0b0b", 1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#8a5cd0", 5: "#d0a020"}
 C_HIT, MUTED = "#d03b3b", "#898781"
 rng = np.random.default_rng(0)
 
@@ -156,6 +156,8 @@ def side(x):
 
 
 out_prefix, files = sys.argv[1], sys.argv[2:]
+_present = sorted({int(a) for f in files for a in np.unique(np.load(f)["arm"])})     # the arms the records hold (11-13: + L, R)
+ARMS0 = tuple(_present); ARMS1 = tuple(a for a in _present if a != 0)
 E, W = [], []
 n_pass = n_drop = 0
 for fn in files:
@@ -165,7 +167,7 @@ print(f"[복제 주행 표] 기록 {len(files)}개 ({', '.join(os.path.basename(
 print(f"원본의 상자 통과 {n_pass}번 가운데 주기 안에서 볼 수 있는 것 {len(E)}번 (주기 끝 0.1 s에 걸리거나 재시작이 낀 것 {n_drop}번 제외)")
 nh, nt = sum(e["hard"] for e in E), sum(e["touch"] and not e["hard"] for e in E)
 print(f"원본: 세게 닿음 {pct(nh, len(E))} · 약하게만 닿음 {pct(nt, len(E))}")
-for a in (0, 1, 2, 3):
+for a in ARMS0:
     bt = boot(E, lambda e: (sum(o["hard"] for o in res(e, a)), len(res(e, a))))
     print(f"  {ARM[a]:<12} 주기 안 결과: 세게 닿음 {fmt(bt)} · 판정 안 된 복제(주기 안에 상자에 못 감) "
           f"{sum(len([o for o in e['out'] if o['arm'] == a]) - len(res(e, a)) for e in E)}")
@@ -191,7 +193,7 @@ print("\n(2) 기억을 바꾼 복제 - 원본이 상자까지 1.0 s 넘게 남�
 print(f"{'원본 결과':<10}{'갈래':<16}{'세게 닿음':<28}{'닿음(약하게 포함)':<28}{'원본과 같은 쪽':<26}{'옆 자리 차이 중앙 / 90 % [m]'}")
 for kd in ("세게 닿음", "약하게 닿음", "안 닿음", "모두"):
     S = [e for e in E if e["lead"] >= 1.0 and (kd == "모두" or kind(e) == kd)]
-    for a in (0, 1, 2, 3):
+    for a in ARMS0:
         if not S:
             continue
         bh = boot(S, lambda e: (sum(o["hard"] for o in res(e, a)), len(res(e, a))))
@@ -206,7 +208,7 @@ print("  원본 줄 = 원본 자신을 그 주기 안에서만 본 것(잣대 �
 print("\n(3) 지난번에 그 상자를 지난 쪽과 견줌 - 지난 통과가 있고 1.0 s 넘게 남았을 때 복제한 통과만")
 print(f"{'갈래':<16}{'지난번과 다른 쪽으로 감':<28}{'같은 쪽으로 간 통과의 세게 닿음':<34}{'다른 쪽으로 간 통과의 세게 닿음'}")
 S = [e for e in E if e["lead"] >= 1.0 and e["prev_lat"] is not None]
-for a in (0, 1, 2, 3):
+for a in ARMS0:
     O = [(o, e) for e in S for o in res(e, a) if o["lat0"] is not None]
     oth = [(o, e) for o, e in O if side(o["lat0"]) != side(e["prev_lat"])]
     sam = [(o, e) for o, e in O if side(o["lat0"]) == side(e["prev_lat"])]
@@ -214,7 +216,7 @@ for a in (0, 1, 2, 3):
 for lab, cond in (("지난번에 세게 닿은 상자", True), ("지난번에 안 닿거나 약하게 닿은 상자", False)):
     S2 = [e for e in S if e["prev_hard"] == cond]
     print(f"  {lab}: 통과 {len(S2)}번 · " + " · ".join(
-        f"{ARM[a]} 세게 {fmt(boot(S2, lambda e: (sum(o['hard'] for o in res(e, a)), len(res(e, a)))))}" for a in (0, 1, 2, 3)))
+        f"{ARM[a]} 세게 {fmt(boot(S2, lambda e: (sum(o['hard'] for o in res(e, a)), len(res(e, a)))))}" for a in ARMS0))
 
 print("\n(4) 한 통과 안에서 원본 + A 복제가 모두 같은 쪽으로 갔는가 (셋 이상 판정된 통과)")
 for lo, hi in BINS:
@@ -228,7 +230,7 @@ for lo, hi in BINS:
     print(f"  {lo:.1f}-{hi:.1f} s: 모두 같은 쪽 {pct(len(un), len(U))} · 그 안의 세게 닿음 {pct(hu, nu)} | 쪽이 갈린 통과의 세게 닿음 {pct(hs, ns)}")
 
 print("\n(5) 주기 끝(3 s 뒤)에 복제가 원본에서 벌어진 거리 [m]: 중앙 / 90 % (복제-주기 수)")
-for a in (1, 2, 3):
+for a in ARMS1:
     row = []
     for hb, lab in ((True, "상자 통과가 든 주기"), (False, "상자 통과가 없는 주기")):
         v = np.array([x[2] for x in W if x[0] == a and x[1] == hb])
@@ -268,7 +270,7 @@ for lo, hi in ((0.5, 1.0), (1.0, 2.9)):
 print("\n(9) 상자 옆을 지나는 순간: 복제의 속도 - 원본의 속도 [m/s], 상자와의 옆 간격(가운데끼리) [m] - 1.0 s 넘게 남았을 때 복제한 통과")
 src_gap = np.array([abs(e["lat0"]) for e in E if e["crossed"] and e["lead"] >= 1.0])
 print(f"  원본: 옆 간격 중앙 {np.median(src_gap):.2f} · 하위 10 % {np.percentile(src_gap, 10):.2f} · 하위 2 % {np.percentile(src_gap, 2):.2f} ({len(src_gap)})")
-for a in (1, 2, 3):
+for a in ARMS1:
     O = [(o, e) for e in E if e["crossed"] and e["lead"] >= 1.0 for o in res(e, a) if o["crossed"] and o["v"] is not None]
     if not O:
         continue
@@ -351,13 +353,13 @@ def scenes(S, fn, title):
                 h = max(2.6, 0.5 * np.hypot(e["box"][0] - r.st[t0, s, 0], e["box"][1] - r.st[t0, s, 1]) + 1.6)
                 ax.set_xlim(cx - h, cx + h); ax.set_ylim(cy - h, cy + h)
                 txt = []
-                for a in (1, 2, 3):
+                for a in ARMS1:
                     oo = [o for o in e["out"] if o["arm"] == a]
                     if oo:
                         txt.append(f"{ARM[a][0]} 세게 {sum(o['hard'] for o in oo)}/{len(oo)}")
                 ax.set_title(f"{e['fn'].split('_')[-1][:-4]} 묶음 {e['g']} · {t0 * r.dt:.0f} s · {e['n']}번째 통과 · 상자까지 {e['lead']:.1f} s · {e['v0']:.1f} m/s\n"
                              f"원본 {kind(e)} | " + " · ".join(txt), fontsize=8.4, loc="left")
-    hs = [plt.Line2D([], [], color=COL[a], lw=2, label=ARM[a] + (" (네모 = 복제한 순간의 차)" if a == 0 else "")) for a in (0, 1, 2, 3)]
+    hs = [plt.Line2D([], [], color=COL[a], lw=2, label=ARM[a] + (" (네모 = 복제한 순간의 차)" if a == 0 else "")) for a in ARMS0]
     hs.append(plt.Line2D([], [], color=C_HIT, marker="x", ls="", ms=8, mew=2, label="세게 닿은 순간의 차 자리"))
     fig.legend(handles=hs, loc="lower center", ncol=5, frameon=False, fontsize=9.5)
     fig.suptitle(title, fontsize=12, x=0.01, y=1 - 0.06 / (4.75 * nr), ha="left", va="top")
