@@ -1,0 +1,19 @@
+== 결정마다 새로 (지금 학습): batch rollout 14개, gradient rollout 7개
+   앞에 상자 없음: 더 빠르게                          평균 +0.0041 ± 0.0007 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0026  ·  평균/흩어짐 +1.61  ·  부호가 평균과 같은 rollout 14/14
+   가까이 지나갈 상자가 1.5~6 m 앞: 더 빠르게             평균 -0.0058 ± 0.0129 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0484  ·  평균/흩어짐 -0.12  ·  부호가 평균과 같은 rollout 7/14
+   모든 결정: 조향을 더 왼쪽으로                        평균 +0.0050 ± 0.0011 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0040  ·  평균/흩어짐 +1.24  ·  부호가 평균과 같은 rollout 12/14
+   서로 다른 rollout 둘의 gradient cosine (조향): 평균 +0.210, 가장 낮은 쌍 -0.39, 가장 높은 쌍 +0.80, 0보다 큰 쌍 15/21
+   서로 다른 rollout 둘의 gradient cosine (속도): 평균 +0.047, 가장 낮은 쌍 -0.64, 가장 높은 쌍 +0.76, 0보다 큰 쌍 12/21
+== 0.7 남김: batch rollout 14개, gradient rollout 7개
+   앞에 상자 없음: 더 빠르게                          평균 +0.0140 ± 0.0028 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0103  ·  평균/흩어짐 +1.36  ·  부호가 평균과 같은 rollout 12/14
+   가까이 지나갈 상자가 1.5~6 m 앞: 더 빠르게             평균 -0.0873 ± 0.0164 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0612  ·  평균/흩어짐 -1.43  ·  부호가 평균과 같은 rollout 13/14
+   모든 결정: 조향을 더 왼쪽으로                        평균 +0.0210 ± 0.0024 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0089  ·  평균/흩어짐 +2.35  ·  부호가 평균과 같은 rollout 14/14
+   서로 다른 rollout 둘의 gradient cosine (조향): 평균 +0.742, 가장 낮은 쌍 +0.39, 가장 높은 쌍 +0.89, 0보다 큰 쌍 21/21
+   서로 다른 rollout 둘의 gradient cosine (속도): 평균 +0.158, 가장 낮은 쌍 -0.55, 가장 높은 쌍 +0.85, 0보다 큰 쌍 13/21
+== 0.9 남김: batch rollout 14개, gradient rollout 7개
+   앞에 상자 없음: 더 빠르게                          평균 +0.0211 ± 0.0062 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0231  ·  평균/흩어짐 +0.91  ·  부호가 평균과 같은 rollout 10/14
+   가까이 지나갈 상자가 1.5~6 m 앞: 더 빠르게             평균 -0.1027 ± 0.0196 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0732  ·  평균/흩어짐 -1.40  ·  부호가 평균과 같은 rollout 14/14
+   모든 결정: 조향을 더 왼쪽으로                        평균 +0.0561 ± 0.0052 s (rollout 사이 표준오차)  ·  rollout 하나의 흩어짐 0.0193  ·  평균/흩어짐 +2.90  ·  부호가 평균과 같은 rollout 14/14
+   서로 다른 rollout 둘의 gradient cosine (조향): 평균 +0.838, 가장 낮은 쌍 +0.72, 가장 높은 쌍 +0.98, 0보다 큰 쌍 21/21
+   서로 다른 rollout 둘의 gradient cosine (속도): 평균 +0.011, 가장 낮은 쌍 -0.77, 가장 높은 쌍 +0.89, 0보다 큰 쌍 9/21
+그림 /home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out/netaudit/batch_grad_compare_plan25y_u150.png

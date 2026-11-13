@@ -49,6 +49,14 @@ for name, d in runs:
                 jk.append(np.mean([g[i] @ g[j] / (nr[i] * nr[j]) for i, j in itertools.combinations(idx, 2)]))
             se = np.sqrt((len(g) - 1) / len(g) * ((np.array(jk) - np.mean(jk)) ** 2).sum())
             say(f"  {kn:<6} {gname:<14} {cs.mean():+.3f} ±{se:.3f}   {np.median(nr):.4f}   {np.linalg.norm(g.mean(0)):.4f}")
+            if gname == "전체":
+                # rollouts are not exchangeable (episodes of 400 decisions run in step over rollouts of 128), so the pairs are shown too
+                C = (g / nr[:, None]) @ (g / nr[:, None]).T
+                say(f"         rollout {first}..{first + len(g) - 1} 서로의 cosine:")
+                for r_ in C:
+                    say("           " + " ".join(f"{c_:+.2f}" for c_ in r_))
+                ib = names.index("pi.bias"); o_ = int(sizes[:ib].sum()); j_ = int(np.argmax(np.abs(G[:, o_:o_ + sizes[ib]]).sum(0)))
+                say(f"         출력 층 bias[{j_}]에 걸린 gradient (음수 = 그 출력을 키우라는 쪽), rollout마다: " + " ".join(f"{x_:+.3f}" for x_ in G[:, o_ + j_]))
 if len(runs) > 1:
     say("\n=== 서로 다른 잡음 방식의 평균 gradient가 같은 쪽을 가리키나 (cosine) ===")
     for (a, _), (b, _) in itertools.combinations(runs, 2):

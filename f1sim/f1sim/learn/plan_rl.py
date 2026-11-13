@@ -1050,6 +1050,9 @@ def main(argv=None):
             np.savez(os.path.join(args.dump_rollout, f"g{upd}.npz"), names=np.array(names_), sizes=np.array([p_.numel() for p_ in pr_]),
                      **{k_: torch.cat([a_.reshape(-1) for a_ in v_]).cpu().numpy() for k_, v_ in gsum.items()})
             print(f"[plan_rl] update {upd}: rollout + its policy gradient saved ({t_roll:.0f} s), no update made", flush=True)
+            del gsum, bAn, w_
+            bS = bX = bPV = bU = bVT = bLP = bA = bR = bV = bFM = None   # the next rollout needs the room (7.5 GB card)
+            torch.cuda.empty_cache()
             continue
         tu0 = time.time()
         for ep in range(args.epochs):
