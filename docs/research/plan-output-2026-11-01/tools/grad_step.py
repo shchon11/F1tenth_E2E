@@ -8,6 +8,8 @@ drives the copy in the frozen exam (same seed -> same worlds as the unmoved chec
     python3 grad_step.py CHECKPOINT DUMP_DIR OUT.pt DISTANCE [ROLLOUTS, default 4-10: their mean | one number: that rollout] [steer+speed | steer | speed]
 
 DISTANCE < 0 moves the other way (the control: if the direction is real, that must drive worse).
+DUMP_DIR = random:SEED:DIR -> a random direction (Gaussian over all weights, seed SEED; DIR only gives the weight layout): the
+control for 'any move of this size changes the driving'.
 """
 import sys, os, glob
 import numpy as np, torch
@@ -16,10 +18,15 @@ ck_path, dump, out, dist = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv
 rr = sys.argv[5] if len(sys.argv) > 5 else "4-10"
 parts = (sys.argv[6] if len(sys.argv) > 6 else "steer+speed").split("+")
 lo, hi = (int(x) for x in rr.split("-")) if "-" in rr else (int(rr), int(rr))
+rand = dump.startswith("random:")
+if rand:
+    _, seed, dump = dump.split(":", 2)
 fs = [os.path.join(dump, f"g{u}.npz") for u in range(lo, hi + 1)]
 Z = [np.load(f) for f in fs]
 names = [str(n) for n in Z[0]["names"]]; sizes = Z[0]["sizes"]
 g = np.mean([sum(z[p].astype(np.float64) for p in parts) for z in Z], 0)
+if rand:
+    g = np.random.default_rng(int(seed)).standard_normal(g.shape[0]); parts = [f"무작위 방향 시드 {seed}"]
 step = -dist * g / np.linalg.norm(g)
 ck = torch.load(ck_path, map_location="cpu", weights_only=False)
 sd = ck["actor"]; o = 0

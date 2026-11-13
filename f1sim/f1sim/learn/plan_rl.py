@@ -398,6 +398,8 @@ def main(argv=None):
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatches", type=int, default=8)
+    ap.add_argument("--accum", type=int, default=1, help="minibatches whose gradients are summed into one optimizer step "
+                    "(1 = a step per minibatch, as before; = --minibatches: one step per epoch over the whole rollout)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr-end", type=float, default=1e-4)
@@ -417,6 +419,10 @@ def main(argv=None):
                     "batches): every update's rollout is saved here as u<N>.npz -- per decision the first step's noise, the "
                     "steering it gave, advantage, value, reward parts, hard contacts, the boxes ahead, the pose -- and NO update "
                     "is made")
+    ap.add_argument("--track-steps", default="", help="measurement (11-14): an npz of directions in the actor's weight space (names, "
+                    "sizes, dir_<key> unit vectors over its trainable weights, + = the way that drove better). Every optimizer step's "
+                    "move of the actor is projected on each, and in the first epoch each loss term's gradient too; saved per update "
+                    "as <run>/track/t<N>.npz. Training itself is unchanged")
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
     ap.add_argument("--stall-s", type=float, default=0.0,
@@ -717,6 +723,16 @@ def main(argv=None):
     T = args.horizon
     log = open(os.path.join(run, "progress.jsonl"), "a")
     t0 = time.time()
+    trk = None
+    if args.track_steps:
+        # --track-steps: how far each optimizer step moves the actor along directions measured elsewhere
+        import numpy as np
+        zt = np.load(args.track_steps)
+        trk_p = [p_ for p_ in actor.parameters() if p_.requires_grad]
+        assert [str(n_) for n_ in zt["names"]] == [n_ for n_, p_ in actor.named_parameters() if p_.requires_grad]
+        trk = {k_[4:]: torch.as_tensor(zt[k_], dtype=torch.float32, device=dev) for k_ in zt.files if k_.startswith("dir_")}
+        trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
+        os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1, args.updates + 1):
         frac = (upd - 1) / max(1, args.updates - 1)
         for gp in opt.param_groups:
@@ -1055,6 +1071,13 @@ def main(argv=None):
             torch.cuda.empty_cache()
             continue
         tu0 = time.time()
+        acc_i = 0
+        if trk is not None:
+            th_prev = trk_flat(); th_start = th_prev.clone()
+            T_ = {k_: [] for k_ in ("step_norm", "grad_norm", "clip_coef")}
+            for k_ in trk:
+                T_[f"step_{k_}"] = []; T_[f"grad_{k_}"] = []
+            T_terms = {}
         for ep in range(args.epochs):
             for sel in batches():
                 if v2:
@@ -1077,9 +1100,11 @@ def main(argv=None):
                 pl = -(torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_) * m_).sum() / n_
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
+                terms_ = {"policy": pl, "vest": args.vest_coef * el}
                 if memv_on:
                     lmv = (aux_box["v"] - bRn[mb]).pow(2).mean()
                     loss = loss + args.mem_value * lmv
+                    terms_["memv"] = args.mem_value * lmv
                     mvs.append(float(lmv.detach()))
                 if args.grad_split and args.memory and v2 and ep == 0:
                     for k_, l_ in (("policy", pl), ("speed", args.vest_coef * el)) + ((("value", args.mem_value * lmv),) if memv_on else ()):
@@ -1102,6 +1127,7 @@ def main(argv=None):
                         lv = nn.functional.smooth_l1_loss(pc_["pv"][:, 1:], tgv[:, :-1], reduction="none")
                         lc = (lpos + lv).mean()
                         loss = loss + args.tail_consistency * lc
+                        terms_["tail"] = args.tail_consistency * lc
                         cls_.append(float(lc.detach()))
                         ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
                 if aux_on:
@@ -1137,14 +1163,58 @@ def main(argv=None):
                     ls_ = (nn.functional.smooth_l1_loss(jerk, torch.zeros_like(jerk), reduction="none") * ok_s).sum() / ok_s.sum().clamp_min(1.0)
                     loss = loss + args.smooth_reg * ls_
                     sms.append(float(ls_.detach()))
-                opt.zero_grad(set_to_none=True); loss.backward()
-                nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
+                if trk is not None and ep == 0:
+                    for k_, l_ in terms_.items():
+                        if not l_.requires_grad:
+                            continue
+                        gs_ = torch.autograd.grad(l_, trk_p, retain_graph=True, allow_unused=True)
+                        g_ = -torch.cat([(g1 if g1 is not None else torch.zeros_like(p_)).reshape(-1) for g1, p_ in zip(gs_, trk_p)])
+                        e_ = T_terms.setdefault(k_, {"norm": [], "sum": torch.zeros_like(g_), **{d_: [] for d_ in trk}})
+                        e_["norm"].append(float(g_.norm())); e_["sum"] += g_
+                        for d_, v_ in trk.items():
+                            e_[d_].append(float(g_ @ v_))
+                        del gs_, g_
+                if acc_i % args.accum == 0:
+                    opt.zero_grad(set_to_none=True)
+                (loss / args.accum if args.accum > 1 else loss).backward(); acc_i += 1
+                if acc_i % args.accum:
+                    with torch.no_grad():
+                        kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
+                        cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
+                        vls.append(float(vl)); els.append(float(el))
+                    continue
+                gn_all = nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
+                if trk is not None:
+                    g_ = -torch.cat([(p_.grad if p_.grad is not None else torch.zeros_like(p_)).reshape(-1) for p_ in trk_p])
+                    T_["grad_norm"].append(float(g_.norm())); T_["clip_coef"].append(min(1.0, args.max_grad / (float(gn_all) + 1e-6)))
+                    for d_, v_ in trk.items():
+                        T_[f"grad_{d_}"].append(float(g_ @ v_))
                 opt.step()
+                if trk is not None:
+                    th_ = trk_flat(); dth = th_ - th_prev; th_prev = th_
+                    T_["step_norm"].append(float(dth.norm()))
+                    for d_, v_ in trk.items():
+                        T_[f"step_{d_}"].append(float(dth @ v_))
                 with torch.no_grad():
                     kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
                     cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
+        if trk is not None:
+            # per optimizer step: the actor's move and the clipped gradient (descent sign) along each direction; per loss term
+            # (first epoch, per minibatch): its descent direction along each, and the term summed over the first epoch
+            dth = th_prev - th_start
+            sv_ = {k_: np.array(v_) for k_, v_ in T_.items()}
+            sv_["lr"] = np.array(opt.param_groups[0]["lr"]); sv_["update_norm"] = np.array(float(dth.norm()))
+            for d_, v_ in trk.items():
+                sv_[f"update_{d_}"] = np.array(float(dth @ v_))
+            for k_, e_ in T_terms.items():
+                sv_[f"term_{k_}_norm"] = np.array(e_["norm"]); sv_[f"term_{k_}_sum"] = e_["sum"].cpu().numpy().astype(np.float16)
+                for d_ in trk:
+                    sv_[f"term_{k_}_{d_}"] = np.array(e_[d_])
+            sv_["update_move"] = dth.cpu().numpy().astype(np.float16)
+            np.savez(os.path.join(run, "track", f"t{upd}.npz"), **sv_)
+            del dth, th_start
         secs = T * PS.DT
         mins = secs * n_ord / 60.0
         dc = (pr.n_contacts - c0)[ordm].sum(0)
