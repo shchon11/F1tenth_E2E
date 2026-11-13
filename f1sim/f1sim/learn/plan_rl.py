@@ -955,8 +955,6 @@ def main(argv=None):
                                 v_last=v_last.cpu().numpy(), r=R_.cpu().numpy(), done=D_.cpu().numpy().astype(np.uint8),
                                 boxes=f16(torch.stack(PV)[:, :, _P0:_P0 + _w]), gamma=args.gamma, lam=args.lam,
                                 **{k: torch.stack(v_).cpu().numpy() for k, v_ in DMP.items()})
-            print(f"[plan_rl] update {upd}: rollout saved ({t_roll:.0f} s), no update made", flush=True)
-            continue
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
         bFM = FM_.reshape(-1)                                  # the policy learns from the decisions it made
@@ -1024,6 +1022,35 @@ def main(argv=None):
             # a decision has a next plan to learn from unless it is the rollout's last or its car restarted in it
             c_ok = torch.ones(NB, dtype=torch.bool, device=dev); c_ok[-Bl:] = False
             c_ok &= D_.reshape(-1) <= 0
+        if args.dump_rollout:
+            # the direction this rollout alone would push the actor (no step is made): the policy loss of the first pass
+            # (ratio 1, advantage normalised over the whole rollout), its gradient through the steering mean, the speed
+            # mean and the noise sizes kept apart. Rollouts are independent, so the cosine between two of them is the
+            # share of one rollout's push that is signal.
+            pr_ = [p_ for p_ in actor.parameters() if p_.requires_grad]
+            gsum = {k_: [torch.zeros_like(p_) for p_ in pr_] for k_ in ("steer", "speed", "std")}
+            nF = bFM.sum().clamp_min(1.0); muA = (bA * bFM).sum() / nF
+            bAn = (bA - muA) / (((bA - muA).pow(2) * bFM).sum() / nF).sqrt().add(1e-8)
+            for sel in batches():
+                mean, log_std, _, mb, _ = actor_on(sel) if v2 else (*actor(bX[sel], bS[sel]), None, sel, None)
+                w_ = bAn[mb] * bFM[mb] / nF
+                ii_ = rl_idx if tailc else torch.arange(PS.ACT_DIM, device=dev)
+                st_ = ii_ < PS.N_STEP
+                um_, mm_, ls_ = bU[mb][:, ii_], mean[:, ii_], log_std[:, ii_]
+                ls_parts = (("steer", tanh_logp(um_[:, st_], mm_[:, st_], ls_[:, st_].detach())),
+                            ("speed", tanh_logp(um_[:, ~st_], mm_[:, ~st_], ls_[:, ~st_].detach())),
+                            ("std", tanh_logp(um_, mm_.detach(), ls_)))
+                for j_, (k_, lp_) in enumerate(ls_parts):
+                    for a_, g_ in zip(gsum[k_], torch.autograd.grad(-(lp_ * w_).sum(), pr_, retain_graph=j_ < 2, allow_unused=True)):
+                        if g_ is not None:
+                            a_ += g_
+                del mean, log_std, ls_parts, lp_, um_, mm_, ls_      # the graph goes before the next minibatch's is built
+                aux_box.clear()
+            names_ = [n_ for n_, p_ in actor.named_parameters() if p_.requires_grad]
+            np.savez(os.path.join(args.dump_rollout, f"g{upd}.npz"), names=np.array(names_), sizes=np.array([p_.numel() for p_ in pr_]),
+                     **{k_: torch.cat([a_.reshape(-1) for a_ in v_]).cpu().numpy() for k_, v_ in gsum.items()})
+            print(f"[plan_rl] update {upd}: rollout + its policy gradient saved ({t_roll:.0f} s), no update made", flush=True)
+            continue
         tu0 = time.time()
         for ep in range(args.epochs):
             for sel in batches():
