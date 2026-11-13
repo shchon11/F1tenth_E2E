@@ -410,6 +410,13 @@ def main(argv=None):
     ap.add_argument("--save-every", type=int, default=25)
     ap.add_argument("--init", default="", help="v3: start the actor from this v2 checkpoint (its 36 inputs + the servo angle at 0), "
                     "the critic's scan encoder too")
+    ap.add_argument("--noise-corr", type=float, default=0.0,
+                    help="exploration noise that stays over decisions: AR(1) coefficient per decision (0 = a fresh draw every "
+                         "decision; 0.8 = half gone after 0.3 s). The size of the noise at one decision is unchanged")
+    ap.add_argument("--dump-rollout", default="", help="measurement only (with --init --init-critic: a checkpoint's own training "
+                    "batches): every update's rollout is saved here as u<N>.npz -- per decision the first step's noise, the "
+                    "steering it gave, advantage, value, reward parts, hard contacts, the boxes ahead, the pose -- and NO update "
+                    "is made")
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
     ap.add_argument("--stall-s", type=float, default=0.0,
@@ -632,6 +639,7 @@ def main(argv=None):
     lag_lo, lag_hi = max(args.scene_lag // 2, 1), args.scene_lag + args.scene_lag // 2
     hist = collections.deque(maxlen=lag_hi + 1)                    # the last decisions' states, the newest last
     since = torch.zeros(Bl, dtype=torch.long, device=dev)          # decisions driven since the row's last restart
+    eps_n = torch.randn(Bl, PS.ACT_DIM, device=dev)                # the exploration noise that stays (--noise-corr)
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -722,6 +730,7 @@ def main(argv=None):
         sc_new = torch.zeros(3, device=dev)                    # --scene-replay: scenes taken this update, by what was hit
         sc_dec = sc_end = sc_end_hit = 0
         AX = []                                                # --mem-aux: the boxes ahead at each decision
+        DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
         n_removed = 0
         n_restarted = 0
         near_sum = torch.zeros(Bl, device=dev)
@@ -790,17 +799,34 @@ def main(argv=None):
                     br_n["arg_switch"] += float(((arg_ != arg_prev).float() * same_ep).sum())
                     br_n["pairs"] += float(same_ep.sum())
                     br_prev, arg_prev = br, arg_
+                if args.noise_corr > 0:
+                    # exploration noise that stays for several decisions (AR(1), each decision still N(0, 1) by itself; a
+                    # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
+                    # 2021) and coloured noise in PPO (Hollenstein et al. 2024) do
+                    eps_n = args.noise_corr * eps_n + (1.0 - args.noise_corr ** 2) ** 0.5 * torch.randn_like(mean)
+                    eps = eps_n
+                else:
+                    eps = torch.randn_like(mean)
                 if tailc:
-                    u = mean + log_std.exp() * torch.randn_like(mean) * rl_mask      # the tail: its mean, no noise
+                    u = mean + log_std.exp() * eps * rl_mask                         # the tail: its mean, no noise
                     lp = tanh_logp(u[:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
                 else:
-                    u = mean + log_std.exp() * torch.randn_like(mean)
+                    u = mean + log_std.exp() * eps
                     lp = tanh_logp(u, mean, log_std)
                 if two:
                     lp = lp + pb[ar_l, br].log()
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
                 v = critic(sc, s, pv_)
                 v_true = env.sim.state[lid, dyn.IVX].float().clone()
+                if args.dump_rollout:
+                    # the first 0.1 s steering the sample commands and the one the mean would have [rad]
+                    vh_ = v_hat.clamp(-PS.V_REV, PS.V_FWD)
+                    DMP["mean"].append(mean[:, rl_idx].clone()); DMP["std"].append(log_std.exp().expand_as(mean)[:, rl_idx].clone())
+                    DMP["d_samp"].append(PS.step_targets(torch.tanh(u), vh_, obs.cmd_d, lim)[0][:, 0].clone())
+                    DMP["d_mean"].append(PS.step_targets(torch.tanh(mean), vh_, obs.cmd_d, lim)[0][:, 0].clone())
+                    st_ = env.sim.state[lid].float()
+                    DMP["pose"].append(torch.stack([st_[:, 0], st_[:, 1], st_[:, 2], st_[:, dyn.IVX], env.sim.tid[lid].float()], 1))
+                    hard_d0 = env.sim.contact_counts[lid, 3:6].clone()
                 p = None
                 if v3:
                     # the plan knows the control delay: from the speed estimate, the servo angle the last plan left and the
@@ -830,6 +856,10 @@ def main(argv=None):
                 if levels is not None:
                     hard0 = env.sim.contact_counts[lid, 3:6].clone()
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if args.dump_rollout:
+                    DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
+                    for k in ("contact", "lap", "shaping"):
+                        DMP[k].append(out[k].clone())
                 if levels is not None and env.level_replay is not None:
                     hd = (env.sim.contact_counts[lid, 3:6] - hard0).clamp_min(0).float()
                     hd[:, 2] = hd[:, 2] * (pr.seen_t <= SEEN_S + PS.DT).float()      # a car the reward charges for
@@ -877,6 +907,8 @@ def main(argv=None):
                     sc_dec += int(in_rep0.sum()); sc_end += int(ended_.sum()); sc_end_hit += int((ended_ & rep_hit).sum())
                     rep_hit &= ~out["restarted"]
                 since = torch.where(out["restarted"], torch.zeros_like(since), since + 1)
+                if args.noise_corr > 0:
+                    eps_n = torch.where(out["restarted"][:, None], torch.randn_like(eps_n), eps_n)
                 cool += 1
                 if tailc:
                     ii_ = PT_IDX.to(dev)
@@ -914,6 +946,17 @@ def main(argv=None):
             gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
             adv[t] = gae
         ret = adv + V_
+        if args.dump_rollout:
+            import numpy as np
+            os.makedirs(args.dump_rollout, exist_ok=True)
+            f16 = lambda a: a.cpu().numpy().astype(np.float16)
+            np.savez_compressed(os.path.join(args.dump_rollout, f"u{upd}.npz"),
+                                u=torch.stack(U)[:, :, rl_idx].cpu().numpy(), adv=adv.cpu().numpy(), v=V_.cpu().numpy(),
+                                v_last=v_last.cpu().numpy(), r=R_.cpu().numpy(), done=D_.cpu().numpy().astype(np.uint8),
+                                boxes=f16(torch.stack(PV)[:, :, _P0:_P0 + _w]), gamma=args.gamma, lam=args.lam,
+                                **{k: torch.stack(v_).cpu().numpy() for k, v_ in DMP.items()})
+            print(f"[plan_rl] update {upd}: rollout saved ({t_roll:.0f} s), no update made", flush=True)
+            continue
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
         bFM = FM_.reshape(-1)                                  # the policy learns from the decisions it made
