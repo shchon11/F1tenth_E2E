@@ -552,11 +552,33 @@ def main(argv=None):
     ap.add_argument("--scene-episode-s", type=float, default=5.0, help="[s] an episode that starts from a scene lasts this long")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dist-world", type=int, default=1, help="(11-14) processes training ONE policy together, one per GPU, each "
+                    "driving its own cars (--envs per process: give the slower GPU fewer); every optimizer step averages their "
+                    "gradients weighted by decisions, the observation statistics and return scale are merged after each rollout. "
+                    "Start one process per GPU with the same arguments except --dist-rank / --envs / CUDA_VISIBLE_DEVICES")
+    ap.add_argument("--dist-rank", type=int, default=0, help="0 logs and saves; others write only to <run>/rank<N>/")
+    ap.add_argument("--dist-init", default="tcp://127.0.0.1:29533")
+    ap.add_argument("--dist-backend", default="gloo", choices=("gloo", "nccl"))
+    ap.add_argument("--dist-same-seed", action="store_true", help="test only: every process drives the same seed")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
     args = ap.parse_args(argv)
+    dist = None
+    if args.dist_world > 1:
+        import datetime
+        import torch.distributed as dist
+        if (args.dump_rollout or args.track_steps or args.level_replay > 0 or args.self_opp > 0 or args.branches == 2
+                or args.hold_p > 0 or args.scene_replay > 0 or args.accum > 1):
+            raise SystemExit("--dist-world: not with --dump-rollout / --track-steps / --level-replay / --self-opp / --branches 2 / "
+                             "--hold-p / --scene-replay / --accum (use --accum-actor)")
+        dist.init_process_group(args.dist_backend, init_method=args.dist_init, rank=args.dist_rank, world_size=args.dist_world,
+                                timeout=datetime.timedelta(minutes=30))
+        if args.dist_rank > 0 and not args.dist_same_seed:
+            args.seed += 7919 * args.dist_rank          # its own cars, boxes, opponents and noise; the weights come from rank 0
     torch.manual_seed(args.seed)
     dev = torch.device(args.device)
     run = os.path.join(args.runs, args.name)
+    if args.dist_rank > 0:
+        run = os.path.join(run, f"rank{args.dist_rank}")
     if os.path.exists(os.path.join(run, "progress.jsonl")):
         raise SystemExit(f"{run} already has a run: pick an unused name")
     os.makedirs(run, exist_ok=True)
@@ -735,6 +757,48 @@ def main(argv=None):
     else:
         opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
         opt_c = None
+    dist_w = 1.0                                    # this process's share of the update's decisions (--dist-world)
+
+    def dist_grads(params):
+        """--dist-world: every process's gradient on `params`, weighted by its share of the decisions, summed into all"""
+        if dist is None:
+            return
+        ps_ = list(params)
+        flat = torch.cat([(p_.grad if p_.grad is not None else torch.zeros_like(p_)).reshape(-1) for p_ in ps_]) * dist_w
+        dist.all_reduce(flat)
+        o_ = 0
+        for p_ in ps_:
+            n_ = p_.numel()
+            p_.grad = flat[o_:o_ + n_].view_as(p_).clone(); o_ += n_
+
+    def dist_sum(*xs):
+        """--dist-world: float sums over the processes (a tensor of them)"""
+        t_ = torch.tensor([float(x_) for x_ in xs], dtype=torch.float64, device=dev)
+        if dist is not None:
+            dist.all_reduce(t_)
+        return t_
+
+    def norm_snap():
+        return [(m_.mean.double().clone(), m_.var.double().clone(), m_.count.double().clone()) for m_ in (actor.norm, critic.norm)]
+
+    def norm_merge(snap):
+        """--dist-world: the observation statistics as if one process had seen every process's rollout (each started from the
+        same `snap`; parallel mean/variance from the counts, sums and sums of squares each added)"""
+        if dist is None:
+            return
+        for m_, (m0, v0, c0) in zip((actor.norm, critic.norm), snap):
+            m1, v1, c1 = m_.mean.double(), m_.var.double(), m_.count.double()
+            add = torch.cat([(c1 - c0).reshape(1), m1 * c1 - m0 * c0, (v1 + m1 * m1) * c1 - (v0 + m0 * m0) * c0])
+            dist.all_reduce(add)
+            n_ = m0.numel(); c_ = c0 + add[0]
+            mean_ = (m0 * c0 + add[1:1 + n_]) / c_
+            var_ = ((v0 + m0 * m0) * c0 + add[1 + n_:]) / c_ - mean_ * mean_
+            m_.mean.copy_(mean_.float()); m_.var.copy_(var_.clamp_min(0.0).float()); m_.count.copy_(c_.float())
+
+    if dist is not None:
+        # one policy: every process starts from rank 0's weights and statistics
+        for t_ in list(actor.parameters()) + list(actor.buffers()) + list(critic.parameters()) + list(critic.buffers()):
+            dist.broadcast(t_.data, 0)
     json.dump({"args": vars(args), "world": vars(world), "priv_dim": priv_dim, "beams": obs.beams},
               open(os.path.join(run, "args.json"), "w"), indent=1, default=str)
     print(f"[plan_rl] {args.name}: 환경 {env.B} (학습 차 {Bl}), 결정 0.1 s, 롤아웃 {args.horizon}결정, LiDAR {obs.beams}빔 x {3}장, "
@@ -781,6 +845,7 @@ def main(argv=None):
                   flush=True)
         lv0 = (levels.n_new, levels.n_replay, levels.ended, levels.ended_hit) if levels is not None else None
         tr0 = time.time()
+        nsnap = norm_snap() if dist is not None else None
         actor.eval(); critic.eval()
         for t in range(T):
             with torch.no_grad():
@@ -969,6 +1034,8 @@ def main(argv=None):
         with torch.no_grad():
             v_last = critic(obs.scans, obs.state(), priv_h())
         t_roll = time.time() - tr0
+        if dist is not None:
+            norm_merge(nsnap)
         # GAE; a restart (episode end) cuts the trace and bootstraps from the value before it
         V_ = torch.stack(V); R_ = torch.stack(R); D_ = torch.stack(D); FM_ = torch.stack(FM)
         adv = torch.zeros_like(R_); gae = torch.zeros(Bl, device=dev)
@@ -1047,8 +1114,13 @@ def main(argv=None):
         als, aac, aac_far, alo, sms, mvs = [], [], [], [], [], []
         aux_box = {}
         g_split = {"policy": [], "speed": [], "value": []}
+        if dist is not None:
+            ss_ = dist_sum(bFM.sum(), bR.numel(), bR.sum(), bR.pow(2).sum())
+            dist_w = float(bFM.sum()) / float(ss_[0]); n_all = float(ss_[0])
+            r_mu = ss_[2] / ss_[1]; r_sd = (ss_[3] / ss_[1] - r_mu * r_mu).clamp_min(1e-12).sqrt()
         if memv_on:
-            bRn = (bR - bR.mean()) / bR.std().clamp_min(1e-6)
+            bRn = ((bR - bR.mean()) / bR.std().clamp_min(1e-6) if dist is None else
+                   (bR - float(r_mu)) / max(float(r_sd), 1e-6))
         if two:
             bBR = torch.cat(BR)
         if tailc:
@@ -1109,17 +1181,26 @@ def main(argv=None):
                 gs2_ += float(g_.pow(2).sum()); nb_ += 1; bs_ += float(n_)
                 del mean, log_std, lp_, g_
                 aux_box.clear()
-            bs_ /= nb_; bb_ = bs_ * nb_
-            gb2_ = float((gsum_ / nb_).pow(2).sum()); gs2_ /= nb_
+            if dist is None:
+                bs_ /= nb_; bb_ = bs_ * nb_
+                gb2_ = float((gsum_ / nb_).pow(2).sum()); gs2_ /= nb_
+            else:
+                # every process's minibatch gradients: the big batch = all decisions (weighted mean of the processes' means)
+                gm_ = gsum_ / nb_ * dist_w
+                dist.all_reduce(gm_)
+                tt_ = dist_sum(gs2_, nb_, bs_)
+                gb2_ = float(gm_.pow(2).sum()); gs2_ = float(tt_[0] / tt_[1]); bs_ = float(tt_[2] / tt_[1]); bb_ = n_all
+                del gm_
             G2_ = (bb_ * gb2_ - bs_ * gs2_) / (bb_ - bs_); tr_ = (gs2_ - gb2_) / (1.0 / bs_ - 1.0 / bb_)
             ns_ema = (G2_, tr_) if ns_ema is None else (0.9 * ns_ema[0] + 0.1 * G2_, 0.9 * ns_ema[1] + 0.1 * tr_)
             b_noise = ns_ema[1] / ns_ema[0] if ns_ema[0] > 0 else float("inf")
             k_ = 1
+            bstep_ = bb_ / args.minibatches                     # decisions in one minibatch step (all processes)
             if args.accum_auto_frac > 0:
-                while k_ * 2 <= args.minibatches and k_ * 2 * bs_ <= args.accum_auto_frac * b_noise:
+                while k_ * 2 <= args.minibatches and k_ * 2 * bstep_ <= args.accum_auto_frac * b_noise:
                     k_ *= 2
             else:
-                while k_ * 2 <= args.minibatches and k_ * bs_ < b_noise:
+                while k_ * 2 <= args.minibatches and k_ * bstep_ < b_noise:
                     k_ *= 2
             args.accum_actor = k_
             del gsum_
@@ -1232,6 +1313,7 @@ def main(argv=None):
                         opt.zero_grad(set_to_none=True)
                     opt_c.zero_grad(set_to_none=True)
                     loss.backward(); acc_i += 1
+                    dist_grads(critic.parameters())
                     nn.utils.clip_grad_norm_(list(critic.parameters()), args.max_grad)
                     opt_c.step()
                     if acc_i % args.accum_actor:
@@ -1250,6 +1332,7 @@ def main(argv=None):
                             cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                             vls.append(float(vl)); els.append(float(el))
                         continue
+                dist_grads(list(actor.parameters()) + ([] if opt_c is not None else list(critic.parameters())))
                 gn_all = nn.utils.clip_grad_norm_(list(actor.parameters()) + ([] if opt_c is not None else list(critic.parameters())), args.max_grad)
                 if trk is not None:
                     g_ = -torch.cat([(p_.grad if p_.grad is not None else torch.zeros_like(p_)).reshape(-1) for p_ in trk_p])
@@ -1289,6 +1372,8 @@ def main(argv=None):
             print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
                "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
+               "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
+               "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,
                "stopped": float(stop_sum[ordm].mean()) / T, "contacts_wall_per_min": float(dc[0]) / mins,
                "stall_s_per_min": float((pr.stall_time - st0)[ordm].sum()) / mins,
@@ -1353,7 +1438,7 @@ def main(argv=None):
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
-        if upd % args.save_every == 0 or upd == args.updates:
+        if (upd % args.save_every == 0 or upd == args.updates) and args.dist_rank == 0:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
                        os.path.join(run, f"plan_u{upd}.pt"))
