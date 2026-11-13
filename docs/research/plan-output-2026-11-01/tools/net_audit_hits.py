@@ -31,7 +31,7 @@ GD = torch.device("cuda" if torch.cuda.is_available() else "cpu")      # the col
 SCN = os.environ.get("NET_HITS_SCENES", "")  # png: draw scenes from this tool's output OUT.npz instead of measuring
 CKP = os.environ.get("NET_HITS_CKPTS", "")  # net_audit.py's _pairs.npz: the reaction by distance for each checkpoint (arguments after the record)
 GAP = os.environ.get("NET_HITS_PLANGAP", "0") == "1"   # from OUT.npz: would the plan drawn before each hit have touched the box
-log = open(OUT + (f".scenes_{os.environ.get('NET_HITS_WHICH', 'early')}.txt" if SCN else ".plangap.txt" if GAP else ".ckpts.txt" if CKP else ".txt"), "w")
+log = open(OUT + (f".scenes_{os.environ.get('NET_HITS_WHICH', 'early')}.txt" if SCN else ".plangap.txt" if GAP else ".value.txt" if os.environ.get("NET_HITS_VALUE", "0") == "1" else ".ckpts.txt" if CKP else ".txt"), "w")
 
 
 def say(*a):
@@ -418,6 +418,117 @@ def plan_gap():
             f"상자가 plan의 도는 쪽 안에 있음 {np.mean(A[tn, 3] > 0) * 100:.0f} %")
 
 
+def find_events(o):
+    """(hard hits [(world, decision of the hit, box)], clean passes of a box straight ahead [(world, decision level with the box,
+    box)] chosen as the main loop below chooses them, near passes [(world, decision of the closest approach, box)]: every pass
+    within 0.8 m centre to centre with no contact of any kind from 3 s before to 0.5 s after, at most 3 a world -- a comparison
+    set that does not select on where the box stood in the car's view)"""
+    R = o.R; T = o.T; H, C, N = [], [], []; o.n_near = 0
+    hard = R.d[:T, :, 4] > 0; anyhard = R.d[:T, :, 3:6].sum(-1) > 0; touch = R.d[:T, :, 1] > 0; anyc = R.d[:T].sum(-1) > 0
+    rng = np.random.default_rng(0)
+    for b in np.nonzero((R.sid[0] >= 0).any(-1))[0]:
+        for t in np.nonzero(hard[:o.k_rm, b])[0]:
+            if t - R.k0[t, b] < 12 or anyhard[max(t - LOOK, 0): t, b].any() or abs(o.st[t - 1, b, 3]) < 1.0:
+                continue
+            pp = o.polys(t - 1, b)
+            if pp:
+                body = R.body(*o.st[t, b, :3]).mean(0)
+                H.append((int(b), int(t), int(min(pp, key=lambda k: np.hypot(*(pp[k].mean(0) - body))))))
+        t = 3; n_c = 0
+        while t < o.k_rm - 30 and n_c < 2:
+            x, y, yaw = o.st[t, b, :3]; c, s = np.cos(yaw), np.sin(yaw); best = None
+            for j, poly in o.polys(t, b).items():
+                dx, dy = poly.mean(0) - [x, y]; ax, ay = dx * c + dy * s, -dx * s + dy * c
+                if 2.5 < ax < 3.2 and abs(ay) < 0.3:
+                    best = j
+            if best is not None and abs(o.st[t, b, 3]) > 1.0 and not touch[t: t + 30, b].any() and not anyhard[max(t - 20, 0): t, b].any() and t - R.k0[t, b] > 12:
+                te = t
+                while te < o.k_rm - 1:
+                    x, y, yaw = o.st[te, b, :3]; dx, dy = o.polys(te, b)[best].mean(0) - [x, y]
+                    if dx * np.cos(yaw) + dy * np.sin(yaw) < 0.3:
+                        break
+                    te += 1
+                C.append((int(b), int(te), int(best))); n_c += 1; t = te + 40
+            else:
+                t += 1
+        near = []
+        for j in range(R.sid.shape[2]):
+            ok = R.sid[:o.k_rm, b, j] >= 0
+            d = np.where(ok, np.hypot(*(R.pose[:o.k_rm, b, j, :2] - o.st[:o.k_rm, b, :2]).T), np.inf)
+            for t in np.nonzero((d[1:-1] < 0.8) & (d[1:-1] <= d[:-2]) & (d[1:-1] < d[2:]))[0] + 1:
+                if t - R.k0[t, b] > LOOK + 2 and t + 6 < o.k_rm and not anyc[t - LOOK: t + 6, b].any() and abs(o.st[t - 10, b, 3]) > 1.0:
+                    near.append((int(b), int(t), int(j)))
+        o.n_near += len(near)
+        N += [near[i] for i in sorted(rng.choice(len(near), min(3, len(near)), replace=False))]
+    return H, C, N
+
+
+def value_trace():
+    """what the critic (it is given the boxes' places) makes of the box about to be hit / passed, by time before: its value as
+    recorded, and its value with that box taken out of its inputs (the scans as `One.scans` erases it, and the box's slot of the
+    privileged box block). Records made with F1SIM_EXAM_SAVE_VALUE=1. Values in seconds (laps x T_REF). Also saved per decision
+    for read-outs (net_audit_value_probe.py): the actor's trunk input and memory, the critic's inputs."""
+    from f1sim.learn.plan_policy import Critic
+    from f1sim.learn.plan_reward import T_REF
+    TAGS = ("세게 닿음", "안 닿고 지나감", "가까이 지나감")
+    rows = {k: [] for k in TAGS}; XA = {k: [] for k in TAGS}; XC = {k: [] for k in TAGS}; err = []; eid = 0; n_near = 0
+    for fn in recs:
+        o = One(fn); R = o.R
+        zp = np.load(fn[:-4] + "_priv.npz"); PV = zp["priv"]; VS = zp["value"]; P0, w_ = [int(v) for v in zp["box_cols"]]
+        critic = Critic(o.SC.shape[2], PV.shape[2], state_dim=o.F.shape[2] - 256).to(dev)
+        critic.load_state_dict(ck["critic"]); critic.eval()
+        EV = find_events(o); n_near += o.n_near
+        say(f"== {os.path.basename(fn)}: 세게 닿음 {len(EV[0])}건, 앞에 놓인 상자를 안 닿고 지나감 {len(EV[1])}건, 가까이(중심 사이 0.8 m 안) 안 닿고 지나감 {o.n_near}건 가운데 {len(EV[2])}건")
+        for tag, E in zip(TAGS, EV):
+            for n_, (b, t_end, j) in enumerate(E):
+                eid += 1
+                for back in range(1, 31):
+                    t = t_end - back
+                    if t <= R.k0[t_end, b] + 1 or j not in o.polys(t, b):
+                        break
+                    w, wo, n0 = o.scans(t, b, j)
+                    x, y, yaw = o.st[t, b, :3]; c, s_ = np.cos(yaw), np.sin(yaw)
+                    dx, dy = o.polys(t, b)[j].mean(0) - [x, y]; ax, ay = dx * c + dy * s_, -dx * s_ + dy * c
+                    pv = PV[t, b].astype(np.float32); blk = pv[P0: P0 + w_].reshape(-1, 4).copy()
+                    dist = np.where(blk[:, 0] > 0.5, np.hypot(blk[:, 1] * 5.0 - ax, blk[:, 2] * 5.0 - ay), np.inf)
+                    k = int(np.argmin(dist)); listed = bool(dist[k] < 0.3)
+                    pv2 = pv.copy()
+                    if listed:
+                        blk2 = np.concatenate([np.delete(blk, k, 0), np.zeros((1, 4), np.float32)]); pv2[P0: P0 + w_] = blk2.ravel()
+                    raw = torch.from_numpy(o.F[t, b, 256:].astype(np.float32))[None] * NS + NM
+                    with torch.no_grad():
+                        v1 = float(critic(torch.from_numpy(w.astype(np.float32))[None], raw, torch.from_numpy(pv)[None])) * T_REF
+                        v0 = float(critic(torch.from_numpy(wo.astype(np.float32))[None], raw, torch.from_numpy(pv2)[None])) * T_REF
+                        v_s = float(critic(torch.from_numpy(wo.astype(np.float32))[None], raw, torch.from_numpy(pv)[None])) * T_REF   # scan erased only
+                    err.append(abs(v1 - float(VS[t, b]) * T_REF))
+                    d1, s1 = o.first_step(t, b, w); d0, s0 = o.first_step(t, b, wo)
+                    rows[tag].append((back * R.dt, ax, n0, float(listed), v1, v1 - v0, v1 - v_s, d1 - d0, s0 - s1, float(VS[t, b]) * T_REF,
+                                      float(eid), ay, float(o.st[t, b, 3]), float(yaw - o.st[max(t - 2, 0), b, 2]), float(recs.index(fn) * 1000 + b), float(j)))
+                    XA[tag].append(np.concatenate([o.F[t, b], o.H[t, b]]).astype(np.float16))
+                    XC[tag].append(np.concatenate([o.F[t, b, 256:], pv]).astype(np.float16))
+                if n_ % 20 == 0:
+                    print(tag, n_, len(E), file=sys.stderr, flush=True)
+        del o
+    say(f"   다시 계산한 critic 값과 기록된 값의 차 중앙 {np.median(err):.3f} s, 95 % {np.percentile(err, 95):.3f} s (작아야 계산이 같은 것)")
+    BINS = ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0), (1.0, 1.5), (1.5, 2.0), (2.0, 3.0))
+    for tag, L in rows.items():
+        A = np.array(L, float)
+        if not len(A):
+            continue
+        say(f"  [{tag}] 그 상자가 critic의 값에서 깎는 크기 [s] (상자를 critic의 입력에서 뺐을 때와의 차; −면 상자 때문에 값이 낮음), 몇 초 전 결정:")
+        for lo, hi in BINS:
+            m = (A[:, 0] > lo + 1e-6) & (A[:, 0] <= hi + 1e-6)
+            if m.sum() < 5:
+                continue
+            say(f"    {lo:.1f}~{hi:.1f} s 전 ({int(m.sum())}개, 상자까지 중앙 {np.median(A[m, 1]):.1f} m, 스캔에 보임 {np.mean(A[m, 2] >= 2) * 100:.0f} %, critic의 상자 칸에 있음 {np.mean(A[m, 3]) * 100:.0f} %): "
+                f"깎는 크기 중앙 {np.median(A[m, 5]):+.2f} (25~75 %: {np.percentile(A[m, 5], 25):+.2f}~{np.percentile(A[m, 5], 75):+.2f}) · 0.3 s 넘게 깎은 비율 {np.mean(A[m, 5] < -0.3) * 100:.0f} % · "
+                f"스캔에서만 지웠을 때 {np.median(A[m, 6]):+.2f} | critic 값 중앙 {np.median(A[m, 4]):+.1f} | actor의 첫 0.1 s: 조향 |{np.median(np.abs(A[m, 7])):.1f}|도, 속도 {np.median(A[m, 8]):+.2f}")
+    np.savez_compressed(OUT + ".value.npz", near_total=n_near, **{f"{n}{sfx}": np.array(D[k], dt) for n, k in zip(("hit", "clean", "near"), TAGS)
+                                              for sfx, D, dt in (("", rows, float), ("_xa", XA, np.float16), ("_xc", XC, np.float16))})
+
+
+if os.environ.get("NET_HITS_VALUE", "0") == "1":
+    value_trace(); sys.exit(0)
 if GAP:
     plan_gap(); sys.exit(0)
 if CKP:

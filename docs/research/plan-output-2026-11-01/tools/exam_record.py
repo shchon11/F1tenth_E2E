@@ -24,6 +24,8 @@ F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반�
 F1SIM_EXAM_SAVE_SCAN=1 (11-13, policy가 상자를 보고도 왜 그대로 가는지 policy 안에서 보는 분석용): 결정마다 policy가 읽은 가장 새 스캔
 (range_max로 나눈 값, float16; 입력은 이것과 앞 두 결정의 스캔)과 빔마다 맞은 것(lidar.HIT_*)을 `출력_scan.npz`(scan, typ, range_max, angles)에 남김.
 주행·기록은 그대로.
+F1SIM_EXAM_SAVE_VALUE=1 (11-13, 상자에 닿기 전 critic은 언제부터 그 상자를 값에 치는지 보는 분석용): 결정마다 critic이 읽은
+참값 입력(학습과 같은 것: 상자 칸은 트랙을 따라 --box-range 안)과 critic의 값을 `출력_priv.npz`(priv, value, box_cols)에 남김.
 F1SIM_EXAM_OPP_SLOT=JSON (11-12, 시험 점수가 아니라 상대 차 하나를 따로 보는 기록): 상대 차 자리 설정에 덮어씀(state_rl.build_env의
 `--opp-slot`과 같음). 예: AuRoRus 포팅본만 상대로 `{"kind": "aurorus", "kind_mix": [], "reactive": {}, "events": [], "event_rate": 0.0,
 "speed_scale": [1.0, 1.0]}` (그 차는 자기 선 속도의 0.8 x speed_scale로 달리고, 자기 LiDAR로 본 점만으로 비켜 감). 기록의 opp_slot에 남김.
@@ -48,6 +50,7 @@ assert SLIP in ("", "oracle", "table"), SLIP
 LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
 SAVE_MEM = os.environ.get("F1SIM_EXAM_SAVE_MEM", "") == "1"
 SAVE_SCAN = os.environ.get("F1SIM_EXAM_SAVE_SCAN", "") == "1"   # the newest scan the policy read + what each beam hit
+SAVE_VALUE = os.environ.get("F1SIM_EXAM_SAVE_VALUE", "") == "1"  # the critic's privileged input and its value
 OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
 REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
 HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent starts half a lap away (the user's events)
@@ -229,6 +232,27 @@ MEM = {"feat": [], "mem": []}
 if SAVE_MEM:
     assert getattr(actor, "memory", 0), "이 checkpoint에는 기억이 없습니다"
 SCN = {"scan": [], "typ": []}
+VAL = {"priv": [], "value": []}
+if SAVE_VALUE:
+    from f1sim.learn.plan_policy import Critic
+    from f1sim.learn.plan_rl import track_boxes, PRIV_V2_PROP_SLOTS
+    _br = float(ck["args"].get("box_range") or 0.0)
+    assert not ck["args"].get("hold_p"), "a hold-trained critic also reads the decisions left on the plan in hand"
+    critic = Critic(obs.beams, int(ck["priv_dim"]), state_dim=int(obs.state().shape[1])).to(dev)
+    critic.load_state_dict(ck["critic"]); critic.eval()
+    _P0 = _w = 0
+    if _br > 0:                                             # plan_rl's --box-range: the box block's columns, refilled along the track
+        _pv0, _pb0 = obs.priv(), env._prop_block(env.sim.state)[lid].float()
+        _w = _pb0.shape[1]
+        _hit = [j for j in range(_pv0.shape[1] - _w + 1) if torch.allclose(_pv0[:, j:j + _w].float(), _pb0, atol=1e-5)]
+        assert len(_hit) == 1 and float(_pb0.abs().sum()) > 0.0, f"the critic's box block not found unambiguously ({_hit})"
+        _P0 = _hit[0]
+
+    def priv_now():
+        pv = obs.priv()
+        if _br > 0:
+            pv[:, _P0:_P0 + _w] = track_boxes(env, pr.goal, lid, PRIV_V2_PROP_SLOTS, _br)
+        return pv
 t0 = time.time()
 for kd in range(T):
     snap()
@@ -241,6 +265,9 @@ for kd in range(T):
         MEM["feat"].append(torch.cat([actor.enc(obs.scans), actor.norm(obs.state())], 1).half().cpu())
     if SAVE_SCAN:
         SCN["scan"].append(obs.scans[:, 0].half().cpu()); SCN["typ"].append(env.last_result.scan_type[lid].to(torch.uint8).cpu())
+    if SAVE_VALUE:
+        _pv = priv_now()
+        VAL["priv"].append(_pv.half().cpu()); VAL["value"].append(critic(obs.scans, obs.state(), _pv).float().cpu())
     cmd_d0 = obs.cmd_d.clone()
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
     if SAVE_MEM:
@@ -313,6 +340,9 @@ os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
     np.savez(out_npz[:-4] + "_mem.npz", feat=torch.stack(MEM["feat"]).numpy(), mem=torch.stack(MEM["mem"]).numpy())
+if SAVE_VALUE:
+    np.savez_compressed(out_npz[:-4] + "_priv.npz", priv=torch.stack(VAL["priv"]).numpy(), value=torch.stack(VAL["value"]).numpy(),
+                        box_cols=np.array([_P0, _w]), box_range=np.array(_br))
 if SAVE_SCAN:
     np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
                         range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
