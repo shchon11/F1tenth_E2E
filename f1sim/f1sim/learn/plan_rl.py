@@ -457,6 +457,19 @@ def main(argv=None):
                          "taught, with this weight, to say what the NEXT plan says for the same moments (11-09, the user chose (가): "
                          "the previous plan's 0.1-1.0 s pulled toward the new plan's 0-0.9 s, never the other way). The output layer "
                          "alone learns it: nothing that drives is touched. 0 = off (all 20 outputs are actions)")
+    ap.add_argument("--tail-target", default="next", choices=("next", "driven"),
+                    help="what the plan's 0.2-1.0 s points learn: 'next' = the next plan's same moments (11-09 (가)); 'driven' "
+                         "(11-14, the user chose 2) = where the car actually was 0.2-1.0 s after the decision (positions and "
+                         "speeds from the rollout; points past a restart or the rollout's end are left out). 11-13: with 'next' the "
+                         "1.0 s point was 63 cm beside the driven path while a fresh net on the same inputs got 5 cm")
+    ap.add_argument("--tail-trunk", action="store_true",
+                    help="the tail's loss also trains the trunk, scan encoder and memory (default: the output layer alone on "
+                         "detached features). Logged per update: its trunk gradient / the policy's")
+    ap.add_argument("--tail-trunk-ratio", type=float, default=0.0,
+                    help="with --tail-trunk: keep the tail's gradient on the shared weights (encoder, trunk, memory) at about this "
+                         "fraction of the policy's, by scaling only what flows into them (the output layer always learns the tail "
+                         "fully); measured each update, adjusted between updates. 0 = no scaling (11-14 small test at weight 1: "
+                         "0.7-3.4x the policy's)")
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
@@ -808,6 +821,7 @@ def main(argv=None):
     t0 = time.time()
     trk = None
     ns_ema, b_noise = None, float("nan")       # --accum-actor-auto: smoothed |G|^2 and tr(Sigma) of the policy gradient
+    tail_alpha = 1.0                            # --tail-trunk-ratio: the share of the tail's gradient let into the shared weights
     if args.track_steps:
         # --track-steps: how far each optimizer step moves the actor along directions measured elsewhere
         import numpy as np
@@ -1111,6 +1125,7 @@ def main(argv=None):
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
+        ce10, tr_ratio = [], []
         als, aac, aac_far, alo, sms, mvs = [], [], [], [], [], []
         aux_box = {}
         g_split = {"policy": [], "speed": [], "value": []}
@@ -1130,6 +1145,21 @@ def main(argv=None):
             # a decision has a next plan to learn from unless it is the rollout's last or its car restarted in it
             c_ok = torch.ones(NB, dtype=torch.bool, device=dev); c_ok[-Bl:] = False
             c_ok &= D_.reshape(-1) <= 0
+            if args.tail_target == "driven":
+                # where the car was k x 0.1 s after each decision (k = 1..10): the state k decisions later, unless the car
+                # restarted in between or the rollout ended first
+                S_ = bST0.view(T, Bl, -1); Dn_ = (D_ > 0).long(); cs_ = torch.cumsum(Dn_, 0)
+                DRV = torch.zeros(T, Bl, PS.N_STEP, 2, device=dev); DRVV = torch.zeros(T, Bl, PS.N_STEP, device=dev)
+                DRVM = torch.zeros(T, Bl, PS.N_STEP, dtype=torch.bool, device=dev)
+                for k_ in range(1, PS.N_STEP + 1):
+                    if k_ >= T:
+                        break
+                    DRV[:T - k_, :, k_ - 1] = S_[k_:, :, 0:2]; DRVV[:T - k_, :, k_ - 1] = S_[k_:, :, dyn.IVX]
+                    before_ = torch.cat([torch.zeros(1, Bl, dtype=cs_.dtype, device=dev), cs_[:T - k_ - 1]], 0)
+                    DRVM[:T - k_, :, k_ - 1] = (cs_[k_ - 1:T - 1] - before_) == 0     # no restart in decisions t .. t+k-1
+                bDRV, bDRVV, bDRVM = DRV.reshape(NB, PS.N_STEP, 2), DRVV.reshape(NB, PS.N_STEP), DRVM.reshape(NB, PS.N_STEP)
+                c_ok = bDRVM[:, 1]                                  # at least the 0.2 s point is known
+                del DRV, DRVV, DRVM, S_
         if args.dump_rollout:
             # the direction this rollout alone would push the actor (no step is made): the policy loss of the first pass
             # (ratio 1, advantage normalised over the whole rollout), its gradient through the steering mean, the speed
@@ -1248,21 +1278,42 @@ def main(argv=None):
                     ok_ = c_ok[mb]
                     if bool(ok_.any()):
                         mb_c = mb[ok_]
-                        tail_mean = (actor.all_heads(f_heads[ok_].detach())[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
-                                     if two else actor.pi(f_heads[ok_].detach()))      # the plan that was driven
+                        fh_ = (f_heads[ok_] * tail_alpha + f_heads[ok_].detach() * (1.0 - tail_alpha) if args.tail_trunk
+                               else f_heads[ok_].detach())     # same values; only tail_alpha of the gradient reaches the trunk
+                        tail_mean = (actor.all_heads(fh_)[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
+                                     if two else actor.pi(fh_))      # the plan that was driven
                         a_c = torch.where(rl_mask[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
                         pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim)
                         xw_c, yw_c, _ = plan_world(pc_, bST0[mb_c])
                         ii_ = PT_IDX.to(dev)
                         pts_c = torch.stack([xw_c[:, ii_], yw_c[:, ii_]], -1)
-                        tgt, tgv = bPTS[mb_c + Bl], bPVS[mb_c + Bl]
-                        lpos = nn.functional.smooth_l1_loss(pts_c[:, 1:], tgt[:, :-1], reduction="none").sum(-1)
-                        lv = nn.functional.smooth_l1_loss(pc_["pv"][:, 1:], tgv[:, :-1], reduction="none")
-                        lc = (lpos + lv).mean()
+                        if args.tail_target == "driven":
+                            tgt, tgv, vm_ = bDRV[mb_c], bDRVV[mb_c], bDRVM[mb_c][:, 1:].float()
+                            lpos = nn.functional.smooth_l1_loss(pts_c[:, 1:], tgt[:, 1:], reduction="none").sum(-1)
+                            lv = nn.functional.smooth_l1_loss(pc_["pv"][:, 1:], tgv[:, 1:], reduction="none")
+                            lc = ((lpos + lv) * vm_).sum() / vm_.sum().clamp_min(1.0)
+                            with torch.no_grad():
+                                for k_, lst_ in ((4, ce5), (9, ce10)):     # the 0.5 s / 1.0 s point beside the driven path
+                                    ok5_ = bDRVM[mb_c][:, k_]
+                                    if bool(ok5_.any()):
+                                        lst_.append(float((pts_c[ok5_, k_] - tgt[ok5_, k_]).norm(dim=-1).median()))
+                        else:
+                            tgt, tgv = bPTS[mb_c + Bl], bPVS[mb_c + Bl]
+                            lpos = nn.functional.smooth_l1_loss(pts_c[:, 1:], tgt[:, :-1], reduction="none").sum(-1)
+                            lv = nn.functional.smooth_l1_loss(pc_["pv"][:, 1:], tgv[:, :-1], reduction="none")
+                            lc = (lpos + lv).mean()
+                            ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
                         loss = loss + args.tail_consistency * lc
                         terms_["tail"] = args.tail_consistency * lc
                         cls_.append(float(lc.detach()))
-                        ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
+                        if args.tail_trunk and ep == 0 and len(tr_ratio) < 4:
+                            # how hard the tail pulls on the shared weights next to the policy (11-14: the speed estimate's
+                            # trunk gradient was 18x the policy's and set Adam's step size there)
+                            sh_ = [p_ for n_, p_ in actor.named_parameters() if p_.requires_grad and n_.startswith(("enc.", "trunk.", "gru."))]
+                            gp_ = torch.autograd.grad(pl, sh_, retain_graph=True, allow_unused=True)
+                            gt_ = torch.autograd.grad(args.tail_consistency * lc, sh_, retain_graph=True, allow_unused=True)
+                            nrm_ = lambda gs: float(torch.sqrt(sum((g_.pow(2).sum() for g_ in gs if g_ is not None), torch.zeros((), device=dev))))
+                            tr_ratio.append(nrm_(gt_) / max(nrm_(gp_), 1e-12))
                 if aux_on:
                     pa_all, ta_all = aux_box["pred"], bAX[mb]
                     pa = pa_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS)); ta = ta_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS))
@@ -1350,6 +1401,12 @@ def main(argv=None):
                     cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
+        if args.tail_trunk and args.tail_trunk_ratio > 0 and tr_ratio:
+            # measured with the present share: move the share toward the target ratio (damped; the next update uses it)
+            r_ = sum(tr_ratio) / len(tr_ratio)
+            if dist is not None:
+                r_ = float(dist_sum(r_)[0]) / args.dist_world          # one share for every process
+            tail_alpha = float(min(1.0, max(0.01, tail_alpha * (args.tail_trunk_ratio / max(r_, 1e-6)) ** 0.5)))
         if trk is not None:
             # per optimizer step: the actor's move and the clipped gradient (descent sign) along each direction; per loss term
             # (first epoch, per minibatch): its descent direction along each, and the term summed over the first epoch
@@ -1382,7 +1439,8 @@ def main(argv=None):
                "shaping": float(stats["shaping"][ordm].mean()) / T, "contact_cost": float(stats["contact"][ordm].mean()) / T,
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
                "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed, "opp_restarted": n_restarted,
-               "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None, "near_share": float(near_sum.mean()) / T,
+               "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None,
+               "tail_driven_10": (sum(ce10) / len(ce10)) if ce10 else None, "tail_trunk_ratio": (sum(tr_ratio) / len(tr_ratio)) if tr_ratio else None, "tail_alpha": tail_alpha if args.tail_trunk else None, "near_share": float(near_sum.mean()) / T,
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
@@ -1436,7 +1494,10 @@ def main(argv=None):
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
               + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
-              + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
+              + (f"뒷부분 손실 {row['tail_loss']:.3f}, " + (f"실제로 간 길과 0.5 s / 1.0 s 차이 {row['tail_next_05'] * 100:.0f} / {(row['tail_driven_10'] or 0) * 100:.0f} cm"
+                 if args.tail_target == "driven" else f"다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm")
+                 + (f", 몸통 gradient policy 대비 {row['tail_trunk_ratio']:.2f}배" if row.get("tail_trunk_ratio") is not None else "") + " | "
+                 if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if (upd % args.save_every == 0 or upd == args.updates) and args.dist_rank == 0:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
