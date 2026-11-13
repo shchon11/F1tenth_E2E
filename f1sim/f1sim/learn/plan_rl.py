@@ -403,6 +403,11 @@ def main(argv=None):
     ap.add_argument("--accum-actor", type=int, default=1, help="as --accum for the actor only: the critic keeps its own optimizer "
                     "and steps every minibatch (11-14: per-minibatch actor steps flip sign along the direction the whole rollout "
                     "points to and the actor churns ~1.0 per update; one step per epoch halved the churn's damage)")
+    ap.add_argument("--accum-actor-auto", action="store_true", help="the actor's minibatches per step chosen every update from the "
+                    "policy gradient's noise scale (McCandlish et al. 2018: B_noise = tr(Sigma)/|G|^2, the decisions a step must "
+                    "average for its signal to match its noise), measured on the rollout before the epochs and smoothed over updates: "
+                    "the smallest power of two of minibatches covering it, up to --minibatches (11-14: plan25y's noise scale grew from "
+                    "~5k decisions at u25 to 25k-1.4M at u150; a minibatch is 4k)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr-end", type=float, default=1e-4)
@@ -720,7 +725,7 @@ def main(argv=None):
         print(f"[plan_rl] actor from {args.init} (update {ck0.get('update')}), critic's scan encoder too", flush=True)
     if args.accum_actor > 1 and args.accum > 1:
         raise SystemExit("--accum and --accum-actor: one or the other")
-    if args.accum_actor > 1:
+    if args.accum_actor > 1 or args.accum_actor_auto:
         opt = torch.optim.Adam(list(actor.parameters()), lr=args.lr, eps=1e-5)
         opt_c = torch.optim.Adam(list(critic.parameters()), lr=args.lr, eps=1e-5)
     else:
@@ -734,6 +739,7 @@ def main(argv=None):
     log = open(os.path.join(run, "progress.jsonl"), "a")
     t0 = time.time()
     trk = None
+    ns_ema, b_noise = None, float("nan")       # --accum-actor-auto: smoothed |G|^2 and tr(Sigma) of the policy gradient
     if args.track_steps:
         # --track-steps: how far each optimizer step moves the actor along directions measured elsewhere
         import numpy as np
@@ -1081,6 +1087,34 @@ def main(argv=None):
             torch.cuda.empty_cache()
             continue
         tu0 = time.time()
+        if args.accum_actor_auto:
+            # the policy gradient's noise scale on this rollout, at the policy that drove it (no step): per minibatch the
+            # gradient of the policy loss at ratio 1 (advantage normalised per minibatch, as the epochs do), then
+            # |G|^2 and tr(Sigma) from the minibatch gradients and their mean (two batch sizes), smoothed over updates
+            pr_ = [p_ for p_ in actor.parameters() if p_.requires_grad]
+            gsum_, gs2_, nb_, bs_ = None, 0.0, 0, 0.0
+            for sel in batches():
+                mean, log_std, _, mb, _ = actor_on(sel) if v2 else (*actor(bX[sel], bS[sel]), None, sel, None)
+                ii_ = rl_idx if tailc else torch.arange(PS.ACT_DIM, device=dev)
+                lp_ = tanh_logp(bU[mb][:, ii_], mean[:, ii_], log_std[:, ii_])
+                m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0); a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
+                a_ = (a_ - mu_) / (((a_ - mu_).pow(2) * m_).sum() / n_).sqrt().add(1e-8)
+                g_ = torch.autograd.grad(-(lp_ * a_ * m_).sum() / n_, pr_, allow_unused=True)
+                g_ = torch.cat([(x_ if x_ is not None else torch.zeros_like(p_)).reshape(-1) for x_, p_ in zip(g_, pr_)])
+                gsum_ = g_ if gsum_ is None else gsum_ + g_
+                gs2_ += float(g_.pow(2).sum()); nb_ += 1; bs_ += float(n_)
+                del mean, log_std, lp_, g_
+                aux_box.clear()
+            bs_ /= nb_; bb_ = bs_ * nb_
+            gb2_ = float((gsum_ / nb_).pow(2).sum()); gs2_ /= nb_
+            G2_ = (bb_ * gb2_ - bs_ * gs2_) / (bb_ - bs_); tr_ = (gs2_ - gb2_) / (1.0 / bs_ - 1.0 / bb_)
+            ns_ema = (G2_, tr_) if ns_ema is None else (0.9 * ns_ema[0] + 0.1 * G2_, 0.9 * ns_ema[1] + 0.1 * tr_)
+            b_noise = ns_ema[1] / ns_ema[0] if ns_ema[0] > 0 else float("inf")
+            k_ = 1
+            while k_ * 2 <= args.minibatches and k_ * bs_ < b_noise:
+                k_ *= 2
+            args.accum_actor = k_
+            del gsum_
         acc_i = 0
         if trk is not None:
             th_prev = trk_flat(); th_start = th_prev.clone()
@@ -1243,7 +1277,10 @@ def main(argv=None):
         secs = T * PS.DT
         mins = secs * n_ord / 60.0
         dc = (pr.n_contacts - c0)[ordm].sum(0)
+        if args.accum_actor_auto:
+            print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
+               "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,
                "stopped": float(stop_sum[ordm].mean()) / T, "contacts_wall_per_min": float(dc[0]) / mins,
                "stall_s_per_min": float((pr.stall_time - st0)[ordm].sum()) / mins,
