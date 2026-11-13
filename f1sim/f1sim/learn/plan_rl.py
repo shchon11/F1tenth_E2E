@@ -408,6 +408,10 @@ def main(argv=None):
                     "average for its signal to match its noise), measured on the rollout before the epochs and smoothed over updates: "
                     "the smallest power of two of minibatches covering it, up to --minibatches (11-14: plan25y's noise scale grew from "
                     "~5k decisions at u25 to 25k-1.4M at u150; a minibatch is 4k)")
+    ap.add_argument("--accum-auto-frac", type=float, default=0.0, help="with --accum-actor-auto: instead of the smallest power of two "
+                    "covering the noise scale, the largest one whose decisions stay within FRAC x the noise scale (1 below that); "
+                    "0.5 = steps a little smaller than the noise scale, the sample-efficient side (11-14: plan26e's covering rule "
+                    "took 2-4 minibatches at 6-13k and its u25 drove half as far as plan25y's)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr-end", type=float, default=1e-4)
@@ -1111,8 +1115,12 @@ def main(argv=None):
             ns_ema = (G2_, tr_) if ns_ema is None else (0.9 * ns_ema[0] + 0.1 * G2_, 0.9 * ns_ema[1] + 0.1 * tr_)
             b_noise = ns_ema[1] / ns_ema[0] if ns_ema[0] > 0 else float("inf")
             k_ = 1
-            while k_ * 2 <= args.minibatches and k_ * bs_ < b_noise:
-                k_ *= 2
+            if args.accum_auto_frac > 0:
+                while k_ * 2 <= args.minibatches and k_ * 2 * bs_ <= args.accum_auto_frac * b_noise:
+                    k_ *= 2
+            else:
+                while k_ * 2 <= args.minibatches and k_ * bs_ < b_noise:
+                    k_ *= 2
             args.accum_actor = k_
             del gsum_
         acc_i = 0
