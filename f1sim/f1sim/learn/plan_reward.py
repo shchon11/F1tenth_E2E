@@ -19,7 +19,9 @@
   - A plan that runs into a wall or a box within its second (any footprint corner of its poses inside one) costs
     PLAN_HIT_SHARE of the contact it would be, at the plan's speed there: drawn every 0.1 s, a second of such plans
     costs about one contact.
-* No stall price, no other shaping: standing still earns no laps."""
+* No stall price, no other shaping: standing still earns no laps. (11-13, the user: "저번에 분명히 서 있는거에 보상 매겨서
+  후진하도록 유도했는데" -- the 11-06 stall price had gone with this redesign; policies stood nose-on at a box for 20 s, even
+  after it was taken away: `stall_s` puts it back, off by default.)"""
 import hashlib
 import math
 import os
@@ -168,6 +170,13 @@ class PlanReward:
         self.plan_hit_share, self.plan_hit_n = PLAN_HIT_SHARE, None
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
+        # (11-13) the stall price of 11-06 ("--stall-mode progress"): each second the car's progress over the last
+        # `stall_window_s` falls short of `stall_vmin` [m/s] costs `stall_s` seconds x the shortfall's share; 0 = off.
+        # Progress = the drop of the walls-only distance left, so standing, rocking and going the wrong way all pay, and a
+        # quick back-out pays only while it lasts. The window starts again at every restart.
+        self.stall_s, self.stall_vmin, self.stall_window_s = 0.0, 1.0, 2.0
+        self._st_buf = None
+        self.stall_time = torch.zeros(Bl, device=device)        # [s] the shortfall's share, summed (for the log)
         self.begin(torch.arange(Bl, device=device))
 
     def _d_car(self) -> torch.Tensor:
@@ -199,11 +208,17 @@ class PlanReward:
         self.phi[rows] = -d / L
         self.cost[rows] = 0.0
         self.seen_t[rows] = 1e9
+        if self._st_buf is not None:
+            self._st_buf[:, rows] = 0.0; self._st_sum[rows] = 0.0; self._st_n[rows] = 0
+            self._st_d[rows] = d
 
-    def control_step(self, seen_car: Optional[torch.Tensor] = None) -> None:
-        """after an `env.step`: charge the contacts it began; `seen_car` (B_l,) bool = a beam hit a car this step"""
+    def control_step(self, seen_car: Optional[torch.Tensor] = None, restarted: Optional[torch.Tensor] = None) -> None:
+        """after an `env.step`: charge the contacts it began; `seen_car` (B_l,) bool = a beam hit a car this step;
+        `restarted` (B_l,) bool = the row reset in this step (the stall window starts again)"""
         env = self.env
         dt = float(env.sim.control_dt)
+        if self.stall_s > 0:
+            self._stall(dt, restarted)
         self.seen_t = self.seen_t + dt
         if seen_car is not None:
             self.seen_t = torch.where(seen_car, torch.zeros_like(self.seen_t), self.seen_t)
@@ -216,6 +231,39 @@ class PlanReward:
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
         self.cost = self.cost + self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
         self.n_contacts = self.n_contacts + on
+
+    def _stall(self, dt: float, restarted: Optional[torch.Tensor]) -> None:
+        """the stall price of one control step (see `__init__`)"""
+        d = self._d_car()
+        L = self.goal.lap[self.env.sim.tid[self.lid]]
+        if self._st_buf is None:
+            W = max(1, int(round(self.stall_window_s / dt)))
+            self._st_buf = torch.zeros(W, d.shape[0], device=d.device)
+            self._st_sum = torch.zeros(d.shape[0], device=d.device)
+            self._st_n = torch.zeros(d.shape[0], dtype=torch.long, device=d.device)
+            self._st_ptr = 0
+            self._st_d = torch.where(torch.isfinite(d), d, L)
+        d = torch.where(torch.isfinite(d), d, self._st_d)          # inside a wall for a moment: hold the last reading
+        step = self._st_d - d                                       # [m] forward this control step
+        step = step + L * ((step < -0.5 * L).float() - (step > 0.5 * L).float())   # across the finish line
+        fresh = step.abs() > 1.0                                    # a reset: no car covers 1 m in a control step
+        if restarted is not None:
+            fresh = fresh | restarted
+        step = torch.where(fresh, torch.zeros_like(step), step)
+        W = self._st_buf.shape[0]
+        self._st_sum = self._st_sum + step - self._st_buf[self._st_ptr]
+        self._st_buf[self._st_ptr] = step
+        self._st_ptr = (self._st_ptr + 1) % W
+        self._st_n = (self._st_n + 1).clamp(max=W)
+        if bool(fresh.any()):
+            self._st_buf[:, fresh] = 0.0
+            self._st_sum = torch.where(fresh, torch.zeros_like(self._st_sum), self._st_sum)
+            self._st_n = torch.where(fresh, torch.zeros_like(self._st_n), self._st_n)
+        rate = self._st_sum / (self._st_n.clamp(min=1).float() * dt)
+        short = ((self.stall_vmin - rate) / max(self.stall_vmin, 1e-6)).clamp(0.0, 1.0) * (self._st_n > 0).float()
+        self.cost = self.cost + self.stall_s * dt * short / T_REF
+        self.stall_time = self.stall_time + dt * short
+        self._st_d = d
 
     def plan_cost(self, x: torch.Tensor, y: torch.Tensor, psi: torch.Tensor, v: torch.Tensor) -> Dict[str, torch.Tensor]:
         """A plan just drawn, its poses in the world (B_l, n) each and speeds (B_l, n): the first pose whose footprint

@@ -367,7 +367,7 @@ class Driver:
             if self.opp is not None:
                 self.opp.stepped(te | trc)
             r = env.last_result
-            self.pr.control_step((r.scan_type[lid] == self._hit_car).any(1))     # a beam ended on a car
+            self.pr.control_step((r.scan_type[lid] == self._hit_car).any(1), (te | trc)[lid])     # a beam ended on a car
         price, hit = pc["price"], pc["hit"].float()
         if charge is not None:
             price, hit = torch.where(charge, price, torch.zeros_like(price)), hit * charge.float()
@@ -412,6 +412,11 @@ def main(argv=None):
                     "the critic's scan encoder too")
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
+    ap.add_argument("--stall-s", type=float, default=0.0,
+                    help="the stall price of 11-06, back (11-13): [s] per second the progress over the last --stall-window "
+                         "falls short of --stall-vmin, x the shortfall's share; 0 = off")
+    ap.add_argument("--stall-vmin", type=float, default=1.0, help="[m/s] --stall-s charges a progress rate below this")
+    ap.add_argument("--stall-window", type=float, default=2.0, help="[s] --stall-s: the progress window")
     ap.add_argument("--contact-scale", type=float, default=1.0,
                     help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices)")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
@@ -546,6 +551,7 @@ def main(argv=None):
     pr = PlanReward(env, args.gamma, dev)
     pr.plan_hit_share = float(args.plan_hit_share)
     pr.contact_scale = float(args.contact_scale)
+    pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)
     pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
@@ -723,6 +729,7 @@ def main(argv=None):
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
         c0 = pr.n_contacts.clone()
+        st0 = pr.stall_time.clone()
         if levels is not None and upd == max(1, args.level_replay_from):
             env.level_replay = levels                          # races reset from here on are named and scored
             print(f"[plan_rl] level replay on: {args.level_replay:g} of the resets, {args.level_replay_size} races per seat",
@@ -1071,6 +1078,7 @@ def main(argv=None):
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,
                "stopped": float(stop_sum[ordm].mean()) / T, "contacts_wall_per_min": float(dc[0]) / mins,
+               "stall_s_per_min": float((pr.stall_time - st0)[ordm].sum()) / mins,
                "contacts_prop_per_min": float(dc[1]) / mins, "contacts_car_per_min": float(dc[2]) / mins,
                "plan_hit_share": float(stats["plan_hit"][ordm].mean()) / T, "reward": float(R_.mean()),
                "shaping": float(stats["shaping"][ordm].mean()) / T, "contact_cost": float(stats["contact"][ordm].mean()) / T,
@@ -1108,7 +1116,8 @@ def main(argv=None):
                        replay_buffer=levels.stats()["buffer_mean"], replay_score=levels.stats()["score_mean"])
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
-              f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
+              f"{row['stopped'] * 100:.0f} % " + (f"(서 있는 벌점 {row['stall_s_per_min']:.1f} s/분) " if args.stall_s > 0 else "")
+              + f"| 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
               f"{row['contacts_car_per_min']:.2f} /분 | 박는 plan {row['plan_hit_share'] * 100:.0f} % | 보상 {row['reward']:.4f} | "
               f"KL {row['kl']:.4f} 잘림 {row['clipfrac'] * 100:.0f} % | 속도 짐작 오차 {row['vest_mae']:.2f} m/s | 표준편차 {sum(row['std']) / len(row['std']):.3f} | "
               + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
