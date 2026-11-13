@@ -400,6 +400,9 @@ def main(argv=None):
     ap.add_argument("--minibatches", type=int, default=8)
     ap.add_argument("--accum", type=int, default=1, help="minibatches whose gradients are summed into one optimizer step "
                     "(1 = a step per minibatch, as before; = --minibatches: one step per epoch over the whole rollout)")
+    ap.add_argument("--accum-actor", type=int, default=1, help="as --accum for the actor only: the critic keeps its own optimizer "
+                    "and steps every minibatch (11-14: per-minibatch actor steps flip sign along the direction the whole rollout "
+                    "points to and the actor churns ~1.0 per update; one step per epoch halved the churn's damage)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr-end", type=float, default=1e-4)
@@ -715,7 +718,14 @@ def main(argv=None):
             else:
                 print("[plan_rl] critic NOT taken: its inputs differ", flush=True)
         print(f"[plan_rl] actor from {args.init} (update {ck0.get('update')}), critic's scan encoder too", flush=True)
-    opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
+    if args.accum_actor > 1 and args.accum > 1:
+        raise SystemExit("--accum and --accum-actor: one or the other")
+    if args.accum_actor > 1:
+        opt = torch.optim.Adam(list(actor.parameters()), lr=args.lr, eps=1e-5)
+        opt_c = torch.optim.Adam(list(critic.parameters()), lr=args.lr, eps=1e-5)
+    else:
+        opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
+        opt_c = None
     json.dump({"args": vars(args), "world": vars(world), "priv_dim": priv_dim, "beams": obs.beams},
               open(os.path.join(run, "args.json"), "w"), indent=1, default=str)
     print(f"[plan_rl] {args.name}: 환경 {env.B} (학습 차 {Bl}), 결정 0.1 s, 롤아웃 {args.horizon}결정, LiDAR {obs.beams}빔 x {3}장, "
@@ -735,7 +745,7 @@ def main(argv=None):
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1, args.updates + 1):
         frac = (upd - 1) / max(1, args.updates - 1)
-        for gp in opt.param_groups:
+        for gp in opt.param_groups + (opt_c.param_groups if opt_c is not None else []):
             gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
         if upd <= args.actor_freeze:
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
@@ -1174,16 +1184,31 @@ def main(argv=None):
                         for d_, v_ in trk.items():
                             e_[d_].append(float(g_ @ v_))
                         del gs_, g_
-                if acc_i % args.accum == 0:
-                    opt.zero_grad(set_to_none=True)
-                (loss / args.accum if args.accum > 1 else loss).backward(); acc_i += 1
-                if acc_i % args.accum:
-                    with torch.no_grad():
-                        kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
-                        cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
-                        vls.append(float(vl)); els.append(float(el))
-                    continue
-                gn_all = nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
+                if opt_c is not None:
+                    # --accum-actor: the critic steps on this minibatch; the actor's gradient keeps adding up
+                    if acc_i % args.accum_actor == 0:
+                        opt.zero_grad(set_to_none=True)
+                    opt_c.zero_grad(set_to_none=True)
+                    loss.backward(); acc_i += 1
+                    nn.utils.clip_grad_norm_(list(critic.parameters()), args.max_grad)
+                    opt_c.step()
+                    if acc_i % args.accum_actor:
+                        with torch.no_grad():
+                            kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
+                            cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
+                            vls.append(float(vl)); els.append(float(el))
+                        continue
+                else:
+                    if acc_i % args.accum == 0:
+                        opt.zero_grad(set_to_none=True)
+                    (loss / args.accum if args.accum > 1 else loss).backward(); acc_i += 1
+                    if acc_i % args.accum:
+                        with torch.no_grad():
+                            kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
+                            cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
+                            vls.append(float(vl)); els.append(float(el))
+                        continue
+                gn_all = nn.utils.clip_grad_norm_(list(actor.parameters()) + ([] if opt_c is not None else list(critic.parameters())), args.max_grad)
                 if trk is not None:
                     g_ = -torch.cat([(p_.grad if p_.grad is not None else torch.zeros_like(p_)).reshape(-1) for p_ in trk_p])
                     T_["grad_norm"].append(float(g_.norm())); T_["clip_coef"].append(min(1.0, args.max_grad / (float(gn_all) + 1e-6)))
