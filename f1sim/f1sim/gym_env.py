@@ -3080,7 +3080,11 @@ class F1VecEnv:
             # One draw per race, not per car: the leader's limit ends the whole race (see the
             # truncation in `_step_math`), so the cars of a race have to share it.
             n = int(self.ecfg.max_steps)
-            per_race = torch.randint(1, n + 1, (self.B // self.M,), generator=self.sim.gen, device=self.device)
+            # `ep_align` (a trainer that decides every k control steps sets it, 11-14): first lengths in whole decisions, so every
+            # episode ends on a decision's last step -- the restarts of a decision come in one batch instead of up to k, and the
+            # opponents' planner clock (`opp_every`, zeroed by a restart) stays on the decision grid
+            k = max(1, int(getattr(self, "ep_align", 1)))
+            per_race = torch.randint(1, n // k + 1, (self.B // self.M,), generator=self.sim.gen, device=self.device) * k
             self.ep_limit.copy_(per_race.repeat_interleave(self.M))
         # one zero-action step so that odom/scan come from the simulator path
         r = self.sim.step(torch.stack([torch.zeros(self.B, device=self.device), self.sim.state[:, 3]], 1))
