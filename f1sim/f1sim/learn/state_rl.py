@@ -76,6 +76,9 @@ def build_env(a, device, extra=None):
                                   **dict(limits, objective="min_time"))
     cfg = Config()
     cfg.sim.compile = False
+    # the substep's two hot leaves (tyre/body dynamics, IMU) fused by torch.compile inside the captured physics graph, as the
+    # console runs them (`SimParams.compile_leaves`; 11-14: ~450 tiny kernels a substep -> a few)
+    cfg.sim.compile_leaves = bool(getattr(a, "compile_leaves", False))
     cfg.lidar.n_beams = int(a.beams)
     # the scanner where it is on the car (params.LIDAR_MOUNT_X_COG): the world's own `lidar_mount_x`, else F1SIM_LIDAR_MOUNT_X --
     # read HERE so that every tool building this world (plan_rl.build or directly) gets the place `plan_policy.load_actor2`

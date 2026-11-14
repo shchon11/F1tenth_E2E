@@ -558,6 +558,9 @@ def main(argv=None):
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
                          "axle + 0.297). Stored in the checkpoint; tools take it from F1SIM_LIDAR_MOUNT_X")
+    ap.add_argument("--compile-leaves", action="store_true",
+                    help="the physics substep's tyre/body dynamics and IMU fused by torch.compile inside the captured graph, as the "
+                         "console does (11-14 nsys: the physics graph was ~24k kernels of ~1 us per control step, the GPU busy 49 %%)")
     ap.add_argument("--track-scales", default="",
                     help="size variants added to the world's tracks: per cents, comma-separated, or 'korea25' = "
                          "`state_rl.TRACK_SCALES_25` (0.60-0.92 and 1.08-1.20 of a warp each; 11-12, the user: \"트랙 변형도 스케일 "
@@ -614,6 +617,8 @@ def main(argv=None):
         os.environ.pop("F1SIM_LIDAR_MOUNT_X", None)                       # the checkpoint says 0: build it that way
     os.environ.pop("F1SIM_WORLD_TRACKS", None)                            # a measurement tool's track choice never trains
     ov = {}
+    if args.compile_leaves:
+        ov["compile_leaves"] = True
     if args.track_scales:
         ov["track_scales"] = (list(SR.TRACK_SCALES_25) if args.track_scales == "korea25"
                               else [int(x_) for x_ in args.track_scales.split(",")])

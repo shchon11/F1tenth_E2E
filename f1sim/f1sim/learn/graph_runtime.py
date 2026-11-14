@@ -152,7 +152,10 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
 class _LeafOrEager:
     """A captured prop leaf that steps aside instead of stopping the run: a call with keywords (another call
     site than the one captured) or after its guards changed (a prop set rebound under it) goes to the eager
-    method -- for good, after a guard change, said once. Everything else (adopt, release) is the graph's."""
+    method -- for good, after a guard change, said once. A call with another batch size (a restart's rows:
+    `_fill_scans` merges the props into the respawned cars' scans only) goes to the eager method for that call
+    alone: until 11-14 it raised the same GuardViolation and the LiDAR merge leaf ran eager for the rest of
+    training from the first restart on. Everything else (adopt, release) is the graph's."""
 
     def __init__(self, graphed, eager, log):
         self._g, self._eager, self._log, self.dead = graphed, eager, log, False
@@ -160,6 +163,10 @@ class _LeafOrEager:
     def __call__(self, *a, **kw):
         if kw or self.dead:
             return self._eager(*a, **kw)
+        st = getattr(self._g, "_static", None)
+        if st is not None and len(a) == len(st) and any(
+                torch.is_tensor(a[i]) and a[i].shape != st[i].shape for i in getattr(self._g, "_tensor_at", ())):
+            return self._eager(*a)
         from ..viewer.graph_fastpath import GuardViolation
         try:
             return self._g(*a)
