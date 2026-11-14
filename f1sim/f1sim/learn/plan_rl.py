@@ -71,7 +71,7 @@ def build(world: str, envs: int, seed: int, device, overrides=None, fmt: str = "
     else:
         env.enable_ideal()
     from .graph_runtime import prepare_graph_runtime
-    prepare_graph_runtime(env, log=lambda _t: None)
+    prepare_graph_runtime(env, log=lambda _t: print(f"[graph] {_t}", flush=True) if ("eager" in _t or "goes back" in _t or "captured in" in _t) else None)
     env.reset(seed=seed)
     lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device)
     return env, lim, a
@@ -408,6 +408,13 @@ def main(argv=None):
                     "average for its signal to match its noise), measured on the rollout before the epochs and smoothed over updates: "
                     "the smallest power of two of minibatches covering it, up to --minibatches (11-14: plan25y's noise scale grew from "
                     "~5k decisions at u25 to 25k-1.4M at u150; a minibatch is 4k)")
+    ap.add_argument("--noise-probe-every", type=int, default=1,
+                    help="with --accum-actor-auto: measure the noise scale every N updates (it is smoothed over updates and moves "
+                         "slowly; the measurement is one more forward/backward over the whole rollout, ~1/5 of an update)")
+    ap.add_argument("--opp-every", type=int, default=0,
+                    help="(11-14) the scripted opponents' planners every N control steps, their command held in between "
+                         "(GymEnv.opp_every; 0 = leave the env's, F1SIM_OPP_EVERY or 1). Exam on plan26f u150: opponents' speed, "
+                         "stops, restarts and our results unchanged at 2 and 4; rollout -37 % at 4")
     ap.add_argument("--accum-auto-frac", type=float, default=0.0, help="with --accum-actor-auto: instead of the smallest power of two "
                     "covering the noise scale, the largest one whose decisions stay within FRAC x the noise scale (1 below that); "
                     "0.5 = steps a little smaller than the noise scale, the sample-efficient side (11-14: plan26e's covering rule "
@@ -607,6 +614,8 @@ def main(argv=None):
         ov["track_scales"] = (list(SR.TRACK_SCALES_25) if args.track_scales == "korea25"
                               else [int(x_) for x_ in args.track_scales.split(",")])
     env, lim, world = build(args.world, args.envs, args.seed, dev, overrides=ov, fmt=args.format)
+    if args.opp_every > 0:
+        env.opp_every = int(args.opp_every)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
     pr.plan_hit_share = float(args.plan_hit_share)
@@ -1193,7 +1202,7 @@ def main(argv=None):
             torch.cuda.empty_cache()
             continue
         tu0 = time.time()
-        if args.accum_actor_auto:
+        if args.accum_actor_auto and (upd - 1) % max(1, args.noise_probe_every) == 0:
             # the policy gradient's noise scale on this rollout, at the policy that drove it (no step): per minibatch the
             # gradient of the policy loss at ratio 1 (advantage normalised per minibatch, as the epochs do), then
             # |G|^2 and tr(Sigma) from the minibatch gradients and their mean (two batch sizes), smoothed over updates
@@ -1425,6 +1434,13 @@ def main(argv=None):
         secs = T * PS.DT
         mins = secs * n_ord / 60.0
         dc = (pr.n_contacts - c0)[ordm].sum(0)
+        tg_ = env.__dict__.get("_teacher_normalized")
+        if tg_ is not None and hasattr(tg_, "fell_back") and upd <= 3:
+            # (11-14) how the opponents' planners ran: graph replays, eager steps, planners that went back to eager for good
+            print(f"[plan_rl] update {upd}: 상대 차 planner graph 재생 {getattr(tg_, 'replays', 0)}번, 한 번씩 eager "
+                  f"{getattr(tg_, 'eager_steps', 0)}번, 아예 eager로 돌아간 planner {dict(tg_.fell_back)}", flush=True)
+            for k_, n_ in sorted(getattr(tg_, "eager_why", {}).items(), key=lambda kv: -kv[1])[:6]:
+                print(f"[plan_rl]     eager {n_}번: {k_}", flush=True)
         if args.accum_actor_auto:
             print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,

@@ -1105,6 +1105,12 @@ class F1VecEnv:
         #: The checkpoint paths of the pool, in driver-code order.
         self.pool_paths = tuple(n for n in self.pool_names if n not in (POOL_SELF, POOL_TEACHER))
         self.pool = None                                       # set_opponent_pool()
+        #: (11-14) the teacher-driven opponents' planners run every `opp_every`-th control step and their
+        #: command is held in between (1 = every step, as before). They were 68 % of a training env step at
+        #: 1024 envs; the learner re-plans every 4 steps (0.1 s). Env `F1SIM_OPP_EVERY` or set the attribute.
+        self.opp_every = max(1, int(__import__("os").environ.get("F1SIM_OPP_EVERY", "1")))
+        self._opp_tick = 0
+        self._opp_held = None
         #: Car-level masks the behaviour gate and the pool action both read. `teacher_race` below is
         #: a *race* flag; these are per car, and slot 0 is in neither.
         self.teacher_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
@@ -2307,6 +2313,7 @@ class F1VecEnv:
     def _reset_envs_core(self, ids: torch.Tensor, fill: bool = True):
         if ids.numel() == 0:
             return
+        self._opp_tick = 0          # opp_every: a restarted car's opponent plans on the next step, not a held command
         e = self.ecfg
         gen = self.sim.gen
         n = ids.numel()
@@ -2730,9 +2737,22 @@ class F1VecEnv:
         """Refresh reset rows without advancing any car or mutating transition info."""
         current = replace(r, **{f.name: value.clone() for f in fields(r)
                                if isinstance(value := getattr(r, f.name), torch.Tensor)})
-        current.state[ids] = self.sim.state[ids]
-        current.odom[ids] = self.sim.odom.state[ids]
-        current.s[ids] = self.sim.s[ids]
+        if r.state is self.sim.state:
+            current.state = self.sim.state          # (11-14) the same one-tensor alias as `odom` below
+        else:
+            current.state[ids] = self.sim.state[ids]
+        if r.odom is self.sim.odom.state:
+            # (11-14) the step's odometry IS the sim's (no copy) on a step without restarts, and the opponents'
+            # planner graphs were captured reading it through both names. A clone here parted the two names on every
+            # step with a restart -- most steps at 640 envs -- and sent all five planners eager (70 of 96 calls each
+            # per update). The clone's rows equal the sim's after this assignment anyway, so keep the one tensor.
+            current.odom = self.sim.odom.state
+        else:
+            current.odom[ids] = self.sim.odom.state[ids]
+        if r.s is self.sim.s:
+            current.s = self.sim.s
+        else:
+            current.s[ids] = self.sim.s[ids]
         _, lateral, _ = self.sim.track.project(self.sim.state[:, :2], self.sim.tid)
         current.lateral[ids] = lateral[ids]
         current.wall_dist[ids] = self.sim._footprint_clearance(self.sim.state)[ids]
@@ -2778,6 +2798,10 @@ class F1VecEnv:
             return out
         if self.teacher is None:
             raise RuntimeError(f"opponent == {self.ecfg.opponent!r} needs env.set_teacher(RacelineTeacher)")
+        tick, self._opp_tick = self._opp_tick, self._opp_tick + 1
+        if self.opp_every > 1 and self._opp_held is not None and tick % self.opp_every:
+            # between the planners' runs: their last command, held
+            return torch.where(self.teacher_driven[:, None], self._opp_held, out)
         follow, v_cap = self.follow_cap(self.sim.state)
         if self.events is not None:
             blind = self.events.oblivious_mask()
@@ -2810,6 +2834,8 @@ class F1VecEnv:
             # the moment its module appears.
             an = torch.where(self.alt_teacher_mask[kind][:, None],
                              self._teacher_normalized(alt, ev_off, ev_speed, follow, v_cap), an)
+        if self.opp_every > 1:
+            self._opp_held = an.clone()
         return torch.where(self.teacher_driven[:, None], an, out)
 
     def _note_imu_yaw_rate(self, r) -> None:
@@ -3136,6 +3162,10 @@ class F1VecEnv:
                 # not the cars on an external command (11-09: a plan policy on its own follower in a race paid 18 ms a step
                 # for MAP's answer for its car, which `ext_cmd` then replaced); the traffic is the inner tracker's
                 self.tracker.map_rows = self.learner & ~self.ext_mask if self._ext_ids else self.learner
+                if self.sim.ideal_rows is not None:
+                    # (11-14) rows on ideal execution drive `ideal_cmd`; MAP's answer for them was computed every
+                    # control step and thrown away (~18 % of a training env step at 640 envs)
+                    self.tracker.map_rows = self.tracker.map_rows & ~self.sim.ideal_rows
                 self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c", "tw5g")
                 from . import plan_tw as _ptw
                 self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"

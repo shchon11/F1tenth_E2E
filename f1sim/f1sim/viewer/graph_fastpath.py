@@ -949,6 +949,7 @@ class TeacherGraph:
         self.fell_back: Dict[str, str] = {}           # teacher class -> why it went eager
         self.replays = 0
         self.eager_steps = 0
+        self.eager_why: Dict[tuple, int] = {}       # (teacher, the names that parted) -> eager steps
         self._installed = False
         for teacher, args in calls.items():
             self._captures[id(teacher)] = _TeacherCapture(env, self._eager, teacher, args)
@@ -993,6 +994,8 @@ class TeacherGraph:
                     # Two names for what was one tensor now hold different ones: which of them the
                     # call reads is not something this can know. Eager for this step only.
                     self.eager_steps += 1
+                    k_ = (type(teacher).__name__, tuple(str(x) for x in ps))
+                    self.eager_why[k_] = self.eager_why.get(k_, 0) + 1
                     return self._eager(teacher, *args)
             if live.shape != clone.shape or live.dtype != clone.dtype:
                 self._give_up(cap, f"입력 {tuple(clone.shape)} 이 {tuple(live.shape)} 로 바뀜")

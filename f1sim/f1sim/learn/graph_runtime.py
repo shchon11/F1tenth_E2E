@@ -60,6 +60,26 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
         return eager_roll(*args)
 
     sim._roll = roll_spy
+    # (11-14) the two prop leaves, recorded from the same steps as the console does (`sim_worker`): the contact
+    # test `sim.step` runs after every roll and the LiDAR's prop merge. Training never captured them, and the
+    # contact test alone was ~21 % of a training env step at 640 envs, eager. Spies are instance attributes,
+    # deleted afterwards (not assigned back: a bound method in the instance dict would pin the object).
+    lidar = getattr(sim, "lidar", None)
+    eager_contact = sim._prop_contact
+    eager_merge = getattr(lidar, "_merge_props", None)
+
+    def contact_spy(*a, **kw):
+        if not kw:                        # only the plain `sim.step` call is what the leaf is captured for
+            rec["contact"] = a
+        return eager_contact(*a, **kw)
+
+    def merge_spy(*a):
+        rec["merge"] = a
+        return eager_merge(*a)
+
+    sim._prop_contact = contact_spy
+    if eager_merge is not None:
+        lidar._merge_props = merge_spy
     if tracker is not None:
         from .. import mpc as _mpc
         base = prev_solver or (_mpc.solve_fast if tracker.compile_solver else _mpc.solve)
@@ -75,6 +95,9 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
             env.step(act)
     finally:
         sim._roll = eager_roll
+        sim.__dict__.pop("_prop_contact", None)
+        if eager_merge is not None:
+            lidar.__dict__.pop("_merge_props", None)
         if tracker is not None:
             tracker._solver = prev_solver
     if "roll" not in rec:
@@ -90,6 +113,18 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
                 fp.capture_mpc(tracker, rec["mpc"])
             except NotCapturable as exc:
                 log(f"graph runtime: plan solver stays eager ({exc})")
+        if "contact" in rec:
+            try:
+                fp.capture_prop_contact(rec["contact"])
+                fp._leaf_contact = _LeafOrEager(fp._leaf_contact, eager_contact, log)
+            except NotCapturable as exc:
+                log(f"graph runtime: prop contact stays eager ({exc})")
+        if lidar is not None and "merge" in rec:
+            try:
+                fp.capture_merge_props(lidar, rec["merge"])
+                fp._leaf_merge = _LeafOrEager(fp._leaf_merge, eager_merge, log)
+            except NotCapturable as exc:
+                log(f"graph runtime: prop LiDAR merge stays eager ({exc})")
         fp.install(tracker)
         fp.adopt()                       # captured and replayed on this thread; adopt before stepping
     except NotCapturable as exc:
@@ -99,11 +134,42 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
     except BaseException:
         fp.release()
         raise
-    _capture_opponents(env, fp, act, log)
+    # (11-14) with `opp_every` > 1 a step may hold the planners' last command and call none of them: the capture
+    # records from one real step, so it runs with every step planning
+    k_ = getattr(env, "opp_every", 1)
+    env.opp_every = 1
+    try:
+        _capture_opponents(env, fp, act, log)
+    finally:
+        env.opp_every = k_
+        env._opp_held = None
     log(f"graph runtime: captured in {time.perf_counter() - t0:.2f} s "
         f"({len(fp._by_phase)} physics graph(s), solver {'graphed' if fp.mpc else 'eager'}, "
         f"opponent planners {'graphed' if fp.teacher_graph is not None else 'eager'})")
     return fp
+
+
+class _LeafOrEager:
+    """A captured prop leaf that steps aside instead of stopping the run: a call with keywords (another call
+    site than the one captured) or after its guards changed (a prop set rebound under it) goes to the eager
+    method -- for good, after a guard change, said once. Everything else (adopt, release) is the graph's."""
+
+    def __init__(self, graphed, eager, log):
+        self._g, self._eager, self._log, self.dead = graphed, eager, log, False
+
+    def __call__(self, *a, **kw):
+        if kw or self.dead:
+            return self._eager(*a, **kw)
+        from ..viewer.graph_fastpath import GuardViolation
+        try:
+            return self._g(*a)
+        except GuardViolation as exc:
+            self.dead = True
+            self._log(f"graph runtime: {getattr(self._g, 'name', 'leaf')} goes back to eager ({exc})")
+            return self._eager(*a)
+
+    def __getattr__(self, name):
+        return getattr(self._g, name)
 
 
 def _capture_opponents(env, fp, act, log) -> None:
