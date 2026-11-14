@@ -408,6 +408,10 @@ def main(argv=None):
                     "average for its signal to match its noise), measured on the rollout before the epochs and smoothed over updates: "
                     "the smallest power of two of minibatches covering it, up to --minibatches (11-14: plan25y's noise scale grew from "
                     "~5k decisions at u25 to 25k-1.4M at u150; a minibatch is 4k)")
+    ap.add_argument("--accum-ratchet", action="store_true",
+                    help="with --accum-actor-auto: the minibatches per actor step never go back down (11-14, plan26i: at u236 the "
+                         "noise scale read 190k -> 56k -> 15k as the policy got worse, the rule dropped 16 -> 4 -> 1 minibatches, "
+                         "4-16x the actor steps per update, KL 3-8x, contacts 3x, training reward down -- a feedback loop)")
     ap.add_argument("--noise-probe-every", type=int, default=1,
                     help="with --accum-actor-auto: measure the noise scale every N updates (it is smoothed over updates and moves "
                          "slowly; the measurement is one more forward/backward over the whole rollout, ~1/5 of an update)")
@@ -1244,6 +1248,8 @@ def main(argv=None):
             else:
                 while k_ * 2 <= args.minibatches and k_ * bstep_ < b_noise:
                     k_ *= 2
+            if args.accum_ratchet:
+                k_ = max(k_, args.accum_actor)
             args.accum_actor = k_
             del gsum_
         acc_i = 0
