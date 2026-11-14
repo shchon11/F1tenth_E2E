@@ -4,7 +4,9 @@ Tailscale 주소에만 열림(공개 인터넷 X). 페이지는 30 s마다 스�
   - 학습 표: plan_table.py (칸 5개)
   - checkpoint마다: frozen exam 결과(analysis/RUN_uU_exam.txt), 비교 run 같은 update와 세션끼리 짝지은 차(grad_step_table.py, 캐시),
     네 경우 영상(videos/), 기억 비교 요약, 추세 그림
-  - 그림 모음: out/netaudit, out/drift (최근 것부터)
+  - 그림 모음: out/netaudit, out/drift, out/edge*, out/rwexam, out/batchdump (최근 것부터)
+  - 연구 기록: out/research_log.md (날짜별 분석·결정, 최근 것부터) · run 상태 메모: out/run_notes.json {run: 멈춘 이유 등}
+  - 이어 시작한 run(--init ...plan_uN.pt): 학습 표에 부모 run의 u<=N 행을 '이어 받음'으로 채움
 실행: python3 dash_server.py [주소 100.99.253.65] [포트 8765]"""
 import json, os, re, subprocess, sys, time, threading, html, glob
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -18,9 +20,9 @@ PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
 CACHE = OUT + "/dash_cache"
 os.makedirs(CACHE, exist_ok=True)
 FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts_wall_per_min", "contacts_prop_per_min",
-          "contacts_car_per_min", "reward", "contact_cost", "kl", "clipfrac", "vloss", "accum_actor", "stopped")
+          "contacts_car_per_min", "reward", "contact_cost", "kl", "clipfrac", "vloss", "accum_actor", "stopped", "noise_rho_steer")
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
-         ".json": "application/json", ".jpg": "image/jpeg"}
+         ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()
 
 
@@ -36,11 +38,32 @@ def memo(key, ttl, fn):
     return val
 
 
+def run_notes():
+    try:
+        return json.load(open(f"{OUT}/run_notes.json"))
+    except Exception:
+        return {}
+
+
+def parent(name):
+    """(run, update) this run was initialised from (--init .../RUN/plan_uN.pt), else (None, None)"""
+    try:
+        ini = json.load(open(f"{RUNS}/{name}/args.json"))["args"].get("init") or ""
+    except Exception:
+        return None, None
+    m = re.search(r"/([^/]+)/plan_u(\d+)\.pt$", ini)
+    return (m.group(1), int(m.group(2))) if m else (None, None)
+
+
 def runs():
     out = []
+    ps = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True).stdout
+    notes = run_notes()
     for p in glob.glob(RUNS + "/plan2*/progress.jsonl"):
         name = p.split("/")[-2]
-        out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name)})
+        par, cut = parent(name)
+        out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name), "alive": f"plan_rl --name {name} " in ps,
+                    "parent": par, "cut": cut, "note": notes.get(name, "")})
     out.sort(key=lambda r: -r["mtime"])
     return out
 
@@ -66,7 +89,10 @@ def progress(name):
                 r = json.loads(line)
             except ValueError:
                 continue
-            rows.append({k: r.get(k) for k in FIELDS})
+            row = {k: r.get(k) for k in FIELDS}
+            sd = r.get("std")
+            row["std_steer"] = sd[0] if isinstance(sd, list) and sd else None
+            rows.append(row)
     return rows
 
 
@@ -105,11 +131,24 @@ def header(name):
     return "\n".join(out)
 
 
-def table(name):
+def table_rows(name):
     r = subprocess.run([PY, "../tools/plan_table.py", name], cwd=OUT, capture_output=True, text=True, timeout=120)
     lines = [l for l in r.stdout.splitlines() if l.startswith("|")]
-    rows = [[c.strip() for c in l.strip("|").split("|")] for l in lines if not re.fullmatch(r"\|[-| ]+\|", l.strip())]
-    return rows
+    return [[c.strip() for c in l.strip("|").split("|")] for l in lines if not re.fullmatch(r"\|[-| ]+\|", l.strip())]
+
+
+def table(name):
+    """{rows, inherited, parent, cut}: a run started from a parent's checkpoint gets the parent's rows up to that update (its
+    "시작" row is the parent's u<cut>), marked as inherited"""
+    rows = table_rows(name)
+    par, cut = parent(name)
+    inh = []
+    if par and rows and os.path.exists(f"{RUNS}/{par}/progress.jsonl"):
+        prow = [r for r in table_rows(par)[1:] if re.fullmatch(r"u\d+", r[0]) and int(r[0][1:]) < cut]
+        body = [([f"u{cut}"] + r[1:]) if r[0] == "시작" else r for r in rows[1:]]
+        inh = [r[0] for r in prow] + [f"u{cut}"]
+        rows = [rows[0]] + [r[:len(rows[0])] + [""] * max(0, len(rows[0]) - len(r)) for r in prow] + body
+    return {"rows": rows, "inherited": inh, "parent": par, "cut": cut}
 
 
 def ckpts(name):
@@ -206,7 +245,8 @@ def edge(name, ref):
 
 def figs():
     out = []
-    for d in ("netaudit", "drift"):
+    dirs = ["netaudit", "drift", "rwexam", "batchdump"] + sorted(os.path.basename(d) for d in glob.glob(f"{OUT}/edge*") if os.path.isdir(d))
+    for d in dirs:
         for p in glob.glob(f"{OUT}/{d}/*.png"):
             out.append({"path": f"{d}/{os.path.basename(p)}", "mtime": os.path.getmtime(p)})
     out.sort(key=lambda r: -r["mtime"])
@@ -247,7 +287,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;", "image/gif")
             if u.path == "/api/runs":
                 return self._json(memo("runs", 20, runs))
-            if u.path.startswith("/api/") and u.path != "/api/figs" and not ok_run(name):
+            if u.path == "/api/notes":            # the research log (11-15, the user: "사이트에 제대로좀 반영좀")
+                p_ = f"{OUT}/research_log.md"
+                return self._json({"text": open(p_, errors="replace").read() if os.path.exists(p_) else "",
+                                   "mtime": os.path.getmtime(p_) if os.path.exists(p_) else None})
+            if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":
                 return self._json({"rows": memo(("p", name), 10, lambda: progress(name)), "status": memo(("s", name), 10, lambda: status(name))})
