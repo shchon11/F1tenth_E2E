@@ -149,6 +149,44 @@ def compare(name, u, ref):
     return {"text": open(c).read()}
 
 
+EDGE = (("늦게 보인 상자 (0.5-0.9 s 전에 보임)", "0.5-0.9 s 전"), ("보통 (0.9-1.5 s 전에 보임)", "0.9-1.5 s 전"),
+        ("같은 상자 첫째 통과", "첫째"), ("같은 상자 넷째 통과 이후", "넷째 이후"),
+        ("지난번에 세게 닿은 상자", "지난번에 세게 닿음"), ("지난번 깨끗했던 상자", "지난번에 안 닿거나 약하게"),
+        ("급하게 줄인 통과 (1 s에 1.5 m/s 넘게)", "1.5 m/s 넘게 (급하게)"))
+
+
+def edge_one(name, u):
+    """{situation: [passes, hard %]} from analysis/RUN_uU_boxes.txt (boxes on the driven path), + start / recovery from the exam text"""
+    out = {}
+    p = f"{OUT}/analysis/{name}_u{u}_boxes.txt"
+    if os.path.exists(p):
+        txt = open(p, errors="replace").read()
+        for lab, key in EDGE:
+            m = re.search(r"^\s+" + re.escape(key) + r"\s+(\d+)번 \| 세게 닿음\s+([\d.]+) %", txt, re.M)
+            if m:
+                out[lab] = [int(m.group(1)), float(m.group(2))]
+    e = f"{OUT}/analysis/{name}_u{u}_exam.txt"
+    if os.path.exists(e):
+        case = None
+        for line in open(e, errors="replace"):
+            if line.startswith("["):
+                case = line.split("]")[0][1:]
+            m = re.search(r"출발\(처음 5 s\)에 세게 닿은 세션\s+([\d.]+) %", line)
+            if m and case == "상대 차 · 상자":
+                out["출발 5 s 안에 세게 닿은 세션 (상대 차 · 상자)"] = [None, float(m.group(1))]
+            m = re.search(r"세게 닿은 뒤\((\d+)건\): 5 s 안에 선 것\s+([\d.]+) %", line)
+            if m and case == "혼자 · 상자":
+                out["상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)"] = [int(m.group(1)), float(m.group(2))]
+    return out
+
+
+def edge(name, ref):
+    us = sorted({int(m.group(1)) for p in glob.glob(f"{OUT}/analysis/{name}_u*_boxes.txt")
+                 for m in [re.search(rf"{name}_u(\d+)_boxes", p)] if m}, reverse=True)
+    return {"labels": [l for l, _ in EDGE] + ["출발 5 s 안에 세게 닿은 세션 (상대 차 · 상자)", "상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)"],
+            "rows": [{"u": u, "run": edge_one(name, u), "ref": edge_one(ref, u) if ref else {}} for u in us]}
+
+
 def figs():
     out = []
     for d in ("netaudit", "drift"):
@@ -210,6 +248,9 @@ class H(BaseHTTPRequestHandler):
                 if not ok_run(ref):
                     return self._send(404, json.dumps({"error": "no such ref"}))
                 return self._json(compare(name, int(q.get("u", "0")), ref))
+            if u.path == "/api/edge":
+                ref = q.get("ref", "")
+                return self._json(memo(("edge", name, ref), 60, lambda: edge(name, ref if ok_run(ref) else "")))
             if u.path == "/api/figs":
                 return self._json(memo("figs", 60, figs))
             if u.path == "/file":

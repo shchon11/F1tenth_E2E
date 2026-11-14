@@ -64,6 +64,7 @@ button { font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; b
   <div class="card"><details><summary>이 run의 질문 · 근거 · 반증 기준 (실행 스크립트 머리말)</summary><pre id="hdr"></pre></details></div>
   <div class="card"><h2>학습 표: run vs 비교 run <span class="muted">(학습 조건: plan대로 정확히 실행, 같은 checkpoint끼리 · 차 = run − 비교 run, 초록 = run이 나음 · 빨강 = run이 나쁨)</span></h2><div id="table" style="overflow-x:auto"></div>
   <details style="margin-top:8px"><summary>run의 학습 표 원본 (다섯째 칸 포함)</summary><div id="table_raw" style="overflow-x:auto"></div></details></div>
+  <div class="card"><h2>edge case: run vs 비교 run <span class="muted">(frozen exam, 달리던 길 위의 상자 통과 · 칸 = 세게 닿은 통과의 비율 % (통과 수) · 초록 = run이 나음 · 빨강 = run이 나쁨 · 마지막 줄만 높을수록 나쁨 아님: 선 것 = 세게 닿은 뒤 멈춘 비율)</span></h2><div id="edge" style="overflow-x:auto"></div></div>
   <h2 style="font-size:15px;margin:18px 0 8px">학습 중 기록 <span class="muted">(학습 rollout, 탐색 잡음 포함 · 실선 = run, 점선 = 비교 run)</span></h2>
   <div class="charts">
     <div class="card"><h2>바퀴 / 분</h2><canvas id="c_laps"></canvas></div>
@@ -167,6 +168,18 @@ async function loadSlow() {
     $("table").innerHTML = `<table><tr><th rowspan="2">checkpoint</th>` + cols.map(([, h]) => `<th colspan="3" style="text-align:center">${h}</th>`).join("") + "</tr><tr>" +
       cols.map(() => `<th>${esc(run)}</th><th class="muted">${esc(ref)}</th><th>차</th>`).join("") + "</tr>" +
       us.map((u) => `<tr><td>${esc(u)}</td>` + cols.map(([i, , eps]) => cell(A[u] ? num(A[u][i]) : null, B[u] ? num(B[u][i]) : null, eps)).join("") + "</tr>").join("") + "</table>";
+  });
+  j(`/api/edge?run=${run}&ref=${ref}`).then((e) => {
+    if (!e.rows.length) { $("edge").innerHTML = '<span class="muted">아직 없음 (frozen exam 뒤에 생김)</span>'; return; }
+    const f = (v) => v ? `${v[1].toFixed(1)}${v[0] != null ? ` <span class="muted">(${v[0]})</span>` : ""}` : "–";
+    $("edge").innerHTML = "<table><tr><th>상황</th>" + e.rows.map((r) => `<th colspan="2" style="text-align:center">u${r.u}</th>`).join("") + "</tr><tr><th></th>" +
+      e.rows.map(() => `<th>${esc(run)}</th><th class="muted">${esc(ref)}</th>`).join("") + "</tr>" +
+      e.labels.map((lab) => `<tr><td>${esc(lab)}</td>` + e.rows.map((r) => {
+        const a = r.run[lab], b = r.ref[lab];
+        let st = "";
+        if (a && b) { const d = a[1] - b[1], tol = Math.max(2, 0.25 * Math.max(a[1], b[1])); st = d < -tol ? "color:var(--good);font-weight:600" : d > tol ? "color:var(--bad);font-weight:600" : ""; }
+        return `<td class="num" style="${st}">${f(a)}</td><td class="num muted">${f(b)}</td>`;
+      }).join("") + "</tr>").join("") + "</table>";
   });
   const cs = await j(`/api/ckpts?run=${run}`);
   const key = run + ref + JSON.stringify(cs.map((c) => [c.u, !!c.exam, !!c.video, !!c.npz]));
