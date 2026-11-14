@@ -36,7 +36,7 @@ for fn, rf in zip(sys.argv[1::2], sys.argv[2::2]):
                 best, at = g, s
         # room beside the other car at that moment: wall distance from its centre, minus half its width
         wd = R.wall_dist(int(R.tid[at, b]), op[at, b, None, :2])[0] - R.hw
-        out.append((best, abs(st[at, b, 3]), abs(op[at, b, 3]), wd))
+        out.append((best, abs(st[at, b, 3]), abs(op[at, b, 3]), wd, at))   # at = the decision of the closest approach
     o = np.array(out); hard, light = rows[:, 4] > 0, (rows[:, 4] == 0) & (rows[:, 5] > 0)
     clean = ~hard & ~light & (rows[:, 6] == 0); passed = rows[:, 3] == 0
     print(f"== {fn.split('/')[-1]}: 만남 {len(rows)}건, 그중 앞지름으로 끝남 {int(passed.sum())}건")
