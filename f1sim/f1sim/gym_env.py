@@ -912,7 +912,7 @@ class _ContactReplay:
         none = torch.zeros(ids.numel(), dtype=torch.bool, device=env.device)
         if self.n == 0:
             return poses, speed, none
-        in_ids = torch.zeros(env.B, dtype=torch.bool, device=env.device); in_ids[ids] = True
+        in_ids = torch.zeros(env.B, dtype=torch.bool, device=env.device); in_ids.index_fill_(0, ids, True)
         full = in_ids.view(-1, 2).all(1)
         learner_pos = ((env.slot[ids] == 0) & full[env.race[ids]]).nonzero().flatten()
         if learner_pos.numel() == 0:
@@ -1569,7 +1569,7 @@ class F1VecEnv:
                                    for i, sl in enumerate(self.slots, start=1) if sl.external_driven}
         self.external_driven = torch.zeros(self.B, dtype=torch.bool, device=dev)
         for rows in self.external_slot_rows.values():
-            self.external_driven[rows] = True
+            self.external_driven.index_fill_(0, rows, True)
         self.on_policy = self.learner.clone()
         self.slot_scale_lo, self.slot_scale_hi = t(lo)[self.slot], t(hi)[self.slot]
         self.slot_cap = t(cap)[self.slot]
@@ -1778,6 +1778,7 @@ class F1VecEnv:
             drv[:, i] = torch.where(full, new, drv[:, i])
         self.teacher_driven.copy_((self.opp_driver == OPP_DRIVER_TEACHER) & (self.slot > 0))
         self.pool_driven.copy_(self.opp_driver >= OPP_DRIVER_POOL)
+        self._raceline_needed_cache = None          # (11-14) re-asked after the redraw, see `_apply_slot_kinds`
 
     def _apply_slot_kinds(self) -> None:
         """Rebuild the alt-teacher masks from `slot_kind_code`, in place.
@@ -1790,6 +1791,10 @@ class F1VecEnv:
             m = self.alt_teacher_mask[name]
             m &= ~self._slot_mixed_rows            # clear only what this function owns
             m |= mine
+        # (11-14) the masks changed in place: whether any teacher-driven car still takes the raceline teacher's command is
+        # asked again on the next step. Kept from construction, it said "yes" for a mixed planner table whose four kinds
+        # cover every opponent, and the raceline teacher planned all rows every step for nothing (26.5 ms at 608 envs)
+        self._raceline_needed_cache = None
 
     def _slot_spawn_codes(self, is_full_race: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
         """(G, M) spawn code per car of every race, re-drawing the `random` slots of a full reset.
@@ -2009,10 +2014,10 @@ class F1VecEnv:
         rows = torch.nonzero(self.slot == 0).flatten()
         self.external_slot_rows[0] = rows
         self.external_drivers[0] = driver
-        self.external_driven[rows] = True
+        self.external_driven.index_fill_(0, rows, True)
         self._all_external = bool(self.external_driven.all())
         # the driver has these cars now: a follower that claimed them before (`claim_external`) would replace its command
-        self.ext_mask[rows] = False
+        self.ext_mask.index_fill_(0, rows, False)
         self._ext_ids.difference_update(int(i) for i in rows.tolist())
         if hasattr(driver, "rows"):
             driver.rows = rows
@@ -2292,7 +2297,7 @@ class F1VecEnv:
         if getattr(self, "level_replay", None) is None or ids.numel() == 0:
             return self._reset_envs_core(ids)
         M = self.M
-        in_ids = torch.zeros(self.B, dtype=torch.bool, device=self.device); in_ids[ids] = True
+        in_ids = torch.zeros(self.B, dtype=torch.bool, device=self.device); in_ids.index_fill_(0, ids, True)
         full = in_ids.view(-1, M).all(1)
         whole = full[self.race] & in_ids
         part = ids[~whole[ids]]
@@ -2326,7 +2331,7 @@ class F1VecEnv:
         else:
             # a race resets as a whole (new track, cars staggered along the lane) when all its cars are in
             # ids; a single car (crashed) respawns behind its race mates on the race's current track
-            in_ids = torch.zeros(self.B, dtype=torch.bool, device=self.device); in_ids[ids] = True
+            in_ids = torch.zeros(self.B, dtype=torch.bool, device=self.device); in_ids.index_fill_(0, ids, True)
             full = in_ids.view(-1, self.M).all(1)                             # (G,)
             race = self.race[ids]; slot = self.slot[ids]; is_full = full[race]
             if e.resample_track_on_reset and self.sim.track.T > 1:
@@ -2556,7 +2561,7 @@ class F1VecEnv:
         time and calls it again, so nothing here can be left describing the grid the scene replaced."""
         e = self.ecfg
         self.sim.odom.state[ids, 3] = speed
-        self.prev_action[ids] = 0.0
+        self.prev_action.index_fill_(0, ids, 0.0)
         if self.act_dim == 2:
             v_lo = self._v_lo()[ids]
             self.prev_action[ids, 1] = (speed - v_lo) / (e.v_max_policy - v_lo) * 2 - 1
@@ -2583,8 +2588,8 @@ class F1VecEnv:
                     out = torch.where((codes == c)[:, None], held, out)
                 self.prev_action[ids] = out
             self.tracker.reset(ids); self._calibrate_tracker(ids)
-        self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
-        self._dec_cnt[ids] = 0                                     # a respawned car decides on its first step
+        self.prev_steer_norm.index_fill_(0, ids, 0.0); self.last_cmd.index_fill_(0, ids, 0.0); self.last_cmd[ids, 1] = speed
+        self._dec_cnt.index_fill_(0, ids, 0)  # a respawned car decides on its first step
         if self.events is not None:
             self.events.reset(ids)                                  # a respawned car starts with no event
         for alt in self.alt_teachers:
@@ -2603,26 +2608,26 @@ class F1VecEnv:
             hit = torch.isin(rows, ids)
             if bool(hit.any()):
                 drv.reset(hit.cpu().numpy())
-        self._was_touching[ids] = False                             # a fresh car is touching nothing
-        self._was_touching_wall[ids] = False
-        self._car_prev[ids] = False; self._car_resp[ids] = False
+        self._was_touching.index_fill_(0, ids, False)  # a fresh car is touching nothing
+        self._was_touching_wall.index_fill_(0, ids, False)
+        self._car_prev.index_fill_(0, ids, False); self._car_resp.index_fill_(0, ids, False)
         if self.ecfg.contact_severity_min > 0:
-            self._wall_pending[ids] = 0.0; self._car_sev_prev[ids] = False; self._car_sev_ok[ids] = False
-        self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
+            self._wall_pending.index_fill_(0, ids, 0.0); self._car_sev_prev.index_fill_(0, ids, False); self._car_sev_ok.index_fill_(0, ids, False)
+        self.gap_prev.index_fill_(0, ids, 0.0); self.gap_valid.index_fill_(0, ids, False)  # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         for seat in self._seat_builders():
             seat.reset_actions(ids, self.prev_action)
-        self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
-        self.ep_limit[ids] = self.NO_LIMIT; self.ep_contacts[ids] = 0.0
-        self.opponent_held[ids] = False                            # a fresh car holds no car ahead
-        self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
+        self.ep_step.index_fill_(0, ids, 0); self.ep_return.index_fill_(0, ids, 0.0); self.ep_progress.index_fill_(0, ids, 0.0)
+        self.ep_limit.index_fill_(0, ids, self.NO_LIMIT); self.ep_contacts.index_fill_(0, ids, 0.0)
+        self.opponent_held.index_fill_(0, ids, False)  # a fresh car holds no car ahead
+        self.lap_start_step.index_fill_(0, ids, 0); self.prev_lap.index_fill_(0, ids, 0)
         if self.ecfg.reward_lap_time > 0:
             # a car spawns mid-sector, so its first boundary is not a sector it drove: start the clock
             # but withhold the reward until it has crossed one boundary and entered the next cleanly
             s_new = self.sim.s[ids]
             L_ = self.sim.track.length[self.sim.tid[ids]].clamp_min(1e-6)
             self.sector_idx[ids] = (s_new / L_ * self.sector_lim.shape[1]).long().clamp_(0, self.sector_lim.shape[1] - 1)
-            self.sector_t0[ids] = 0.0; self.sector_valid[ids] = False; self.s_prev[ids] = s_new
+            self.sector_t0.index_fill_(0, ids, 0.0); self.sector_valid.index_fill_(0, ids, False); self.s_prev[ids] = s_new
 
     def restart_cars(self, ids: torch.Tensor, far: bool = True) -> None:
         """Respawn these cars now, between two steps, in the race they are in (same track, same layout, same driver):
@@ -2645,7 +2650,7 @@ class F1VecEnv:
             seat.refresh(r)
         if self._opp_age is not None and self.M > 1:
             # the seat's track ends (`_update_opp_visibility`'s rule), without advancing anyone's age a second time
-            done = torch.zeros(self.B, dtype=torch.bool, device=self.device); done[ids] = True
+            done = torch.zeros(self.B, dtype=torch.bool, device=self.device); done.index_fill_(0, ids, True)
             gone = done[:, None] | done[self.sim.other_idx]
             self._opp_age = torch.where(gone, torch.full_like(self._opp_age, OPP_NEVER_SEEN), self._opp_age)
         self.last_result = r
@@ -2679,7 +2684,7 @@ class F1VecEnv:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.plan_dim, device=self.device)], 1)[:, None, :]
         if self.hist2 is not None:
-            self._fresh2[ids] = True                     # filled from the row's first observation
+            self._fresh2.index_fill_(0, ids, True)  # filled from the row's first observation
         for seat in self._seat_builders():
             seat.fill(ids, scan, speed)                  # a league seat's own contract, the same fresh scan
 
@@ -2762,7 +2767,7 @@ class F1VecEnv:
                        current.progress, current.lap, current.car_collision, current.wall_collision,
                        current.wall_impact, current.car_impact):
             if target is not None:
-                target[ids] = 0
+                target.index_fill_(0, ids, 0)
         return current
 
     def _opponent_actions(self, action: torch.Tensor) -> torch.Tensor:
@@ -3166,6 +3171,12 @@ class F1VecEnv:
                     # (11-14) rows on ideal execution drive `ideal_cmd`; MAP's answer for them was computed every
                     # control step and thrown away (~18 % of a training env step at 640 envs)
                     self.tracker.map_rows = self.tracker.map_rows & ~self.sim.ideal_rows
+                # whether any row is left for MAP, read from the GPU once per set of masks rather than every step (a host sync)
+                key_ = (id(self.sim.ideal_rows), id(self.learner), id(self.ext_mask) if self._ext_ids else None)
+                if getattr(self, "_map_off_key", None) != key_:
+                    self._map_off_key = key_
+                    self._map_off = not bool(self.tracker.map_rows.any())
+                self.tracker.map_off = self._map_off
                 self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c", "tw5g")
                 from . import plan_tw as _ptw
                 self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"
@@ -4486,7 +4497,7 @@ class F1VecEnv:
         dt = self.tracker.spec.dt
         self._plan_traj[ids] = straight_traj(state[ids], n, dt, self._plan_clock_shift("main", ids))
         self._plan_pose[ids] = state[ids, :3]
-        self._plan_real[ids] = False
+        self._plan_real.index_fill_(0, ids, False)
         if self.opp_token_keep_alt:
             self._plan_alt[ids] = straight_traj(state[ids], n, dt, self._plan_clock_shift("alt", ids))
 
@@ -4670,7 +4681,7 @@ class F1VecEnv:
         driver's command is the car's, and with the policy idle the follower's is never written -- the car stood still
         under every plan checkpoint (found 2026-11-12)."""
         rows = rows[~self.external_driven[rows]]
-        self.ext_mask[rows] = True
+        self.ext_mask.index_fill_(0, rows, True)
         self._ext_ids.update(int(i) for i in rows.tolist())
 
     def clear_external_command(self, idx: Optional[int] = None) -> None:

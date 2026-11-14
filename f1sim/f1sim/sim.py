@@ -381,21 +381,21 @@ class Simulator:
             self.absent = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         if ids.numel() == 0:
             return
-        self.absent[ids] = True
+        self.absent.index_fill_(0, ids, True)
         self.absent_any = True
         st = self.state
-        st[ids] = 0.0
+        st.index_fill_(0, ids, 0.0)
         st[ids, 0] = -1000.0 - 5.0 * ids.to(st.dtype)
         st[ids, 1] = -1000.0
         if self.wheel_model:
             st[ids, dyn.IOMEGA] = 0.0
-        self.collided[ids] = False
+        self.collided.index_fill_(0, ids, False)
 
     def unpark(self, ids: torch.Tensor) -> None:
         """These cars are in the race again (the next `reset` places them)."""
         if not hasattr(self, "absent") or ids.numel() == 0:
             return
-        self.absent[ids] = False
+        self.absent.index_fill_(0, ids, False)
         self.absent_any = bool(self.absent.any())
 
     def _car_boxes(self, state: torch.Tensor):
@@ -940,39 +940,39 @@ class Simulator:
         # put a 4 m/s slip transient at the head of every episode.
         st[:, dyn.IOMEGA] = st[:, dyn.IVX] / self.P["r_w"][env_ids]
         self.state[env_ids] = st
-        self.ax[env_ids] = 0.0
-        self.ay[env_ids] = 0.0
+        self.ax.index_fill_(0, env_ids, 0.0)
+        self.ay.index_fill_(0, env_ids, 0.0)
         self.pose_prev[env_ids] = poses
-        self.att[env_ids] = 0.0
-        self.att_prev[env_ids] = 0.0
-        self.imu_state[env_ids] = 0.0
-        self.cmd[env_ids] = 0.0
+        self.att.index_fill_(0, env_ids, 0.0)
+        self.att_prev.index_fill_(0, env_ids, 0.0)
+        self.imu_state.index_fill_(0, env_ids, 0.0)
+        self.cmd.index_fill_(0, env_ids, 0.0)
         if speed is not None:
             self.cmd[env_ids, 1] = speed
         self.cmd_hist[env_ids] = self.cmd[env_ids][:, None, :]
         self.odom.reset(env_ids, poses)
-        self._odom_t_prev[env_ids] = self.t
+        self._odom_t_prev.index_fill_(0, env_ids, float(self.t))
         if self.track.cl is not None:
             s, _, i0 = self.track.project(poses[:, :2], self.tid[env_ids])   # global: no history yet
             self.s[env_ids] = s; self.cl_idx[env_ids] = i0
-        self.lap[env_ids] = 0
-        self.collided[env_ids] = False
-        self.car_collision[env_ids] = False
-        self.prop_touched[env_ids] = False
-        self.wall_touched[env_ids] = False
-        self.wall_engaged[env_ids] = False
-        self.impact_kind[env_ids] = 0.0
-        self.kind_prev[env_ids] = False
-        self.contact_pt[env_ids] = 0.0
-        self.contact_pt_sev[env_ids] = 0.0
-        self.contact_now[env_ids] = 0.0
-        self.contact_held[env_ids] = 0.0
-        self.contact_counts[env_ids] = 0
-        self.contact_acc[env_ids] = 0.0
-        self.car_touched[env_ids] = False
-        self.car_impact_roll[env_ids] = 0.0
-        self.wall_impact[env_ids] = 0.0
-        self.steps[env_ids] = 0
+        self.lap.index_fill_(0, env_ids, 0)
+        self.collided.index_fill_(0, env_ids, False)
+        self.car_collision.index_fill_(0, env_ids, False)
+        self.prop_touched.index_fill_(0, env_ids, False)
+        self.wall_touched.index_fill_(0, env_ids, False)
+        self.wall_engaged.index_fill_(0, env_ids, False)
+        self.impact_kind.index_fill_(0, env_ids, 0.0)
+        self.kind_prev.index_fill_(0, env_ids, False)
+        self.contact_pt.index_fill_(0, env_ids, 0.0)
+        self.contact_pt_sev.index_fill_(0, env_ids, 0.0)
+        self.contact_now.index_fill_(0, env_ids, 0.0)
+        self.contact_held.index_fill_(0, env_ids, 0.0)
+        self.contact_counts.index_fill_(0, env_ids, 0)
+        self.contact_acc.index_fill_(0, env_ids, 0.0)
+        self.car_touched.index_fill_(0, env_ids, False)
+        self.car_impact_roll.index_fill_(0, env_ids, 0.0)
+        self.wall_impact.index_fill_(0, env_ids, 0.0)
+        self.steps.index_fill_(0, env_ids, 0)
         self._resample_car_dims(env_ids)
 
     # ------------------------------------------------------------------ warm-up

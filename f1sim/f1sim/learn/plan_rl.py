@@ -1115,14 +1115,17 @@ def main(argv=None):
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
             h = bHM[sel[0]]
-            outs = []
+            hs_ = []
             for i in range(sel.shape[0]):
                 if i > 0:
                     # after a restart: the state the next decision was driven from -- zero, or a scene's memory
                     h = torch.where(bD[sel[i - 1]][:, None] > 0, bHM[sel[i]], h)
-                fi, h = actor.remember(f[i], h)
-                outs.append(fi)
-            fc = torch.cat(outs, 0)
+                h = actor.gru(f[i], h)
+                hs_.append(h)
+            # (11-14) what `remember` does after the GRU, once over the whole sequence instead of per step: the same
+            # numbers, ~10 fewer kernel launches per step forward and backward in the update's 128-step loop
+            hcat_ = torch.cat(hs_, 0); fflat_ = f.reshape(-1, f.shape[-1])
+            fc = (actor.trunk(torch.cat([fflat_, hcat_], 1)) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
             if aux_on or memv_on:
                 # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
                 hs = actor.memory_alone(f, bHM[sel[0]], bD[sel], bHM[sel])

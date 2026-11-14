@@ -490,7 +490,7 @@ class SplinerTeacher(FrenetOpponentPlanner):
     def reset_rows(self, rows: torch.Tensor) -> None:
         """A new race on this row is not the pass this one was committed to."""
         if self._side is not None:
-            self._side[rows] = 0.0
+            self._side.index_fill_(0, rows, 0.0)
 
     def _shape_at(self, r: torch.Tensor) -> torch.Tensor:
         """The spline's shape at arc position `r` relative to the apex, zero outside its span."""

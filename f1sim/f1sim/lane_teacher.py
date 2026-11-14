@@ -279,5 +279,5 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         """A new race starts on the racing line, not in the lane the last one ended in."""
         if self._lane is None:
             return
-        self._lane[rows] = self._on_line
-        self._offset[rows] = 0.0
+        self._lane.index_fill_(0, rows, self._on_line)
+        self._offset.index_fill_(0, rows, 0.0)

@@ -365,8 +365,8 @@ class OpponentEvents:
         """
         if ids.numel() == 0:
             return
-        self.kind[ids] = NO_EVENT
-        self.t[ids] = 0.0; self.dur[ids] = 0.0; self.p0[ids] = 0.0; self.p1[ids] = 0.0
+        self.kind.index_fill_(0, ids, NO_EVENT)
+        self.t.index_fill_(0, ids, 0.0); self.dur.index_fill_(0, ids, 0.0); self.p0.index_fill_(0, ids, 0.0); self.p1.index_fill_(0, ids, 0.0)
         if not self.react_on:
             return
         n = ids.numel()
@@ -382,11 +382,11 @@ class OpponentEvents:
         lerp = lambda rng, r: rng[0] + (rng[1] - rng[0]) * r
         self.amp_defend[ids] = lerp(e.opp_defend_offset_range, u[len(REACTIVE_NAMES)])
         self.amp_yield[ids] = lerp(e.opp_yield_offset_range, u[len(REACTIVE_NAMES) + 1])
-        self.react_now[ids] = 0
-        self.react_off[ids] = 0.0
-        self.corner[ids] = -1
-        self.corner_amp[ids] = 0.0
-        self.corner_mode[ids] = 1.0
+        self.react_now.index_fill_(0, ids, 0)
+        self.react_off.index_fill_(0, ids, 0.0)
+        self.corner.index_fill_(0, ids, -1)
+        self.corner_amp.index_fill_(0, ids, 0.0)
+        self.corner_mode.index_fill_(0, ids, 1.0)
 
     # ------------------------------------------------------------------ the timed machine
     def step(self):

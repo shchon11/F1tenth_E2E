@@ -581,7 +581,7 @@ class MAPPlanTracker:
         return getattr(self.__dict__["_inner"], name)
 
     def __setattr__(self, name, value):
-        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
+        if name in ("_inner", "map", "nominal", "map_rows", "map_off", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
                     "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv", "tw_speed_lead"):
             object.__setattr__(self, name, value)
         else:
@@ -590,7 +590,7 @@ class MAPPlanTracker:
     def reset(self, ids: torch.Tensor):
         self._inner.reset(ids)
         m = torch.zeros(self._inner.B, dtype=torch.bool, device=self._inner.device)
-        m[ids] = True
+        m.index_fill_(0, ids, True)
         self.map.reset(m)
 
     def push_imu(self, ax: torch.Tensor) -> None:
@@ -645,7 +645,9 @@ class MAPPlanTracker:
     def __call__(self, action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
                  yaw_rate: Optional[torch.Tensor] = None, delay=None) -> torch.Tensor:
         out = self._inner(action, v_meas, speed_cap, yaw_rate, delay)     # every row; the traffic keeps it
-        if not bool(self.map_rows.any()) or self.P is None:
+        # `map_off` (11-14): the env knows there are no MAP rows (every policy car on ideal execution) without asking the
+        # GPU -- `bool(map_rows.any())` was a host sync every control step, 39 % of a training process's CPU time waiting
+        if self.__dict__.get("map_off", False) or not bool(self.map_rows.any()) or self.P is None:
             return out
         B = action.shape[0]
         dev = action.device

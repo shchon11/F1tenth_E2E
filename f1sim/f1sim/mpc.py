@@ -1187,8 +1187,8 @@ class PlanTracker:
         return c
 
     def reset(self, ids: torch.Tensor):
-        self.u_prev[ids] = 0.0; self.u_seq[ids] = 0.0
-        self.wedged_t[ids] = 0.0; self.backout_t[ids] = 0.0
+        self.u_prev.index_fill_(0, ids, 0.0); self.u_seq.index_fill_(0, ids, 0.0)
+        self.wedged_t.index_fill_(0, ids, 0.0); self.backout_t.index_fill_(0, ids, 0.0)
         if self._reset_hook is not None:
             self._reset_hook(ids)
 

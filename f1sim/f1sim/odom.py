@@ -28,7 +28,7 @@ class VescOdom:
 
     def reset(self, env_ids: torch.Tensor, pose: torch.Tensor):
         self.state[env_ids, :3] = pose
-        self.state[env_ids, 3:] = 0.0
+        self.state[:, 3:].index_fill_(0, env_ids, 0.0)    # (11-14) no host sync (a scalar setitem copies it to the GPU)
 
     def update(self, v_wheel: torch.Tensor, steer_cmd: torch.Tensor, P: Dict[str, torch.Tensor],
                dt: float, quantise: bool = False, yaw_rate_true: Optional[torch.Tensor] = None):
