@@ -7,7 +7,8 @@
 #   100마다: 기억을 지울 때와 비교 (학습 표 다섯째 칸; lap_memory.py)
 # 뺀 것: 제어기(MAP·시간 추종기) 평가와 그 배치 영상, 라인 비교 그림, 상자 반응 기록, 주행 기록·회복 그림, 작은·큰 트랙 평가, 가속 사용,
 #   최단 시간 라인, plan 뒷부분 치우침, 시간 추종기 네 경우 영상. 필요할 때 따로 돌림.
-# 인자: 이름 [시작 25] [간격 25] [끝 1000]
+# 인자: 이름 [시작 25] [간격 25] [끝 1000]   환경변수 CORE_VAL_ENVS: 학습 조건 평가의 차 수(기본 1024 = 학습 차 512대;
+#   두 GPU 학습 중에는 5060이 학습도 하므로 512로 -- 학습 차 256대, 메모리 ~3 GB)
 NAME=$1; U0=${2:-25}; STEP=${3:-25}; U1=${4:-1000}
 D=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out
 T=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/tools
@@ -16,6 +17,8 @@ R=/home/shchon11/f1sim_runs
 source /home/shchon11/F1tenth_E2E/.venv/bin/activate
 export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1
 export F1SIM_PROP_BANK=/home/shchon11/f1sim_runs/prop_banks_box2 F1SIM_PROP_COUNT=uniform
+export F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555    # the run's tyre margin and scanner place (11-14: without them every
+                                                                # evaluation refused the checkpoint and the u25 row was empty)
 cd /home/shchon11/F1tenth_E2E/f1sim
 L=$A/${NAME}_summary.log
 S="bash $T/slot5060.sh"
@@ -27,7 +30,7 @@ for UU in $(seq $U0 $STEP $U1); do
   sleep 10
   echo "== u${UU} $(date +%H:%M)" >> $L
   python3 $T/trend_plot.py $NAME $A/${NAME}_trend.png > /dev/null 2>&1 && cp $A/${NAME}_trend.png $A/${NAME}_u${UU}_trend.png
-  CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 $T/plan_validate.py $C ideal 1024 40 "  u${UU} " 2>&1 | grep "^  u${UU}" >> $D/one_${NAME}_i.log
+  CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 $T/plan_validate.py $C ideal ${CORE_VAL_ENVS:-1024} 40 "  u${UU} " 2>&1 | grep "^  u${UU}" >> $D/one_${NAME}_i.log
   case " 25 50 100 150 " in *" $UU "*) EX=1 ;; *) EX=$(( UU > 150 && UU % 50 == 0 )) ;; esac
   [ "$EX" = 1 ] && bash $T/exam_judge.sh $NAME $UU
   if [ $((UU % 50)) -eq 0 ]; then

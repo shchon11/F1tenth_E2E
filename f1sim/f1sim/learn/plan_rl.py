@@ -584,7 +584,7 @@ def main(argv=None):
             raise SystemExit("--dist-world: not with --dump-rollout / --track-steps / --level-replay / --self-opp / --branches 2 / "
                              "--hold-p / --scene-replay / --accum (use --accum-actor)")
         dist.init_process_group(args.dist_backend, init_method=args.dist_init, rank=args.dist_rank, world_size=args.dist_world,
-                                timeout=datetime.timedelta(minutes=30))
+                                timeout=datetime.timedelta(hours=24))    # gpu_guard3 may pause both while the console runs
         if args.dist_rank > 0 and not args.dist_same_seed:
             args.seed += 7919 * args.dist_rank          # its own cars, boxes, opponents and noise; the weights come from rank 0
     torch.manual_seed(args.seed)
