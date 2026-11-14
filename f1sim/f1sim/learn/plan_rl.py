@@ -593,6 +593,11 @@ def main(argv=None):
     ap.add_argument("--scene-lag", type=int, default=20,
                     help="a scene is the state this many decisions before the contact, drawn per scene from 0.5x to 1.5x of it")
     ap.add_argument("--scene-size", type=int, default=1024, help="scenes kept (the oldest make room)")
+    ap.add_argument("--scene-kinds", default="wall,box,car",
+                    help="which hard contacts give scenes (11-15: 'box' = only box hits -- 44 %% of plan26l u200's hard box hits "
+                         "were fast approaches to a box seen < 1 s before, 6 %% of the passes)")
+    ap.add_argument("--scene-min-speed", type=float, default=0.0,
+                    help="[m/s] a scene is kept only if the car was at least this fast at the scene's moment (the approach)")
     ap.add_argument("--scene-episode-s", type=float, default=5.0, help="[s] an episode that starts from a scene lasts this long")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
@@ -611,9 +616,10 @@ def main(argv=None):
         import datetime
         import torch.distributed as dist
         if (args.dump_rollout or args.track_steps or args.level_replay > 0 or args.self_opp > 0 or args.branches == 2
-                or args.hold_p > 0 or args.scene_replay > 0 or args.accum > 1):
+                or args.hold_p > 0 or args.accum > 1):
+            # --scene-replay (11-15): each rank keeps its own store from its own races; the statistics are rank 0's ordinary races
             raise SystemExit("--dist-world: not with --dump-rollout / --track-steps / --level-replay / --self-opp / --branches 2 / "
-                             "--hold-p / --scene-replay / --accum (use --accum-actor)")
+                             "--hold-p / --accum (use --accum-actor)")
         dist.init_process_group(args.dist_backend, init_method=args.dist_init, rank=args.dist_rank, world_size=args.dist_world,
                                 timeout=datetime.timedelta(hours=24))    # gpu_guard3 may pause both while the console runs
         if args.dist_rank > 0 and not args.dist_same_seed:
@@ -727,6 +733,8 @@ def main(argv=None):
         env.scene_replay = scene
         drv.scene = scene
     lag_lo, lag_hi = max(args.scene_lag // 2, 1), args.scene_lag + args.scene_lag // 2
+    _KIND = {"wall": 0, "box": 1, "car": 2}
+    scene_kinds = torch.tensor([_KIND[k.strip()] for k in args.scene_kinds.split(",") if k.strip()], dtype=torch.long, device=dev)
     hist = collections.deque(maxlen=lag_hi + 1)                    # the last decisions' states, the newest last
     since = torch.zeros(Bl, dtype=torch.long, device=dev)          # decisions driven since the row's last restart
     eps_n = torch.randn(Bl, PS.ACT_DIM, device=dev)                # the exploration noise that stays (--noise-corr)
@@ -1048,12 +1056,17 @@ def main(argv=None):
                     hd = (env.sim.contact_counts[lid, 3:6] - hard0).clamp_min(0).float()
                     hd[:, 2] = hd[:, 2] * (pr.seen_t <= SEEN_S + PS.DT).float()
                     hit = (hd.sum(1) > 0) & ~out["restarted"]
+                    hit_take = (hd[:, scene_kinds] > 0).any(1) & ~out["restarted"]
                     # 3. a scene from every one outside a scene episode: the state `lag` decisions earlier in the same episode
-                    take = hit & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi)
+                    take = hit_take & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi)
                     if bool(take.any()):
                         rows_ = torch.nonzero(take)[:, 0]
                         k_ = torch.randint(lag_lo, lag_hi + 1, (rows_.numel(),), device=dev, generator=scene.gen)
                         k_ = torch.minimum(k_, since[rows_]).clamp(max=len(hist) - 1)
+                        if args.scene_min_speed > 0:                 # the approach: the car's speed at the scene's moment
+                            v_ = torch.stack([hist[-1 - int(kk)]["sim_state"][r_, 0, dyn.IVX] for r_, kk in zip(rows_.tolist(), k_.tolist())])
+                            keep_ = v_.abs() >= args.scene_min_speed
+                            rows_, k_ = rows_[keep_], k_[keep_]
                         kind_ = hd[rows_].argmax(1)
                         for kk in k_.unique().tolist():
                             mk_ = k_ == kk
