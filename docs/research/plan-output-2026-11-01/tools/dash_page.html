@@ -112,7 +112,7 @@ async function loadRuns() {
   const rs = await j("/api/runs");
   const run = q.get("run") || rs[0]?.name, runMap = rs.find((r) => r.name === run)?.map;
   const sameMap = rs.filter((r) => r.name !== run && r.map === runMap);
-  const ref = q.get("ref") || (sameMap.find((r) => r.name === "plan26i") ? "plan26i" : sameMap[0]?.name);
+  const ref = q.get("ref") || (sameMap.find((r) => r.name === "plan26l") ? "plan26l" : sameMap[0]?.name);
   for (const [sel, cur] of [[$("run"), run], [$("ref"), ref]]) {
     sel.innerHTML = rs.map((r) => `<option value="${esc(r.name)}" ${r.name === cur ? "selected" : ""}>${esc(r.name)}${r.map && r.map !== "korea_2025_iccas" ? " · " + esc(r.map) : ""}</option>`).join("");
   }
