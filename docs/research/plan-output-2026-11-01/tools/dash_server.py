@@ -74,9 +74,10 @@ def status(name):
     st = {"run": name, "update": rows[-1]["update"] if rows else 0, "total": total, "alive": len(alive), "jobs": jobs,
           "last_mtime": os.path.getmtime(f"{RUNS}/{name}/progress.jsonl")}
     if len(rows) >= 2:
-        k = rows[-11:] if len(rows) > 11 else rows
-        if k[-1]["min"] is not None and k[0]["min"] is not None and k[-1]["update"] > k[0]["update"]:
-            spu = (k[-1]["min"] - k[0]["min"]) * 60.0 / (k[-1]["update"] - k[0]["update"])
+        k = [r for r in rows[-31:] if r["min"] is not None]
+        d = sorted((b["min"] - a["min"]) * 60.0 / (b["update"] - a["update"]) for a, b in zip(k, k[1:]) if b["update"] > a["update"])
+        if d:
+            spu = d[len(d) // 2]                       # the median: an analysis or a measurement pausing the run does not set the ETA
             st["s_per_update"] = spu
             if total:
                 st["eta"] = time.time() + spu * (total - rows[-1]["update"])
