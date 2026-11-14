@@ -27,6 +27,10 @@ CLR_PROP, CLR_WALL, ROUNDS = 0.10, 0.10, 4
 dev = torch.device("cuda")
 ck = torch.load(pck, map_location=dev, weights_only=False)
 a = argparse.Namespace(**ck["args"])
+# 11-14: BANK_WORLD=세계json = plan_rl checkpoint의 인자에는 트랙·상자 설정이 없어(세계 json에 있음) 그 세계를 그대로 씀 (지도 바꾸기)
+if os.environ.get("BANK_WORLD"):
+    import json
+    a = argparse.Namespace(**json.load(open(os.environ["BANK_WORLD"])))
 a.envs, a.seed, a.device = 64, int(time.time()) % 100000, "cuda"
 a.prop_place, a.prop_count, a.prop_fraction = "uniform", "fixed", 1.0
 a.prop_shapes = os.environ.get("BANK_SHAPES", getattr(a, "prop_shapes", "all"))   # 11-06: "boxes" = box-sized pieces only

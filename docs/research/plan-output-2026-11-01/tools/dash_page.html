@@ -110,9 +110,11 @@ async function j(u) { const r = await fetch(u); if (!r.ok) throw new Error(u); r
 
 async function loadRuns() {
   const rs = await j("/api/runs");
-  const run = q.get("run") || rs[0]?.name, ref = q.get("ref") || (rs.find((r) => r.name === "plan26i") ? "plan26i" : rs[1]?.name);
+  const run = q.get("run") || rs[0]?.name, runMap = rs.find((r) => r.name === run)?.map;
+  const sameMap = rs.filter((r) => r.name !== run && r.map === runMap);
+  const ref = q.get("ref") || (sameMap.find((r) => r.name === "plan26i") ? "plan26i" : sameMap[0]?.name);
   for (const [sel, cur] of [[$("run"), run], [$("ref"), ref]]) {
-    sel.innerHTML = rs.map((r) => `<option ${r.name === cur ? "selected" : ""}>${esc(r.name)}</option>`).join("");
+    sel.innerHTML = rs.map((r) => `<option value="${esc(r.name)}" ${r.name === cur ? "selected" : ""}>${esc(r.name)}${r.map && r.map !== "korea_2025_iccas" ? " · " + esc(r.map) : ""}</option>`).join("");
   }
 }
 function setUrl() { const u = new URL(location); u.searchParams.set("run", $("run").value); u.searchParams.set("ref", $("ref").value); history.replaceState(null, "", u); }

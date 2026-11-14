@@ -121,29 +121,30 @@ def one(fn, rows_fn):
     return f"{R.name} · {count}", gap, clean, touch, hard, (A, Bn)
 
 
-res = [one(sys.argv[i], sys.argv[i + 1]) for i in range(1, len(sys.argv) - 1, 2)]
-if FIG:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), constrained_layout=True)
-    ax = axes[0]
-    edges = np.arange(0, 0.62, 0.02)
-    for k, (name, gap, clean, touch, hard, _) in enumerate(res):
-        ax.hist(100 * gap[clean], bins=100 * edges, histtype="step", lw=2, density=True, color=("#1f77b4", "#e6820e", "#2ca02c", "#9467bd")[k % 4],
-                label=f"{name} (안 닿은 통과 {int(clean.sum())}번, 중앙 {100 * np.median(gap[clean]):.0f} cm)")
-    ax.set_xlabel("가장 가까웠을 때 차체와 상자 사이 틈 [cm]"); ax.set_ylabel("비율 (밀도)"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-    ax.set_title("길 위 상자를 안 닿고 지날 때 남긴 틈", fontsize=10)
-    ax = axes[1]
-    for k, (name, gap, clean, touch, hard, (A, Bn)) in enumerate(res):
-        xs, ys, lo_, hi_ = [], [], [], []
-        for i, (lo, hi) in enumerate(BINS):
-            m = clean[A] & (gap[A] >= lo) & (gap[A] < hi); n = int(m.sum())
-            if n < 5:
-                continue
-            p = touch[Bn][m].mean(); se = 1.96 * np.sqrt(max(p * (1 - p), 1e-9) / n)
-            xs.append(i + 0.12 * (k - 0.5 * (len(res) - 1))); ys.append(100 * p); lo_.append(100 * min(p, se)); hi_.append(100 * se)
-        ax.errorbar(xs, ys, yerr=[lo_, hi_], fmt="o", ms=7, capsize=3, color=("#1f77b4", "#e6820e", "#2ca02c", "#9467bd")[k % 4], label=name)
-    ax.set_xticks(range(len(BINS)))
-    ax.set_xticklabels([f"{100 * lo:.0f}~{100 * hi:.0f} cm" if hi < 9 else f"{100 * lo:.0f} cm 넘음" for lo, hi in BINS])
-    ax.set_xlabel("이번 통과에서 남긴 틈 (안 닿음)"); ax.set_ylabel("같은 상자 바로 다음 통과에서 닿은 비율 [%]"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-    ax.set_title("이번에 바짝 지나간 상자를 다음 바퀴에 닿는가 (막대 = 95 % 구간)", fontsize=10)
-    fig.savefig(FIG, dpi=110); plt.close(fig)
-    print("그림", FIG)
+if __name__ == "__main__":
+    res = [one(sys.argv[i], sys.argv[i + 1]) for i in range(1, len(sys.argv) - 1, 2)]
+    if FIG:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), constrained_layout=True)
+        ax = axes[0]
+        edges = np.arange(0, 0.62, 0.02)
+        for k, (name, gap, clean, touch, hard, _) in enumerate(res):
+            ax.hist(100 * gap[clean], bins=100 * edges, histtype="step", lw=2, density=True, color=("#1f77b4", "#e6820e", "#2ca02c", "#9467bd")[k % 4],
+                    label=f"{name} (안 닿은 통과 {int(clean.sum())}번, 중앙 {100 * np.median(gap[clean]):.0f} cm)")
+        ax.set_xlabel("가장 가까웠을 때 차체와 상자 사이 틈 [cm]"); ax.set_ylabel("비율 (밀도)"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        ax.set_title("길 위 상자를 안 닿고 지날 때 남긴 틈", fontsize=10)
+        ax = axes[1]
+        for k, (name, gap, clean, touch, hard, (A, Bn)) in enumerate(res):
+            xs, ys, lo_, hi_ = [], [], [], []
+            for i, (lo, hi) in enumerate(BINS):
+                m = clean[A] & (gap[A] >= lo) & (gap[A] < hi); n = int(m.sum())
+                if n < 5:
+                    continue
+                p = touch[Bn][m].mean(); se = 1.96 * np.sqrt(max(p * (1 - p), 1e-9) / n)
+                xs.append(i + 0.12 * (k - 0.5 * (len(res) - 1))); ys.append(100 * p); lo_.append(100 * min(p, se)); hi_.append(100 * se)
+            ax.errorbar(xs, ys, yerr=[lo_, hi_], fmt="o", ms=7, capsize=3, color=("#1f77b4", "#e6820e", "#2ca02c", "#9467bd")[k % 4], label=name)
+        ax.set_xticks(range(len(BINS)))
+        ax.set_xticklabels([f"{100 * lo:.0f}~{100 * hi:.0f} cm" if hi < 9 else f"{100 * lo:.0f} cm 넘음" for lo, hi in BINS])
+        ax.set_xlabel("이번 통과에서 남긴 틈 (안 닿음)"); ax.set_ylabel("같은 상자 바로 다음 통과에서 닿은 비율 [%]"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        ax.set_title("이번에 바짝 지나간 상자를 다음 바퀴에 닿는가 (막대 = 95 % 구간)", fontsize=10)
+        fig.savefig(FIG, dpi=110); plt.close(fig)
+        print("그림", FIG)

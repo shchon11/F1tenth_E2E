@@ -40,9 +40,18 @@ def runs():
     out = []
     for p in glob.glob(RUNS + "/plan2*/progress.jsonl"):
         name = p.split("/")[-2]
-        out.append({"name": name, "mtime": os.path.getmtime(p)})
+        out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name)})
     out.sort(key=lambda r: -r["mtime"])
     return out
+
+
+def run_map(name):
+    """the map a run trained on (its args.json world; 11-14). Runs from before --world was used are Korea 2025."""
+    try:
+        w = json.load(open(f"{RUNS}/{name}/args.json"))["args"].get("world") or ""
+        return str(json.load(open(w)).get("tracks", "")).split(",")[0].split(":")[-1] or "korea_2025_iccas"
+    except Exception:
+        return "korea_2025_iccas"
 
 
 def ok_run(name):
@@ -141,6 +150,9 @@ def compare(name, u, ref):
     a = f"{OUT}/exam/exam1_{ref}_u{u}_ideal_uniform_n256.npz"; b = f"{OUT}/exam/exam1_{name}_u{u}_ideal_uniform_n256.npz"
     if not (os.path.exists(a) and os.path.exists(b)):
         return {"text": f"{ref} u{u} 또는 {name} u{u}의 frozen exam 기록이 없음"}
+    ma, mb = run_map(ref), run_map(name)
+    if ma != mb:                                           # 11-14: sessions are paired by seed; another map's run is no comparison
+        return {"text": f"{ref}는 {ma}, {name}는 {mb}에서 학습 -- 다른 지도끼리는 같은 세션 비교가 안 됨"}
     c = f"{CACHE}/{name}_u{u}_vs_{ref}.txt"
     if not os.path.exists(c) or os.path.getmtime(c) < max(os.path.getmtime(a), os.path.getmtime(b)):
         r = subprocess.run([PY, "-W", "ignore", "grad_step_table.py", a, f"{name} u{u}={b}"], cwd=TOOLS, capture_output=True,

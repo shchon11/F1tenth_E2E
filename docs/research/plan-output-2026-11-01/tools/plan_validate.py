@@ -33,6 +33,9 @@ ck_path, mode, n_env, secs = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(s
 tag = sys.argv[5] if len(sys.argv) > 5 else ""
 SEED = int(os.environ.get("F1SIM_EVAL_SEED", 4242))      # a second seed tells how far apart two checkpoints must be to differ (11-11)
 dev = torch.device("cuda")
+_ck0 = torch.load(ck_path, map_location="cpu", weights_only=False)
+from world_of import world_path
+WORLD = world_path(_ck0); del _ck0                         # the world the checkpoint was trained in (11-14)
 a = argparse.Namespace(**json.load(open(WORLD)))
 a.envs, a.seed, a.device = n_env, SEED, "cuda"
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the measurement

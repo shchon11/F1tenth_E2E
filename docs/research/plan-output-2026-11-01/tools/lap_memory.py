@@ -11,6 +11,7 @@ import numpy as np
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import plan_rl as PR
+from world_of import world_path
 from f1sim.learn.plan_policy import PlanObs2, load_actor2, plan_v2
 from f1sim.learn.plan_reward import PlanReward
 from f1sim.sim import CONTACT_FRAME_COLUMNS as CC
@@ -30,7 +31,7 @@ i_hd = [CC.index(k) for k in ("hard_wall", "hard_prop")]
 
 
 def run(props: bool, forget: bool):
-    env, lim, _ = PR.build(PR.WORLD, n_env, SEED, dev, fmt="v2", overrides={
+    env, lim, _ = PR.build(world_path(ck), n_env, SEED, dev, fmt="v2", overrides={
         "prop_fraction": 1.0 if props else 0.0, "opp_present": 0.0, "removal_p": 0.0, "episode_s": secs + 5.0})
     lid = env.learner_ids; B = int(lid.numel())
     actor = load_actor2(ck, dev)

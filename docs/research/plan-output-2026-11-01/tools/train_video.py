@@ -36,7 +36,8 @@ dev = torch.device("cuda")
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 if (ck.get("args") or {}).get("plan_lat_margin") is not None:      # the tyre limit the checkpoint was trained with
     os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(ck["args"]["plan_lat_margin"])
-env, lim, world = PR.build(PR.WORLD, n_env, SEED, dev, fmt="v2", overrides={"episode_s": secs + 5.0})
+from world_of import world_path
+env, lim, world = PR.build(world_path(ck), n_env, SEED, dev, fmt="v2", overrides={"episode_s": secs + 5.0})
 lid = env.learner_ids; Bl = int(lid.numel())
 actor = load_actor2(ck, dev)
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
