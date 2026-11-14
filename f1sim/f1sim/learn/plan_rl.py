@@ -443,6 +443,10 @@ def main(argv=None):
     ap.add_argument("--noise-corr-steer", action="store_true",
                     help="--noise-corr on the steering outputs only; the speed outputs draw afresh every decision (11-14: held speed "
                          "noise stood the cars still 1 s at a time -- 68 %% of plan26m's rollout stopped at u28 vs 6 %% white)")
+    ap.add_argument("--update-offset", type=int, default=0,
+                    help="with --init --init-critic: count updates on from this one (11-14: a run forked from a checkpoint numbers its "
+                         "updates and checkpoints as the parent did, the lr schedule continues where it was; no optimizer state is "
+                         "saved, so Adam starts afresh)")
     ap.add_argument("--noise-corr-ramp", default="",
                     help="U0,U1: --noise-corr starts at 0 (white) and reaches its value linearly from update U0 to U1 (11-14: held "
                          "noise from update 1 stood a fresh policy still -- plan26m u25 drove 1 m in 90 s; at u150 it costs only "
@@ -867,7 +871,7 @@ def main(argv=None):
         trk = {k_[4:]: torch.as_tensor(zt[k_], dtype=torch.float32, device=dev) for k_ in zt.files if k_.startswith("dir_")}
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
-    for upd in range(1, args.updates + 1):
+    for upd in range(1 + args.update_offset, args.updates + 1):
         frac = (upd - 1) / max(1, args.updates - 1)
         if args.noise_corr_ramp:                                   # --noise-corr-ramp: in place, read by the rollout below
             _r0, _r1 = (float(x) for x in args.noise_corr_ramp.split(","))
