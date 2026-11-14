@@ -440,6 +440,13 @@ def main(argv=None):
     ap.add_argument("--noise-corr", type=float, default=0.0,
                     help="exploration noise that stays over decisions: AR(1) coefficient per decision (0 = a fresh draw every "
                          "decision; 0.8 = half gone after 0.3 s). The size of the noise at one decision is unchanged")
+    ap.add_argument("--noise-corr-steer", action="store_true",
+                    help="--noise-corr on the steering outputs only; the speed outputs draw afresh every decision (11-14: held speed "
+                         "noise stood the cars still 1 s at a time -- 68 %% of plan26m's rollout stopped at u28 vs 6 %% white)")
+    ap.add_argument("--noise-corr-ramp", default="",
+                    help="U0,U1: --noise-corr starts at 0 (white) and reaches its value linearly from update U0 to U1 (11-14: held "
+                         "noise from update 1 stood a fresh policy still -- plan26m u25 drove 1 m in 90 s; at u150 it costs only "
+                         "+40 %% training hits, 1 %% stopped)")
     ap.add_argument("--dump-rollout", default="", help="measurement only (with --init --init-critic: a checkpoint's own training "
                     "batches): every update's rollout is saved here as u<N>.npz -- per decision the first step's noise, the "
                     "steering it gave, advantage, value, reward parts, hard contacts, the boxes ahead, the pose -- and NO update "
@@ -719,6 +726,9 @@ def main(argv=None):
     hist = collections.deque(maxlen=lag_hi + 1)                    # the last decisions' states, the newest last
     since = torch.zeros(Bl, dtype=torch.long, device=dev)          # decisions driven since the row's last restart
     eps_n = torch.randn(Bl, PS.ACT_DIM, device=dev)                # the exploration noise that stays (--noise-corr)
+    noise_rho = torch.full((PS.ACT_DIM,), float(args.noise_corr), device=dev)
+    if args.noise_corr_steer:
+        noise_rho[PS.N_STEP:] = 0.0                                 # the speed outputs: a fresh draw every decision
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -859,6 +869,12 @@ def main(argv=None):
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1, args.updates + 1):
         frac = (upd - 1) / max(1, args.updates - 1)
+        if args.noise_corr_ramp:                                   # --noise-corr-ramp: in place, read by the rollout below
+            _r0, _r1 = (float(x) for x in args.noise_corr_ramp.split(","))
+            _rho = float(args.noise_corr) * min(1.0, max(0.0, (upd - _r0) / max(1.0, _r1 - _r0)))
+            noise_rho.fill_(_rho)
+            if args.noise_corr_steer:
+                noise_rho[PS.N_STEP:] = 0.0
         for gp in opt.param_groups + (opt_c.param_groups if opt_c is not None else []):
             gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
         if upd <= args.actor_freeze:
@@ -944,7 +960,7 @@ def main(argv=None):
                     # exploration noise that stays for several decisions (AR(1), each decision still N(0, 1) by itself; a
                     # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
                     # 2021) and coloured noise in PPO (Hollenstein et al. 2024) do
-                    eps_n = args.noise_corr * eps_n + (1.0 - args.noise_corr ** 2) ** 0.5 * torch.randn_like(mean)
+                    eps_n = noise_rho * eps_n + (1.0 - noise_rho ** 2) ** 0.5 * torch.randn_like(mean)
                     eps = eps_n
                 else:
                     eps = torch.randn_like(mean)
@@ -1467,6 +1483,7 @@ def main(argv=None):
             print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
                "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
+               "noise_rho_steer": float(noise_rho[0]),
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,
