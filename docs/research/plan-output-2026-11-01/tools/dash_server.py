@@ -177,13 +177,18 @@ def edge_one(name, u):
             m = re.search(r"세게 닿은 뒤\((\d+)건\): 5 s 안에 선 것\s+([\d.]+) %", line)
             if m and case == "혼자 · 상자":
                 out["상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)"] = [int(m.group(1)), float(m.group(2))]
+            m2 = re.search(r"5 s 안에 다시 못 달린 것\s+([\d.]+) %", line)
+            if m and m2 and case in ("혼자 · 상자", "상대 차 · 상자"):
+                k_ = f"선 뒤 5 s 안에 다시 못 달린 것 ({case})"
+                out[k_] = [None, float(m2.group(1))]
     return out
 
 
 def edge(name, ref):
     us = sorted({int(m.group(1)) for p in glob.glob(f"{OUT}/analysis/{name}_u*_boxes.txt")
                  for m in [re.search(rf"{name}_u(\d+)_boxes", p)] if m}, reverse=True)
-    return {"labels": [l for l, _ in EDGE] + ["출발 5 s 안에 세게 닿은 세션 (상대 차 · 상자)", "상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)"],
+    return {"labels": [l for l, _ in EDGE] + ["출발 5 s 안에 세게 닿은 세션 (상대 차 · 상자)", "상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)",
+                                              "선 뒤 5 s 안에 다시 못 달린 것 (혼자 · 상자)", "선 뒤 5 s 안에 다시 못 달린 것 (상대 차 · 상자)"],
             "rows": [{"u": u, "run": edge_one(name, u), "ref": edge_one(ref, u) if ref else {}} for u in us]}
 
 
