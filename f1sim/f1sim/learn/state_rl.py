@@ -1460,7 +1460,17 @@ def plan_env_fields(ar) -> dict:
     # tw's lookahead, tuned by the distance to given reference paths (`tools/tw_tune.py`, 11-06, the user: "ld가 먼저"): L1 =
     # max(0.35, 0.47 v) -- centreline 3 / 4 m/s 6.2 / 12.4 cm (7.1 / 14.6 at wp4's max(0.96, 0.47 v - 0.50)), the turn after a
     # change of direction 23.5 / 33.8 cm (25.9 / 36.7), wall contacts 6 (15) of 128
-    mp = dict(PLAN_MAP, speed_lookahead=0.0, t_clip_min=0.35, m_l1=0.47, q_l1=0.0) if tw else \
+    # 11-15 (the user: "Map 튜닝으로는 안돼?", "잘좀 해봐봐"): MAP re-tuned on the policy's own plans (tools/map_tune.py, frozen exam1,
+    # avg26s u900, 128 sessions x 90 s, two seeds): a shorter lookahead L1 = max(0.78, 0.37 v - 0.49) (6 m/s: 1.73 m, was 2.82)
+    # cuts the plan's corners less -- the old one clipped the island tips it planned around (84 % of the hard wall hits at one
+    # tip) -- with steering x up to 1.47, no extra scaling while accelerating / braking, the steering speed read 0.13 s ahead
+    # and the speed command 0.14 s ahead (motor lag 0.2 s): hard wall hits 9.12 / 9.58 -> 0.34 / 0.55 per session, boxes
+    # 1.48 -> 0.80, mean speed 4.80 -> 5.33 m/s (exact execution 5.83). F1SIM_MAP_OLD=1 = the setting before
+    TW_MAP = dict(t_clip_min=0.78, m_l1=0.37, q_l1=-0.49, lut_interp="linear", v_steer_gain_max=1.47, acc_scaler_for_steer=1.0,
+                  dec_scaler_for_steer=1.0, delay_comp=0.009, speed_lookahead_for_steer=0.133, tw_speed_lead=0.141)
+    if os.environ.get("F1SIM_MAP_OLD") == "1":
+        TW_MAP = dict(t_clip_min=0.35, m_l1=0.47, q_l1=0.0)
+    mp = dict(PLAN_MAP, speed_lookahead=0.0, **TW_MAP) if tw else \
         dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235)))
     if os.environ.get("F1SIM_MAP_ETA_REF"):                # 11-15: MAP's pursuit angle from "heading" (default) or "velocity"
         mp = dict(mp, eta_ref=os.environ["F1SIM_MAP_ETA_REF"])

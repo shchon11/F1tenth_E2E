@@ -475,8 +475,9 @@ def main(argv=None):
                          "falls short of --stall-vmin, x the shortfall's share; 0 = off")
     ap.add_argument("--stall-vmin", type=float, default=1.0, help="[m/s] --stall-s charges a progress rate below this")
     ap.add_argument("--stall-window", type=float, default=2.0, help="[s] --stall-s: the progress window")
-    ap.add_argument("--contact-scale", type=float, default=1.0,
-                    help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices)")
+    ap.add_argument("--contact-scale", type=float, default=None,
+                    help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices); "
+                         "default: the world json's \"contact_scale\" (6.59 s / the map's raceline lap, 11-15), else 1")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
     ap.add_argument("--hold-p", type=float, default=0.0,
                     help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
@@ -620,6 +621,8 @@ def main(argv=None):
     ap.add_argument("--dist-same-seed", action="store_true", help="test only: every process drives the same seed")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
     args = ap.parse_args(argv)
+    if args.contact_scale is None:                 # the map's own contact weight (11-15: one world json per map carries it)
+        args.contact_scale = float(json.load(open(args.world)).get("contact_scale", 1.0))
     dist = None
     if args.dist_world > 1:
         import datetime

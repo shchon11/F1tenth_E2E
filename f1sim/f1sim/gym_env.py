@@ -1307,9 +1307,12 @@ class F1VecEnv:
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
             if e.plan_follower == "map":
                 from .map_controller import POLICY_MAP, MAPParams, MAPPlanTracker, nominal_lut
+                _fm = dict(e.plan_follower_map or {})
+                _lead = float(_fm.pop("tw_speed_lead", 0.0))  # not a MAPParams field: the time-waypoint speed lead (11-15)
                 self.tracker = MAPPlanTracker(self.tracker, nominal_lut(self.sim),
-                                              MAPParams.from_dict(dict(POLICY_MAP, **(e.plan_follower_map or {}))),
+                                              MAPParams.from_dict(dict(POLICY_MAP, **_fm)),
                                               self.sim.params.nominal)
+                self.tracker.tw_speed_lead = _lead
             elif e.plan_follower != "mpc":
                 raise ValueError(f"plan_follower must be 'mpc' or 'map', not {e.plan_follower!r}")
         if int(e.decision_every) < 1 or (int(e.decision_every) > 1 and (e.action_mode != "plan" or e.plan_follower != "map")):

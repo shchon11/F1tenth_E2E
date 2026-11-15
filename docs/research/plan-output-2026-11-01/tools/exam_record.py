@@ -333,7 +333,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT),
          kinds=np.array(KN), cols=np.array(COLS), name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
          ep_s=np.array(secs + 5.0), level=env.level_seed[lid].cpu().numpy(), lapL=pr.goal.lap.float().cpu().numpy(),
-         exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
+         exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(float(getattr(env.tracker, "tw_speed_lead", 0.0) or 0.0) if mode == "map" else LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
          map=np.array(map_name(WORLD)), bank=np.array(f"{BANK} ({', '.join(_bank)}; sha256 {_sha})"), opp_restart_s=np.array(OPP_RESTART_S),
          lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0), opp_slot=np.array(OPP_SLOT), start_rest=np.array(REST), half_lap=np.array(HALF))
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
