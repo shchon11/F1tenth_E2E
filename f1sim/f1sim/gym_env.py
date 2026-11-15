@@ -3192,6 +3192,15 @@ class F1VecEnv:
                     # a plan handed in from outside as (curvature, signed speed) per 0.1 s segment (`plan_policy.PlanRunner`
                     # in the console / evaluation, 11-07 redesign): MAP follows it as a time-waypoint plan
                     self.tracker.tw_kv = self.ext_plan_kv
+                    if self.ecfg.plan_speed_scale != 1.0:
+                        # the console's plan speed knob (11-16: it did nothing on these plans): the same path, its speeds scaled --
+                        # the lateral acceleration goes with the square. Cached per plan version, so MAP's path cache still hits
+                        k_e, v_e = self.ext_plan_kv
+                        key_ = (id(k_e), k_e._version, id(v_e), v_e._version)
+                        if getattr(self, "_ext_scaled_key", None) != key_:
+                            self._ext_scaled = (k_e, v_e * float(self.ecfg.plan_speed_scale))
+                            self._ext_scaled_key = key_
+                        self.tracker.tw_kv = self._ext_scaled
                 self.tracker.tw_action = self._tw_action
                 self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
