@@ -60,6 +60,15 @@ if [ ! -f "$APPDIR/usr/lib/python/f1sim/viewer/console/__init__.py" ]; then
     find "$APPDIR/usr/lib/python/f1sim" -name __pycache__ -type d -prune -exec rm -rf {} +
 fi
 
+# The real venues' team SLAM maps live in the checkout's external/ (Korea 2025, ICRA 2022, ...), which the package looks for next
+# to itself: the map files (yaml + image) only, at the same relative place (usr/lib/external), so the AppImage opens them
+# without a checkout. F1SIM_EXTERNAL still points elsewhere when set.
+if [ -d "$REPO/external" ]; then
+    ( cd "$REPO/external" && find -L . -path "*/maps/*" \( -name "*.yaml" -o -name "*.pgm" -o -name "*.png" \) -size -20M -print0 \
+        | tar --null -chf - -T - 2>/dev/null ) | ( mkdir -p "$APPDIR/usr/lib/external" && tar -xf - -C "$APPDIR/usr/lib/external" ) || true
+    echo "==> bundled $(find "$APPDIR/usr/lib/external" -name "*.yaml" | wc -l) map files from external/"
+fi
+
 BRANDING="$APPDIR/usr/lib/python/f1sim/assets/branding"
 [ -f "$BRANDING/f1sim.svg" ] || { echo "branding assets did not install" >&2; exit 1; }
 

@@ -28,7 +28,9 @@ from . import tracks
 from .track import Track
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # src/f1sim
-EXTERNAL = os.path.normpath(os.path.join(_HERE, "..", "external"))
+#: the checkout's external/ (team maps, racetracks); F1SIM_EXTERNAL names another one -- an installed package or the
+#: console AppImage has no checkout around it (11-16)
+EXTERNAL = os.path.normpath(os.environ.get("F1SIM_EXTERNAL") or os.path.join(_HERE, "..", "external"))
 RACETRACKS = os.path.join(EXTERNAL, "f1tenth_racetracks")
 GYM_MAPS = os.path.join(EXTERNAL, "f1tenth_gym", "gym", "f110_gym", "envs", "maps")
 GYM_BOUNDARY = {"levine": "wall", "stata_basement": "wall", "berlin": "duct", "skirk": "duct", "vegas": "duct"}
