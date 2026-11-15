@@ -50,7 +50,15 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
 # but the window's own import path does not touch it.
 python3 -m pip install --quiet --upgrade --target "$APPDIR/usr/lib/python" \
     PyQt5 numpy pyyaml pillow
-python3 -m pip install --quiet --no-deps --target "$APPDIR/usr/lib/python" "$REPO/f1sim"
+python3 -m pip install --quiet --no-deps --target "$APPDIR/usr/lib/python" "$REPO/f1sim" || true
+# An old setuptools (< 61, e.g. Ubuntu 22.04's 59.6 when the build is not isolated) does not read pyproject's [project]
+# table and installs an empty "UNKNOWN" package (11-16, the lab PC). The package is plain Python: copy its source instead.
+if [ ! -f "$APPDIR/usr/lib/python/f1sim/viewer/console/__init__.py" ]; then
+    echo "==> pip did not install f1sim (old setuptools?): copying the package source"
+    rm -rf "$APPDIR"/usr/lib/python/UNKNOWN-*.dist-info
+    cp -r "$REPO/f1sim/f1sim" "$APPDIR/usr/lib/python/f1sim"
+    find "$APPDIR/usr/lib/python/f1sim" -name __pycache__ -type d -prune -exec rm -rf {} +
+fi
 
 BRANDING="$APPDIR/usr/lib/python/f1sim/assets/branding"
 [ -f "$BRANDING/f1sim.svg" ] || { echo "branding assets did not install" >&2; exit 1; }
