@@ -1466,10 +1466,10 @@ def plan_env_fields(ar) -> dict:
     # tip) -- with steering x up to 1.47, no extra scaling while accelerating / braking, the steering speed read 0.13 s ahead
     # and the speed command 0.14 s ahead (motor lag 0.2 s): hard wall hits 9.12 / 9.58 -> 0.34 / 0.55 per session, boxes
     # 1.48 -> 0.80, mean speed 4.80 -> 5.33 m/s (exact execution 5.83). F1SIM_MAP_OLD=1 = the setting before
-    # 11-16 (the user: the console car slides, "존나 미끌미끌"): race_stack's undocumented steering x up to 1.47 dropped (1.0) --
-    # exam1 128 sessions x 30 s, the training world's car draw: hard walls 0.43 -> 0.27 per session, slip angle p90 12.9 -> 11.1 deg,
-    # >10 deg 14 -> 12 % of the time, same speed (tools/map_slip_sweep.sh). A longer lookahead slid less (8.6 deg) but hit walls 2.8
-    TW_MAP = dict(t_clip_min=0.78, m_l1=0.37, q_l1=-0.49, lut_interp="linear", v_steer_gain_max=1.0, acc_scaler_for_steer=1.0,
+    # 11-16 (the user: the console car slides, "존나 미끌미끌"): steering x1.0 instead of 1.47 looked better in 30 s sessions
+    # (walls 0.43 -> 0.27, slip p90 12.9 -> 11.1 deg; tools/map_slip_sweep.sh) but the paired 90 s exam said walls 0.17 -> 0.57
+    # per session (+0.40 +- 0.12) -> kept at 1.47. A longer lookahead slid less (8.6 deg) but hit walls 2.8 per 30 s
+    TW_MAP = dict(t_clip_min=0.78, m_l1=0.37, q_l1=-0.49, lut_interp="linear", v_steer_gain_max=1.47, acc_scaler_for_steer=1.0,
                   dec_scaler_for_steer=1.0, delay_comp=0.009, speed_lookahead_for_steer=0.133, tw_speed_lead=0.141)
     if os.environ.get("F1SIM_MAP_OLD") == "1":
         TW_MAP = dict(t_clip_min=0.35, m_l1=0.47, q_l1=0.0)
