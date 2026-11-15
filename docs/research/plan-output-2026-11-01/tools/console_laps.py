@@ -26,8 +26,13 @@ w = sim_worker.SimWorker(_N(), _N()); logs = []
 w.say = lambda k, **f: logs.append(f.get("text") or ""); w.stage = lambda *a, **k: None; w._hold_parked_ok = True
 w._overlay = dict(getattr(w, "_overlay", {}) or {}, plan=True)
 s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=1, device="cuda", compile=False,
-                                    collision_mode="soft", procedural=proc, episode_s=max(60.0, secs + 5), randomize=False), 0)
+                                    collision_mode="soft", procedural=proc, episode_s=max(60.0, secs + 5),
+                                    # F1SIM_LAPS_RANDOMIZE=1 (11-16): the console's own default -- the car's physics drawn at random
+                                    # per session (friction, tyres, motor, ...; `SessionConfig.randomize` / mu_mode "random")
+                                    randomize=os.environ.get("F1SIM_LAPS_RANDOMIZE", "0") == "1"), 0)
 env = s["env"]
+_P = env.sim.P
+print("차 물리:", {k: round(float(_P[k][0]), 3) for k in ("mu", "mu_f_scale", "motor_tau", "speed_gain", "servo_tau") if k in _P})
 print("세션:", s["info_line"], "| 방식", s["mode"], "| 결정", env.ecfg.decision_every, "| 계획", env.ecfg.speed_mode, env.ecfg.plan_follower)
 lap0 = int(env.last_result.lap[0]); t_last = 0.0; laps = []; vmax = 0.0; vs = []
 N = int(secs / 0.025); t0 = time.time()

@@ -1394,10 +1394,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         adv = Collapsible("고급 설정", expanded=False)
         self.adv_fold = adv
         adv.toggle.toggled.connect(lambda _on: self._queue_panel_cap())
-        self.chk_dr = QtWidgets.QCheckBox("차량마다 마찰/지연 무작위화 (학습과 동일)")
+        # 11-16: the planner policies (plan_steps2) learn with the car set exactly on their plan -- no tyres, no motor, no
+        # controller -- so this draw is never part of their training, though the label said "학습과 동일"
+        self.chk_dr = QtWidgets.QCheckBox("차 물리 무작위화 (마찰·타이어·모터 지연·속도 보정; 실차 같은 변동)")
         self.chk_dr.setChecked(True)
-        self.chk_dr.setToolTip("끄면 모든 차가 공칭 파라미터로 달립니다. 미끄러짐이 정책 탓인지 "
-                               "낮은 마찰 뽑기 탓인지 구분할 때 끄세요.")
+        self.chk_dr.setToolTip("켜면 세션마다 차의 마찰(0.7-1.1), 타이어, 모터·서보 지연, 속도 보정 오차를 무작위로 뽑습니다. "
+                               "plan policy는 학습 때 차를 plan 위에 그대로 옮겨서 이 변동을 겪지 않습니다 -- "
+                               "끄면 모든 차가 공칭 값으로 달려, 못 달리는 게 policy 탓인지 차 물리 탓인지 가릴 수 있습니다.")
         adv.add(self.chk_dr)
         self.chk_soft = QtWidgets.QCheckBox("충돌해도 계속 주행 (soft contact)")
         self.chk_soft.setChecked(True)
