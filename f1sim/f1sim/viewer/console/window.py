@@ -334,6 +334,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             row.addWidget(w, 1 if w is self.combo_focus else 0)
         self._focus_lay.addLayout(row)
         self.focus_card.setVisible(False)
+        spd = card("속도 배율")
+        row_s = QtWidgets.QHBoxLayout()
+        row_s.setSpacing(8)
+        row_s.addWidget(self.sld_speed, 1)
+        row_s.addWidget(self.lbl_speed)
+        spd.addLayout(row_s)
         show = card("표시")
         for chk, text in ((self.chk_plan, "정책 궤적"), (self.chk_trails, "주행 자취"),
                           (self.chk_lidar, "LiDAR")):
@@ -2097,8 +2103,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         # the plan speed knob, live (11-16, the user: "콘솔에서도 속도배율좀 조절할 수 있게"): the same value as the start
         # setting's "속도 배율", changeable while the car drives
-        spd = Card("속도 배율")
-        row_s = QtWidgets.QHBoxLayout()
+        # (placed in the driving HUD's right column, `_build_hud`-side `card("속도 배율")`; 11-16: first put here, in the
+        # pre-11-02 panel nobody sees -- the user: "어디에????? 나 랩 pc에서 보고있음")
         self.sld_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sld_speed.setRange(50, 120)
         self.sld_speed.setSingleStep(1); self.sld_speed.setPageStep(5)
@@ -2108,8 +2114,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                   "평균 속도 -13 %).")
         self.lbl_speed = QtWidgets.QLabel("1.00 x")
         self.lbl_speed.setMinimumWidth(48)
-        row_s.addWidget(self.sld_speed, 1); row_s.addWidget(self.lbl_speed)
-        spd.add(row_s)
         self._speed_timer = QtCore.QTimer(self)
         self._speed_timer.setSingleShot(True); self._speed_timer.setInterval(150)
         self._speed_timer.timeout.connect(lambda: self.speed_scale_requested.emit(self.sld_speed.value() / 100.0))
@@ -2120,7 +2124,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self._speed_timer.start()
         self.sld_speed.valueChanged.connect(_on_speed)
         self._sync_speed_slider(float(self.spin_speed_scale.value()))     # a restored start setting shows here too
-        v.addWidget(spd)
 
         show = Card("표시")
         self.chk_lidar = QtWidgets.QCheckBox("LiDAR 점")
