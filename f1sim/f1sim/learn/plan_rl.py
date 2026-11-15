@@ -448,6 +448,10 @@ def main(argv=None):
                          "LO..HI m ahead and within 1 m of the car's side; elsewhere a fresh draw every decision (11-15: cloned cars "
                          "steered 2 deg away for 0.3 s at 1.5-4 m from a box hit it half as often at no cost; held noise everywhere "
                          "(plan26o) added wall hits and lost speed)")
+    ap.add_argument("--noise-corr-car", default="",
+                    help="LO,HI [m]: as --noise-corr-box for the nearest other car (critic's column: LO..HI m ahead in the car's "
+                         "frame, within 1.5 m of its side); with both, the noise is held when either holds (11-15: cloned cars "
+                         "behind a lane_switch car 2-4 m ahead hit it 22 %% as they were, 14 %% steered 2 deg away for 0.3 s)")
     ap.add_argument("--update-offset", type=int, default=0,
                     help="with --init --init-critic: count updates on from this one (11-14: a run forked from a checkpoint numbers its "
                          "updates and checkpoints as the parent did, the lr schedule continues where it was; no optimizer state is "
@@ -747,6 +751,10 @@ def main(argv=None):
     nc_lo, nc_hi = ((float(x) for x in args.noise_corr_box.split(",")) if args.noise_corr_box else (0.0, 0.0))
     if args.noise_corr_box and not args.box_range > 0:
         raise SystemExit("--noise-corr-box reads the critic's box column: needs --box-range")
+    ncc_lo, ncc_hi = ((float(x) for x in args.noise_corr_car.split(",")) if args.noise_corr_car else (0.0, 0.0))
+    from ..gym_env import PRIV_V2_KEYS as _PK
+    from .plan_policy import _PRIV_DROP as _PD
+    _O0 = [k for i, k in enumerate(_PK) if i not in _PD].index("opp0_present")   # the nearest car's columns in the critic's input
     if args.noise_corr_steer:
         noise_rho[PS.N_STEP:] = 0.0                                 # the speed outputs: a fresh draw every decision
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
@@ -982,10 +990,15 @@ def main(argv=None):
                     # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
                     # 2021) and coloured noise in PPO (Hollenstein et al. 2024) do
                     rho_t = noise_rho
-                    if args.noise_corr_box:                      # held only near a box ahead (the critic's column; not a policy input)
-                        _b = pv_[:, _P0:_P0 + 4].float()
-                        _d = _b[:, 3] * 5.0
-                        _near = (_b[:, 0] > 0.5) & (_d >= nc_lo) & (_d <= nc_hi) & ((_b[:, 2] * 5.0).abs() < 1.0)
+                    if args.noise_corr_box or args.noise_corr_car:  # held only near a box / a car ahead (critic's columns; not policy inputs)
+                        _near = torch.zeros(pv_.shape[0], dtype=torch.bool, device=dev)
+                        if args.noise_corr_box:
+                            _b = pv_[:, _P0:_P0 + 4].float()
+                            _d = _b[:, 3] * 5.0
+                            _near |= (_b[:, 0] > 0.5) & (_d >= nc_lo) & (_d <= nc_hi) & ((_b[:, 2] * 5.0).abs() < 1.0)
+                        if args.noise_corr_car:
+                            _o = pv_[:, _O0:_O0 + 3].float()               # nearest car: present, dx/5, dy/5 (car frame)
+                            _near |= (_o[:, 0] > 0.5) & (_o[:, 1] * 5.0 >= ncc_lo) & (_o[:, 1] * 5.0 <= ncc_hi) & ((_o[:, 2] * 5.0).abs() < 1.5)
                         rho_t = noise_rho[None, :] * _near[:, None].float()
                         nc_near += float(_near.float().mean())
                     eps_n = rho_t * eps_n + (1.0 - rho_t ** 2) ** 0.5 * torch.randn_like(mean)
@@ -1516,7 +1529,7 @@ def main(argv=None):
             print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
                "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
-               "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if args.noise_corr_box else None,
+               "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,

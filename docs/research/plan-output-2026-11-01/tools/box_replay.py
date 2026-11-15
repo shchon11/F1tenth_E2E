@@ -124,6 +124,10 @@ NEVER_LEAF = set("""eid other_idx ideal_rows tid absent learner learner_ids race
 external_driven on_policy pool_driven teacher_driven hold_rows map_rows opp_driver slot_cap slot_cap_set slot_scale_hi slot_scale_lo
 spawn_abreast _slot_mixed_rows""".split())
 NEVER_PART = ("_alt_rows.", "alt_teachers.", "alt_teacher_mask.", "sim.params.P.")     # P's entries are rows of sim.params.buf
+if os.environ.get("BOX_REPLAY_OPP", "") == "1" and os.environ.get("BOX_REPLAY_OPP_SLOT"):
+    # 11-15: ONE scripted kind in every world (BOX_REPLAY_OPP_SLOT with a fixed "kind", no kind_mix): every opponent row is the same
+    # kind, so its teacher's per-row state (alt_teachers.*, whole-batch rows) copies row for row like the car itself
+    NEVER_PART = ("_alt_rows.", "alt_teacher_mask.", "sim.params.P.")
 
 
 def pname(path):
