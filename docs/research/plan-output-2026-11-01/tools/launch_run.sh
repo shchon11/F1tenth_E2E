@@ -36,12 +36,22 @@ source /home/shchon11/F1tenth_E2E/.venv/bin/activate
 export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555
 F=/home/shchon11/F1tenth_E2E/f1sim
-setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=1 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 416 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 1 > $D/${N}_rank1.log 2>&1" > /dev/null 2>&1 &
-setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=0 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 608 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 0 > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
+# LAUNCH_GPU=both (기본: 4070 608대 + 5060 416대) | 0 (4070 혼자) | 1 (5060 혼자); 혼자일 때 차 수 LAUNCH_ENVS (기본 512)
+# -- 두 run을 나란히 비교할 때(11-15 Korea 2026 이어 받기 vs 처음부터) 한 GPU씩, 같은 차 수로
+G=${LAUNCH_GPU:-both}
+if [ "$G" = both ]; then
+  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=1 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 416 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 1 > $D/${N}_rank1.log 2>&1" > /dev/null 2>&1 &
+  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=0 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 608 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 0 > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
+else
+  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=$G python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs ${LAUNCH_ENVS:-512} > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
+fi
 sleep 5
-setsid nohup bash tools/gpu_guard3.sh "plan_[r]l --name $N " out/guard4070_$N.done > out/guard4070_$N.log 2>&1 &
-CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 &
+# the guard pauses a 4070 run while anything else uses the 4070 (`gpu_guard3.sh`)
+if [ "$G" != 1 ]; then      # (a background `[ ] || cmd &` list kept a subshell holding this script's stdout open)
+  setsid nohup bash tools/gpu_guard3.sh "plan_[r]l --name $N " out/guard4070_$N.done > out/guard4070_$N.log 2>&1 < /dev/null &
+fi
+CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
 mkdir -p $R/watch_$N
-setsid nohup bash tools/watch_latest_plan.sh watch_$N $N $D/one_$N.done > out/watch_$N.log 2>&1 &
+setsid nohup bash tools/watch_latest_plan.sh watch_$N $N $D/one_$N.done > out/watch_$N.log 2>&1 < /dev/null &
 sleep 2
 ps -eo pid,cmd | grep -E "plan_rl --name $N |core_loop.sh $N|gpu_guard3.sh .*$N" | grep -v grep | cut -c1-120
