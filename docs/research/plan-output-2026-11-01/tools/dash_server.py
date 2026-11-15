@@ -55,16 +55,41 @@ def parent(name):
     return (m.group(1), int(m.group(2))) if m else (None, None)
 
 
+def is_plan_run(name):
+    """a planner run (plan_rl; 11-15: any name -- kr26a, kr26b, ... -- not only plan2*), not a console watch folder"""
+    if name.startswith("watch_"):
+        return False
+    if name.startswith("plan2"):
+        return True
+    try:
+        return json.load(open(f"{RUNS}/{name}/args.json"))["args"].get("format") in ("v2", "v3")
+    except Exception:
+        return False
+
+
 def runs():
     out = []
     ps = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True).stdout
     notes = run_notes()
-    for p in glob.glob(RUNS + "/plan2*/progress.jsonl"):
+    for p in glob.glob(RUNS + "/*/progress.jsonl"):
         name = p.split("/")[-2]
+        if not memo(("isplan", name), 3600, lambda: is_plan_run(name)):
+            continue
         par, cut = parent(name)
         out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name), "alive": f"plan_rl --name {name} " in ps,
                     "parent": par, "cut": cut, "note": notes.get(name, "")})
-    out.sort(key=lambda r: -r["mtime"])
+    out.sort(key=lambda r: (not r["alive"], -r["mtime"]))       # the runs training now first
+    return out
+
+
+def overview():
+    """every run training now: its status and its newest progress row (the page's top strip, 11-15)"""
+    out = []
+    for r in memo("runs", 20, runs):
+        if not r["alive"]:
+            continue
+        rows = memo(("p", r["name"]), 10, lambda n=r["name"]: progress(n))
+        out.append({**r, "status": memo(("s", r["name"]), 10, lambda n=r["name"]: status(n)), "last": rows[-1] if rows else None})
     return out
 
 
@@ -185,14 +210,17 @@ def exam_summary(name, u):
     return "\n".join(keep)
 
 
-def compare(name, u, ref):
-    a = f"{OUT}/exam/exam1_{ref}_u{u}_ideal_uniform_n256.npz"; b = f"{OUT}/exam/exam1_{name}_u{u}_ideal_uniform_n256.npz"
+def compare(name, u, ref, ru=None):
+    """`ru`: the reference run's update to pair with (11-15: a run started from another map's checkpoint is compared at the
+    same number of updates on this map, e.g. kr26b u925 with kr26a u25)"""
+    ru = u if ru is None else ru
+    a = f"{OUT}/exam/exam1_{ref}_u{ru}_ideal_uniform_n256.npz"; b = f"{OUT}/exam/exam1_{name}_u{u}_ideal_uniform_n256.npz"
     if not (os.path.exists(a) and os.path.exists(b)):
-        return {"text": f"{ref} u{u} 또는 {name} u{u}의 frozen exam 기록이 없음"}
+        return {"text": f"{ref} u{ru} 또는 {name} u{u}의 frozen exam 기록이 없음"}
     ma, mb = run_map(ref), run_map(name)
     if ma != mb:                                           # 11-14: sessions are paired by seed; another map's run is no comparison
         return {"text": f"{ref}는 {ma}, {name}는 {mb}에서 학습 -- 다른 지도끼리는 같은 세션 비교가 안 됨"}
-    c = f"{CACHE}/{name}_u{u}_vs_{ref}.txt"
+    c = f"{CACHE}/{name}_u{u}_vs_{ref}" + (f"_u{ru}" if ru != u else "") + ".txt"
     if not os.path.exists(c) or os.path.getmtime(c) < max(os.path.getmtime(a), os.path.getmtime(b)):
         r = subprocess.run([PY, "-W", "ignore", "grad_step_table.py", a, f"{name} u{u}={b}"], cwd=TOOLS, capture_output=True,
                            text=True, timeout=300)
@@ -235,22 +263,25 @@ def edge_one(name, u):
     return out
 
 
-def edge(name, ref):
+def edge(name, ref, shift=0):
     us = sorted({int(m.group(1)) for p in glob.glob(f"{OUT}/analysis/{name}_u*_boxes.txt")
                  for m in [re.search(rf"{name}_u(\d+)_boxes", p)] if m}, reverse=True)
     return {"labels": [l for l, _ in EDGE] + ["출발 5 s 안에 세게 닿은 세션 (상대 차 · 상자)", "상자에 세게 닿은 뒤 5 s 안에 선 것 (혼자 · 상자)",
                                               "선 뒤 5 s 안에 다시 못 달린 것 (혼자 · 상자)", "선 뒤 5 s 안에 다시 못 달린 것 (상대 차 · 상자)"],
-            "rows": [{"u": u, "run": edge_one(name, u), "ref": edge_one(ref, u) if ref else {}} for u in us]}
+            "rows": [{"u": u, "ru": u - shift, "run": edge_one(name, u), "ref": edge_one(ref, u - shift) if ref else {}} for u in us]}
 
 
 def figs():
+    """the newest analysis figures of every out/ folder (11-15: not a fixed list -- mapeta, maptune, ... appeared); the per-
+    checkpoint trend plots stay with their checkpoint"""
     out = []
-    dirs = ["netaudit", "drift", "rwexam", "batchdump"] + sorted(os.path.basename(d) for d in glob.glob(f"{OUT}/edge*") if os.path.isdir(d))
-    for d in dirs:
-        for p in glob.glob(f"{OUT}/{d}/*.png"):
-            out.append({"path": f"{d}/{os.path.basename(p)}", "mtime": os.path.getmtime(p)})
+    for p in glob.glob(f"{OUT}/*/*.png"):
+        d = os.path.basename(os.path.dirname(p))
+        if d in ("analysis", "dash_cache", "videos"):
+            continue
+        out.append({"path": f"{d}/{os.path.basename(p)}", "dir": d, "mtime": os.path.getmtime(p)})
     out.sort(key=lambda r: -r["mtime"])
-    return out[:40]
+    return out[:60]
 
 
 class H(BaseHTTPRequestHandler):
@@ -287,11 +318,13 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;", "image/gif")
             if u.path == "/api/runs":
                 return self._json(memo("runs", 20, runs))
+            if u.path == "/api/overview":
+                return self._json(memo("overview", 10, overview))
             if u.path == "/api/notes":            # the research log (11-15, the user: "사이트에 제대로좀 반영좀")
                 p_ = f"{OUT}/research_log.md"
                 return self._json({"text": open(p_, errors="replace").read() if os.path.exists(p_) else "",
                                    "mtime": os.path.getmtime(p_) if os.path.exists(p_) else None})
-            if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes") and not ok_run(name):
+            if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes", "/api/overview") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":
                 return self._json({"rows": memo(("p", name), 10, lambda: progress(name)), "status": memo(("s", name), 10, lambda: status(name))})
@@ -308,10 +341,11 @@ class H(BaseHTTPRequestHandler):
                 ref = q.get("ref", "")
                 if not ok_run(ref):
                     return self._send(404, json.dumps({"error": "no such ref"}))
-                return self._json(compare(name, int(q.get("u", "0")), ref))
+                return self._json(compare(name, int(q.get("u", "0")), ref, int(q["ru"]) if q.get("ru") else None))
             if u.path == "/api/edge":
                 ref = q.get("ref", "")
-                return self._json(memo(("edge", name, ref), 60, lambda: edge(name, ref if ok_run(ref) else "")))
+                sh = int(q.get("shift", "0") or 0)
+                return self._json(memo(("edge", name, ref, sh), 60, lambda: edge(name, ref if ok_run(ref) else "", sh)))
             if u.path == "/api/figs":
                 return self._json(memo("figs", 60, figs))
             if u.path == "/file":
