@@ -594,6 +594,7 @@ class MAPPlanTracker:
     def __setattr__(self, name, value):
         if name in ("_inner", "map", "nominal", "map_rows", "map_off", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
                     "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv", "tw_speed_lead",
+                    "_tw_cache", "_held_ref",
                     "beta"):
             object.__setattr__(self, name, value)
         else:
@@ -663,6 +664,7 @@ class MAPPlanTracker:
             return out
         B = action.shape[0]
         dev = action.device
+        ref_tw = None                                        # the drawn plan (x, y, heading, speed), set below for "tw"
         if self.tw:
             from . import plan_tw
             if self.tw_kv is not None:                       # a carried plan (`plan_tw.Carry`): the env's segments
@@ -670,13 +672,24 @@ class MAPPlanTracker:
             else:
                 k_tw, v_tw = plan_tw.decode(self.tw_action if self.tw_action is not None else action, self.tw_fmt)
             n_tw = int(math.ceil((k_tw.shape[1] * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
-            path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
-            v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
-            self.tw_plan = plan_tw.dense(k_tw, v_tw)
+            # The plan's path and dense poses only change when a new plan arrives (every `decision_every` control steps; the
+            # env's plan tensors are written in place, which bumps their version): 11-15, the console at 0.86x real time spent
+            # 60 % of each step re-tracing the same plan (`plan_tw.dense` = 131 small arc steps)
+            # (the cache keeps the plan tensors themselves, so a freed tensor's id cannot come back as a false hit)
+            cache = self.__dict__.get("_tw_cache")
+            key = (k_tw._version, v_tw._version, n_tw)
+            if cache is not None and cache[0] is k_tw and cache[1] is v_tw and cache[2] == key:
+                path, pv, pk, d_tw, tot_tw, v1_tw, self.tw_plan = cache[3]
+            else:
+                path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
+                v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
+                self.tw_plan = plan_tw.dense(k_tw, v_tw)
+                self._tw_cache = (k_tw, v_tw, key, (path, pv, pk, d_tw, tot_tw, v1_tw, self.tw_plan))
             # Every viewer (the console, the videos, the ROS link) draws `last_ref`, the inner tracker's plan: for these
             # rows that is the inner's reading of the zeros the env hands it in their place -- a straight 0.6 s line along
             # the heading, not the policy's plan (11-07, the user: "trajectory가 왜 직선이야"). Give them the time-waypoint
-            # plan instead, its whole 1.0 s resampled to the inner's N + 1 points (x, y, heading, speed)
+            # plan instead, its whole 1.0 s resampled to the inner's N + 1 points (x, y, heading, speed); in the frame of the
+            # pose it was issued from -- set below, once the held rows are known
             lr_ = getattr(self._inner, "last_ref", None)
             if lr_ is not None and lr_.shape[0] == B:
                 n1 = lr_.shape[1]
@@ -686,11 +699,6 @@ class MAPPlanTracker:
                 w_ = (pos_ - i0.to(pos_.dtype))[None, :, None]
                 smp = tp[:, i0, :4] * (1 - w_) + tp[:, i0 + 1, :4] * w_
                 ref_tw = smp.to(lr_.dtype)
-                m_ = self.map_rows[:, None, None]
-                self._inner.last_ref = torch.where(m_, ref_tw, lr_)
-                lp_ = getattr(self._inner, "last_pred", None)
-                if lp_ is not None and lp_.shape == lr_.shape:
-                    self._inner.last_pred = torch.where(m_, ref_tw, lp_)
         else:
             path, pv, pk = self.waypoints(action, v_meas, speed_cap)
         zeros = torch.zeros(B, device=dev, dtype=action.dtype)
@@ -720,9 +728,31 @@ class MAPPlanTracker:
                 pos = torch.where(h[:, None], rel, pos)
                 yaw = torch.where(h, dyaw, yaw)
                 pose = torch.where(h[:, None], h0, pose)
+                held_ref = self.__dict__.get("_held_ref")
+                if ref_tw is not None and held_ref is not None and held_ref.shape == ref_tw.shape:
+                    # The drawn plan of a held row stays where it was issued (11-15, the user: the trajectory followed the car
+                    # between decisions and flickered -- the viewers place `last_ref` at the car's CURRENT pose): the plan of its
+                    # last decision, in its issue frame, re-expressed in the car's current frame = the path MAP is following
+                    src = torch.where(h[:, None, None], held_ref, ref_tw)              # every row's plan in its issue frame
+                    c2, s2 = torch.cos(dyaw)[:, None], torch.sin(dyaw)[:, None]
+                    dx, dy = src[..., 0] - rel[:, None, 0], src[..., 1] - rel[:, None, 1]
+                    cur = torch.stack([c2 * dx + s2 * dy, -s2 * dx + c2 * dy, src[..., 2] - dyaw[:, None], src[..., 3]], -1)
+                    self._held_ref = src
+                    ref_tw = torch.where(h[:, None, None], cur, ref_tw)
+                elif ref_tw is not None:
+                    self._held_ref = ref_tw
+            elif ref_tw is not None:
+                self._held_ref = ref_tw
             self._held = (path, pv, pk, pose)
             if self.tw:
                 self._held_tw = (d_tw, tot_tw, v1_tw)
+        if self.tw and ref_tw is not None:
+            lr_ = self._inner.last_ref
+            m_ = self.map_rows[:, None, None]
+            self._inner.last_ref = torch.where(m_, ref_tw, lr_)
+            lp_ = getattr(self._inner, "last_pred", None)
+            if lp_ is not None and lp_.shape == lr_.shape:
+                self._inner.last_pred = torch.where(m_, ref_tw, lp_)
         dly = None
         if delay is not None:
             dly = delay if torch.is_tensor(delay) else torch.full((B,), float(delay), device=dev)
