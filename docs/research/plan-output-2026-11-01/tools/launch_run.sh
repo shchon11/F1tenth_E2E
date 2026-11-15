@@ -52,6 +52,23 @@ if [ "$G" != 1 ]; then      # (a background `[ ] || cmd &` list kept a subshell 
 fi
 CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
 mkdir -p $R/watch_$N
+# the console's list gets the new run at the top (11-15: the list had gone stale -- the console keeps it current only if the
+# launcher does; memory: console picks must be current)
+python3 - "$N" "$MAPN" "${INIT:-}" <<'PY'
+import json, shutil, sys, time
+n, mapn, init = sys.argv[1], sys.argv[2], sys.argv[3]
+p = "/home/shchon11/f1sim_runs/console_picks.json"
+shutil.copy(p, p + time.strftime(".bak_%m%d_%H%M"))
+d = json.load(open(p))
+slug = {"real:korea_2025_iccas": "real/iccas25", "real:korea_2026_competition": "real/korea26"}.get(mapn, mapn.replace("real:", "real/"))
+name = {"real/iccas25": "Korea 2025", "real/korea26": "Korea 2026"}.get(slug, slug)
+src = init.rstrip("/").split("/")[-2] + " " + init.split("_u")[-1].replace(".pt", "") if init else "처음부터"
+e = {"run": f"watch_{n}", "label": f"학습 중 · {n} · {name} · {src}", "map": slug,
+     "note": time.strftime("%m-%d %H:%M 시작"),
+     "settings": {"obstacle": "train", "races": 1, "cars_per_race": 1, "opponent_speed_limit": False, "obstacle_speed_limit": False}}
+d["picks"] = [e] + [x for x in d["picks"] if x["run"] != e["run"]]
+json.dump(d, open(p, "w"), ensure_ascii=False, indent=1)
+PY
 setsid nohup bash tools/watch_latest_plan.sh watch_$N $N $D/one_$N.done > out/watch_$N.log 2>&1 < /dev/null &
 sleep 2
 ps -eo pid,cmd | grep -E "plan_rl --name $N |core_loop.sh $N|gpu_guard3.sh .*$N" | grep -v grep | cut -c1-120
