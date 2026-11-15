@@ -1464,6 +1464,9 @@ def plan_env_fields(ar) -> dict:
         dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235)))
     if os.environ.get("F1SIM_MAP_ETA_REF"):                # 11-15: MAP's pursuit angle from "heading" (default) or "velocity"
         mp = dict(mp, eta_ref=os.environ["F1SIM_MAP_ETA_REF"])
+    if os.environ.get("F1SIM_MAP_OVERRIDE"):               # 11-15: JSON of MAPParams fields over the follower above (controller tests)
+        import json as _json
+        mp = dict(mp, **_json.loads(os.environ["F1SIM_MAP_OVERRIDE"]))
     return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
                 plan_follower_map=mp,
                 decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
