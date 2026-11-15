@@ -7,7 +7,7 @@
 # 쓰는 법: CUDA_VISIBLE_DEVICES=1 bash slot5060.sh timeout 1500 python3 ...
 L=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out/.slot5060
 ALL=0
-case " $* " in *plan_validate.py*" 1024 "*|*box_response.py*" 1024 "*) ALL=1 ;; esac    # (11-12) box_response runs the policy twice
+case " $* " in *plan_validate.py*" 1024 "*|*box_response.py*" 1024 "*|*--dump-rollout*) ALL=1 ;; esac    # (11-12) box_response runs the policy twice; (11-16) a plan_rl rollout dump is a training run (~4 GB)
 # 11-15: a training rank on the 5060 (two-GPU plan_rl, ~4.5 GB of 8) leaves room for ONE evaluation: plan26o u125 and plan26p u225
 # ended with no output (CUDA out of memory) when two ran next to it -> then every job takes both places
 nvidia-smi --query-compute-apps=pid --format=csv,noheader -i 0 2>/dev/null | while read p; do grep -q "plan_rl" /proc/$p/cmdline 2>/dev/null && echo y; done | grep -q y && ALL=1
