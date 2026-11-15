@@ -3196,7 +3196,7 @@ class F1VecEnv:
                         # the console's plan speed knob (11-16: it did nothing on these plans): the same path, its speeds scaled --
                         # the lateral acceleration goes with the square. Cached per plan version, so MAP's path cache still hits
                         k_e, v_e = self.ext_plan_kv
-                        key_ = (id(k_e), k_e._version, id(v_e), v_e._version)
+                        key_ = (id(k_e), k_e._version, id(v_e), v_e._version, float(self.ecfg.plan_speed_scale))
                         if getattr(self, "_ext_scaled_key", None) != key_:
                             self._ext_scaled = (k_e, v_e * float(self.ecfg.plan_speed_scale))
                             self._ext_scaled_key = key_

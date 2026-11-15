@@ -2321,6 +2321,17 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="set_mu", gen=self.gen,
                      state={"mu_mode": mode, "mu": mu, "last_seq": self.seq - 1,
                             "t": float(session["env"].sim.t)})
+        elif kind == P.CMD_SET_SPEED_SCALE:
+            # the plan speed knob, live (11-16, the user: "콘솔에서도 속도배율좀 조절할 수 있게"): our policy's plans
+            # (`EnvConfig.plan_speed_scale`, read every step) and a planner driving the ego car (`PlannerEgoDriver.speed_scale`)
+            sc = min(1.5, max(0.3, float(msg.get("scale", 1.0))))
+            env_ = session["env"]
+            env_.ecfg.plan_speed_scale = sc
+            for drv_ in (getattr(env_, "external_drivers", {}) or {}).values():
+                if hasattr(drv_, "speed_scale"):
+                    drv_.speed_scale = sc
+            self.say(P.MSG_ACK, seq=seq, command="set_speed_scale", gen=self.gen,
+                     state={"plan_speed_scale": sc, "last_seq": self.seq - 1, "t": float(env_.sim.t)})
         elif kind == P.CMD_SET_DIAL:
             dial = session.get("dial")
             if dial is None:
@@ -2540,7 +2551,7 @@ class SimWorker:
                      state={"preparing": self.prepare_gen})
 
         elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU, P.CMD_SET_DIAL,
-                      P.CMD_SET_LAYOUT):
+                      P.CMD_SET_LAYOUT, P.CMD_SET_SPEED_SCALE):
             # These act on a live session. If one is running, its own thread applies them and acks
             # from there, so the ack means "done" rather than "heard".
             if self._sim_thread is not None and self._sim_thread.is_alive():

@@ -95,6 +95,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     overlay_requested = QtCore.pyqtSignal(dict)
     describe_requested = QtCore.pyqtSignal(str)
     mu_requested = QtCore.pyqtSignal(str, float)          # (mode, mu) live friction control
+    speed_scale_requested = QtCore.pyqtSignal(float)      # live plan speed scale (11-16)
     dial_requested = QtCore.pyqtSignal(float)             # grip dial for a conditional ("dial") policy
     layout_requested = QtCore.pyqtSignal(dict)            # {"seed"} or {"pieces"}, "reset": the obstacle layout
     retry_requested = QtCore.pyqtSignal()
@@ -1306,6 +1307,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.row_speed_scale = FieldRow("속도 배율", self.spin_speed_scale,
                                         "노면이 미끄러우면 낮추세요 (μ×0.8 → 약 0.90).")
         cfg_card.add(self.row_speed_scale)
+        # the right panel's live slider shows the same number (built later; wired in `_sync_speed_slider`)
+        self.spin_speed_scale.valueChanged.connect(lambda v: self._sync_speed_slider(v))
 
         # -- the speed limit for a car ahead (2026-10-25, opponent_speed_limit.py)
         self.chk_opp_limit = QtWidgets.QCheckBox("앞차 충돌 방지 감속")
@@ -2092,6 +2095,33 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.log_panel = logs
         v.addWidget(logs)
 
+        # the plan speed knob, live (11-16, the user: "콘솔에서도 속도배율좀 조절할 수 있게"): the same value as the start
+        # setting's "속도 배율", changeable while the car drives
+        spd = Card("속도 배율")
+        row_s = QtWidgets.QHBoxLayout()
+        self.sld_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_speed.setRange(50, 120)
+        self.sld_speed.setSingleStep(1); self.sld_speed.setPageStep(5)
+        self.sld_speed.setValue(100)
+        self.sld_speed.setToolTip("정책이 낸 plan의 속도를 이 배율로 곱해 제어기에 넘깁니다 (경로는 그대로, 옆가속은 배율의 제곱). "
+                                  "달리는 중에도 바로 바뀝니다. 차가 미끄러지면 낮추세요 (11-16 측정: x0.9에서 미끄럼각 90 % 20 -> 7.6도, "
+                                  "평균 속도 -13 %).")
+        self.lbl_speed = QtWidgets.QLabel("1.00 x")
+        self.lbl_speed.setMinimumWidth(48)
+        row_s.addWidget(self.sld_speed, 1); row_s.addWidget(self.lbl_speed)
+        spd.add(row_s)
+        self._speed_timer = QtCore.QTimer(self)
+        self._speed_timer.setSingleShot(True); self._speed_timer.setInterval(150)
+        self._speed_timer.timeout.connect(lambda: self.speed_scale_requested.emit(self.sld_speed.value() / 100.0))
+        def _on_speed(v):
+            self.lbl_speed.setText(f"{v / 100:.2f} x")
+            if abs(self.spin_speed_scale.value() - v / 100) > 1e-6:
+                self.spin_speed_scale.setValue(v / 100)          # the next start uses it too
+            self._speed_timer.start()
+        self.sld_speed.valueChanged.connect(_on_speed)
+        self._sync_speed_slider(float(self.spin_speed_scale.value()))     # a restored start setting shows here too
+        v.addWidget(spd)
+
         show = Card("표시")
         self.chk_lidar = QtWidgets.QCheckBox("LiDAR 점")
         self.chk_lidar.setChecked(True)
@@ -2743,6 +2773,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def _on_mu_mode(self, _idx):
         fixed = self.combo_mu.currentData() == "fixed"
         self.spin_mu.setEnabled(fixed)
+
+    def _sync_speed_slider(self, v: float):
+        sld = getattr(self, "sld_speed", None)
+        if sld is not None and sld.value() != int(round(v * 100)):
+            sld.blockSignals(True); sld.setValue(int(round(v * 100))); sld.blockSignals(False)
+            self.lbl_speed.setText(f"{v:.2f} x")
 
     def _on_mu_apply(self):
         self.btn_mu_apply.mark_pending()

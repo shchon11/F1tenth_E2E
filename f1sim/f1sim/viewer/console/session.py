@@ -343,6 +343,7 @@ class SessionController(QtCore.QObject):
         w.focus_requested.connect(self.set_focus)
         w.overlay_requested.connect(self.set_overlay)
         w.mu_requested.connect(self.set_mu)
+        w.speed_scale_requested.connect(self.set_speed_scale)
         w.dial_requested.connect(self.set_dial)
         w.layout_requested.connect(self.set_layout)
         w.describe_requested.connect(self.describe)
@@ -634,6 +635,11 @@ class SessionController(QtCore.QObject):
         if self._active_gen < 0:
             return
         self.send(P.CMD_SET_MU, for_gen=self._active_gen, mode=str(mode), mu=float(mu))
+
+    def set_speed_scale(self, scale: float):
+        if self._active_gen < 0:
+            return
+        self.send(P.CMD_SET_SPEED_SCALE, for_gen=self._active_gen, scale=float(scale))
 
     def set_dial(self, mu: float):
         if self._active_gen < 0:

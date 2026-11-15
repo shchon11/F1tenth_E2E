@@ -41,6 +41,7 @@ CMD_FOCUS = "focus"                # {"env": int} which car the overlays describ
 CMD_OVERLAY = "overlay"            # {"saliency": bool, "internals": bool, "plan": bool}
 CMD_SET_MU = "set_mu"              # {"mode": "random"|"fixed", "mu": float} live friction control
 CMD_SET_DIAL = "set_dial"          # {"mu": float} live grip dial for a conditional ("dial") policy
+CMD_SET_SPEED_SCALE = "set_speed_scale"   # {"scale": float} live plan speed scale (11-16: was start-only)
 #: {"seed": int} or {"pieces": [portable piece, ...]}, and "reset": bool -- the obstacle layout a session holds
 #: (`viewer.prop_layout.LayoutHold`): a new seed's draw, or a layout made by hand, written into the running
 #: generator's slots; with "reset" the episode starts again on it. Acked with the layout as held.
