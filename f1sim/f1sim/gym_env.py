@@ -3208,6 +3208,11 @@ class F1VecEnv:
                 self._dec_cnt += 1                                 # a reset below sets its rows back to 0
             a_trk = a.clamp(-1.0, 1.0) if float(self.ecfg.plan_reverse_ext) > 0 else a
             a_trk = a_trk if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a_trk)
+            mp_ = getattr(self.tracker, "map", None)
+            if mp_ is not None and getattr(getattr(mp_, "p", None), "eta_ref", "heading") == "velocity":
+                from . import dynamics as _dyn
+                st_ = self.sim.state                          # MAP's pursuit angle from the direction of travel (11-15)
+                self.tracker.beta = torch.atan2(st_[:, _dyn.IVY], st_[:, _dyn.IVX].abs().clamp_min(0.3))
             raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             if self._ext_ids and self.ext_ref is not None:
                 self._ext_ref_to_viewers()

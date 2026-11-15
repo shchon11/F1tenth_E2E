@@ -106,6 +106,13 @@ class MAPParams:
     #: the curvature ahead (2 mean|kappa| / 0.8 - 2 > 0, i.e. hairpins of radius < 1.25 m) and so is
     #: almost never active on these tracks. 0 is race_stack.
     lat_slow: float = 0.0
+    #: what the pursuit angle eta is measured from (11-15, the user: "코드를 뜯어보고 논문도 좀 보고"): "heading" = the body's yaw
+    #: (race_stack / ETH-PBL code, and this file until now); "velocity" = the direction the car actually travels, yaw + slip angle
+    #: atan2(vy, vx) -- the L1 guidance law's own reference (Park et al. 2004: the angle between the VELOCITY vector and the line
+    #: to the reference point). In a corner the car travels 1-6 deg outside its heading; measured from the heading, eta (and so
+    #: a_lat) comes out short and the car drifts outward (11-12: 9-15 cm outside the plan after 0.3 s). Needs the slip angle
+    #: (`MAPController.__call__`'s `beta`).
+    eta_ref: str = "heading"
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "MAPParams":
@@ -117,7 +124,8 @@ class MAPParams:
 
     def __post_init__(self):
         for name, ok in (("l1_speed", ("measured", "commanded")), ("l1_point", ("arc", "euclid")),
-                         ("steer_speed", ("planned", "measured")), ("lut_interp", ("code", "linear"))):
+                         ("steer_speed", ("planned", "measured")), ("lut_interp", ("code", "linear")),
+                         ("eta_ref", ("heading", "velocity"))):
             if getattr(self, name) not in ok:
                 raise ValueError(f"MAPParams.{name} must be one of {ok}, not {getattr(self, name)!r}")
 
@@ -350,7 +358,7 @@ class MAPController:
                  grip: torch.Tensor, trailing: Optional[torch.Tensor] = None, opp_gap: Optional[torch.Tensor] = None,
                  opp_vs: Optional[torch.Tensor] = None, opp_visible: Optional[torch.Tensor] = None,
                  ego_vs: Optional[torch.Tensor] = None, yaw_rate: Optional[torch.Tensor] = None,
-                 delay: Optional[torch.Tensor] = None):
+                 delay: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None):
         """-> (steer command [rad], speed command [m/s]), (R,) each. `trailing` (R,) bool marks the
         cars whose planner is TRAILING an opponent that exists (race_stack: ``state == "TRAILING" and
         opponent is not None``); `opp_gap` / `opp_vs` / `opp_visible` describe it, `ego_vs` is the car's
@@ -440,7 +448,8 @@ class MAPController:
         v_lu = speed_adjust_lat_err(v_lu_raw, lat_e_norm, self.curv_wp)
         vec = l1_pt - pos
         norm = vec.norm(dim=1)
-        cross = -torch.sin(yaw) * vec[:, 0] + torch.cos(yaw) * vec[:, 1]
+        yaw_eta = yaw + beta if (p.eta_ref == "velocity" and beta is not None) else yaw
+        cross = -torch.sin(yaw_eta) * vec[:, 0] + torch.cos(yaw_eta) * vec[:, 1]
         eta = torch.where(norm > 0, torch.asin((cross / norm.clamp_min(1e-12)).clamp(-1.0, 1.0)), torch.zeros_like(norm))
         sin_eta = torch.sin(eta)
         lat_acc = torch.where((L1 == 0) | (sin_eta == 0), torch.zeros_like(L1), 2 * v_lu ** 2 / L1.clamp_min(1e-9) * sin_eta)
@@ -576,13 +585,16 @@ class MAPPlanTracker:
         #: as a forward car with -delta does (11-06, the user: "후진도 map를 안쓸 이유가 있니?")
         self.back_mode = "pp"
         self.wheelbase = float(nominal.get("lf", 0.15875)) + float(nominal.get("lr", 0.17145))
+        #: (B,) [rad] each car's slip angle atan2(vy, vx), set by the env each step when `MAPParams.eta_ref` is "velocity"
+        self.beta = None
 
     def __getattr__(self, name):                       # spec, last_ref, u_seq, hooks, ... are the inner's
         return getattr(self.__dict__["_inner"], name)
 
     def __setattr__(self, name, value):
         if name in ("_inner", "map", "nominal", "map_rows", "map_off", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
-                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv", "tw_speed_lead"):
+                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv", "tw_speed_lead",
+                    "beta"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -721,7 +733,8 @@ class MAPPlanTracker:
             self.map.curr_steer = torch.where(flip, -self.map.curr_steer, self.map.curr_steer)
         steer, speed = self.map(pos, yaw, v_meas.abs(), path, pv, pk,
                                 torch.full((B,), PLAN_WP_SPACING, device=dev), zeros, grip_index(self.P, self.nominal),
-                                yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None)
+                                yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None,
+                                beta=self.beta if self.map.p.eta_ref == "velocity" else None)
         if flip is not None:
             steer = torch.where(flip, -steer, steer)
             self.map.curr_steer = torch.where(flip, -self.map.curr_steer, self.map.curr_steer)

@@ -1462,6 +1462,8 @@ def plan_env_fields(ar) -> dict:
     # change of direction 23.5 / 33.8 cm (25.9 / 36.7), wall contacts 6 (15) of 128
     mp = dict(PLAN_MAP, speed_lookahead=0.0, t_clip_min=0.35, m_l1=0.47, q_l1=0.0) if tw else \
         dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235)))
+    if os.environ.get("F1SIM_MAP_ETA_REF"):                # 11-15: MAP's pursuit angle from "heading" (default) or "velocity"
+        mp = dict(mp, eta_ref=os.environ["F1SIM_MAP_ETA_REF"])
     return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
                 plan_follower_map=mp,
                 decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
