@@ -32,6 +32,9 @@ s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, ca
                                     randomize=os.environ.get("F1SIM_LAPS_RANDOMIZE", "0") == "1"), 0)
 env = s["env"]
 _P = env.sim.P
+if os.environ.get("F1SIM_LAPS_TRAIN_MU") == "1":
+    # 11-16: the training world's friction (state_rl.build_env: mu x1.0, mu_f_scale 0.92 -- not drawn), the rest as drawn
+    _P["mu"].fill_(float(env.sim.params.nominal["mu"])); _P["mu_f_scale"].fill_(0.92)
 print("차 물리:", {k: round(float(_P[k][0]), 3) for k in ("mu", "mu_f_scale", "motor_tau", "speed_gain", "servo_tau") if k in _P})
 print("세션:", s["info_line"], "| 방식", s["mode"], "| 결정", env.ecfg.decision_every, "| 계획", env.ecfg.speed_mode, env.ecfg.plan_follower)
 lap0 = int(env.last_result.lap[0]); t_last = 0.0; laps = []; vmax = 0.0; vs = []

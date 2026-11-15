@@ -1360,6 +1360,12 @@ class SimWorker:
         sim_cfg = viewer_config(compile_enabled, randomize=cfg.randomize)
         if skind:
             sim_cfg.lidar.n_beams = int(state_policy.contract(state_ck, skind)["beams"])
+            # the training world's draw (`state_rl.build_env`): friction is NOT drawn there (mu x1.0, front x0.92); the rest of the
+            # randomisation (motor / servo lag, speed calibration, sensors) is. 11-16: the console drew mu 0.7-1.1 on top and a
+            # plan at 95 % of the nominal tyre limit slid on a low draw -- "학습과 동일" it was not. F1SIM_CONSOLE_MU_RANDOM=1 = the old draw
+            if os.environ.get("F1SIM_CONSOLE_MU_RANDOM") != "1":
+                sim_cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0)
+                sim_cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
         if "range_max" in spec:
             sim_cfg.lidar.range_max = float(spec["range_max"])
         try:
