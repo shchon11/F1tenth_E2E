@@ -4,6 +4,8 @@ Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
         rt:Spielberg        (any directory of f1tenth_racetracks)
         gym:levine          (levine, berlin, skirk, vegas, stata_basement)
         scene:my_hall       (a scene saved by the environment editor, see f1sim.scene; scene:/abs/dir too)
+        real:<id>           also every map registered from a recording (f1sim.map_registry, no code
+                            edit per map); user:<id> is the same map
         /abs/path/map.yaml  (any ROS map; centerline csv next to it is picked up)
     Obstacle suffixes: `+obs<seed>` = boxes hugging the lane edge (the racing line stays clear),
                        `+rlobs<seed>` = boxes standing on the racing line (the car must plan around),
@@ -65,6 +67,37 @@ REAL = {
                          dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
                                                                               # (track built from ducts in a bigger hall): floor beyond
 }
+#: The hand-written entries above. Everything else in `REAL` comes from the map registry
+#: (`map_registry`: one folder per map made from a recording, no code edit per map) and is re-read
+#: by `refresh_registered`.
+REAL_BUILTIN = frozenset(REAL)
+#: Registered maps the car drove clockwise (`map.json` "direction"): their traced centre line runs
+#: that way, so `real:<id>` is the race direction and `~rev` the other one, as on every other map.
+REAL_DIRECTION = {}
+
+
+def refresh_registered() -> List[str]:
+    """(Re)read the map registry into `REAL`. A registered id the hand-written catalogue already
+    uses is skipped: an existing name never changes meaning under a run that trained on it."""
+    from . import map_registry
+    for k in [k for k in REAL if k not in REAL_BUILTIN]:
+        del REAL[k]
+    REAL_DIRECTION.clear()
+    added = []
+    for e in map_registry.entries():
+        if e["id"] in REAL_BUILTIN:
+            continue
+        kw = dict(e["from_ros_map"])
+        kw.setdefault("keep_region", True)
+        REAL[e["id"]] = (e["yaml"], e["boundary"], e["min_clearance"], e["note"], e["seed_xy"], e["despeckle_m2"], kw)
+        if e["direction"] == "cw":
+            REAL_DIRECTION[e["id"]] = "cw"
+        added.append(e["id"])
+    return added
+
+
+refresh_registered()
+
 CENTERLINE_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "centerlines")
 
 #: Clearance the traced centerline keeps off anything solid when a map arrives with no centerline
@@ -107,19 +140,22 @@ def _scene_stamp(name: str):
     return tuple(out)
 
 
-def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None) -> Track:
-    """Extract (and cache) the main loop of a map that has no centerline."""
+def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None, direction: str = "ccw") -> Track:
+    """Extract (and cache) the main loop of a map that has no centerline. `direction` "cw" for a
+    venue raced clockwise (a registered map's `direction`); the key only changes for "cw", so every
+    cached ccw trace stays valid."""
     import hashlib
     import numpy as np
     if track.centerline is not None:
         return track
     os.makedirs(CENTERLINE_CACHE, exist_ok=True)
-    key = hashlib.md5(np.packbits(track.occupancy).tobytes() + f"{min_clearance}{seed_xy}v8".encode()).hexdigest()[:12]
+    tag = f"{min_clearance}{seed_xy}v8" + ("cw" if direction == "cw" else "")
+    key = hashlib.md5(np.packbits(track.occupancy).tobytes() + tag.encode()).hexdigest()[:12]
     path = os.path.join(CENTERLINE_CACHE, f"{track.name}_{key}.csv")
     if os.path.exists(path):
         track.centerline = np.loadtxt(path, delimiter=",")
     else:
-        track.centerline_from_free_space(min_clearance=min_clearance, seed_xy=seed_xy)
+        track.centerline_from_free_space(min_clearance=min_clearance, seed_xy=seed_xy, direction=direction)
         np.savetxt(path, track.centerline, delimiter=",")
     return track
 
@@ -312,8 +348,15 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
         kw.setdefault("boundary", GYM_BOUNDARY.get(n, "duct"))
         clearance = kw.pop("min_clearance", 0.45)
         return _b(_with_auto_centerline(Track.from_ros_map(os.path.join(GYM_MAPS, n + ".yaml"), name=n, **kw), clearance))
+    if name.startswith("user:"):                           # what `slam_map --install` used to print: the same map
+        name = "real:" + name[5:]
     if name.startswith("real:"):
         n, kind, spec = _split_obstacle_suffix(name[5:])        # real:icra2022+obs3 / +rlobs3
+        if n not in REAL:                                       # registered since this process imported maps
+            refresh_registered()
+        if n not in REAL:
+            from . import map_registry
+            raise KeyError(f"real:{n} is neither in maps.REAL nor in the map registry ({map_registry.maps_dir()})")
         entry = REAL[n]; yaml_path, boundary, clearance = entry[:3]; seed_xy = entry[4] if len(entry) > 4 else None
         kw.setdefault("boundary", boundary)
         if len(entry) > 5 and entry[5] is not None:
@@ -324,7 +367,8 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
             if kw.get("keep_region"):
                 kw.setdefault("seed_xy", seed_xy)
         clearance = kw.pop("min_clearance", clearance)
-        t = _b(_with_auto_centerline(Track.from_ros_map(yaml_path, name=n, **kw), clearance, seed_xy))
+        t = _b(_with_auto_centerline(Track.from_ros_map(yaml_path, name=n, **kw), clearance, seed_xy,
+                                     REAL_DIRECTION.get(n, "ccw")))
         if kind == "pinch":                                     # real:x+pinch<seed>: the lane closes down
             return t.with_pinches(seed=int(spec), n=int(np.random.default_rng(int(spec) + 5).integers(2, 5)))
         if kind == "rlobs":                                     # real:x+rlobs<seed>: boxes ON the raceline

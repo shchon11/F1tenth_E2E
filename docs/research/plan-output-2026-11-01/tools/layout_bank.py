@@ -9,12 +9,15 @@
 근처가 비는 편향이라 바꿈)
 통과한 배치만 트랙 이름별로 저장 -> 학습/콘솔은 리셋마다 같은 트랙 은행에서 하나를 꺼내 그 일부(1..전부)를 씀(길이 있는 배치에서
 상자를 빼도 그 길은 남음).
-인자: 체크포인트(학습 인자) 출력.pt 트랙당배치수 [한번에판정할배치수 최적화반복]"""
+인자: 체크포인트(학습 인자) 또는 세계 json, 출력.pt 트랙당배치수 [한번에판정할배치수 최적화반복]
+11-15: 첫 인자가 세계 json 이면 checkpoint 없이 그 세계로 만듦. BANK_SEED=시드 (병렬 조각마다 다르게; 없으면 시각).
+트랙을 나눠 여러 프로세스로 돌리려면 layout_bank_par.py (한 프로세스는 CPU 한 개만 씀, GPU는 거의 놂)."""
 import os, sys, time, argparse
 import numpy as np
 import torch
 from scipy.ndimage import uniform_filter1d
-sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
+# the f1sim this tools folder belongs to (was the main checkout's path, which a worktree's copy also loaded)
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "f1sim")))
 from f1sim.learn import state_rl as SR
 from f1sim import layout_line as LL
 from f1sim.prop_math import _polygon_vertices, _slot_is_live, _to_world
@@ -24,14 +27,17 @@ pck, out, n_per = sys.argv[1], sys.argv[2], int(sys.argv[3])
 nb = int(sys.argv[4]) if len(sys.argv) > 4 else 32
 iters = int(sys.argv[5]) if len(sys.argv) > 5 else 300
 CLR_PROP, CLR_WALL, ROUNDS = 0.10, 0.10, 4
-dev = torch.device("cuda")
-ck = torch.load(pck, map_location=dev, weights_only=False)
-a = argparse.Namespace(**ck["args"])
+dev = torch.device(os.environ.get("BANK_DEVICE", "cuda"))     # 11-15: BANK_DEVICE=cpu (GPU 를 안 건드리는 점검용)
+import json
+if pck.endswith(".json"):
+    a = argparse.Namespace(**json.load(open(pck)))
+else:
+    ck = torch.load(pck, map_location="cpu", weights_only=False)
+    a = argparse.Namespace(**ck["args"])
 # 11-14: BANK_WORLD=세계json = plan_rl checkpoint의 인자에는 트랙·상자 설정이 없어(세계 json에 있음) 그 세계를 그대로 씀 (지도 바꾸기)
 if os.environ.get("BANK_WORLD"):
-    import json
     a = argparse.Namespace(**json.load(open(os.environ["BANK_WORLD"])))
-a.envs, a.seed, a.device = 64, int(time.time()) % 100000, "cuda"
+a.envs, a.seed, a.device = 64, int(os.environ.get("BANK_SEED") or int(time.time()) % 100000), str(dev)
 a.prop_place, a.prop_count, a.prop_fraction = "uniform", "fixed", 1.0
 a.prop_shapes = os.environ.get("BANK_SHAPES", getattr(a, "prop_shapes", "all"))   # 11-06: "boxes" = box-sized pieces only
 # 11-06 14:20: the checkpoint's own --prop-bank made the env draw from THAT bank (place "bank"), so the first "box" bank was the

@@ -302,6 +302,30 @@ PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "
                        # bank dir, e.g. /home/shchon11/f1sim_runs/prop_banks (every catalogue piece, before 11-06; prop_banks_box is the same, re-judged)
                        "procedural_bank": os.environ.get("F1SIM_PROP_BANK", "/home/shchon11/f1sim_runs/prop_banks_box2")}
 
+#: The training worlds (`plan_world_<map>.json`, written by tools/map_setup.sh and tools/new_map.sh): each names the box
+#: bank built for its map. The default above is Korea 2025's, which holds no layouts for any other map, so a session on
+#: another map drew uniform instead (11-15).
+WORLD_CONFIGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "learn", "configs")
+
+
+def world_prop_bank(base_legacy: str) -> Optional[str]:
+    """The box bank of the training world whose first track is this base map (`real:korea_2026_competition`), when that
+    world exists and its bank is on disk; None otherwise. `F1SIM_PROP_BANK` is the caller's to honour first."""
+    import glob
+    import json
+    if not base_legacy:
+        return None
+    for path in sorted(glob.glob(os.path.join(WORLD_CONFIGS, "plan_world_*.json"))):
+        try:
+            w = json.load(open(path))
+        except Exception:
+            continue
+        first = str(w.get("tracks") or "").split(",")[0].strip()
+        bank = os.path.expanduser(str(w.get("prop_bank") or ""))
+        if first == base_legacy and bank and (os.path.isfile(bank) or glob.glob(os.path.join(bank, "*.pt"))):
+            return bank
+    return None
+
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
 #: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the
 #: racing line, and the raceline teacher cannot see a prop (they are not in the occupancy grid),
@@ -1246,6 +1270,15 @@ class SimWorker:
                     f"장애물 '학습과 같음' 은 맵에 굽는 장애물('{scenario.choice}')과 함께 쓸 수 없습니다 — "
                     f"맵은 장애물 없이 고르세요.")
             proc_kw, proc_src = procedural_settings(ckpt_path, getattr(cfg, "collision_mode", "soft"))
+            if not os.environ.get("F1SIM_PROP_BANK"):
+                # the box bank follows the chosen map: its training world's, when one was built (11-15)
+                try:
+                    _wb = world_prop_bank(scenario.entry.legacy if scenario.track else "")
+                except Exception:
+                    _wb = None
+                if _wb and _wb != proc_kw.get("procedural_bank"):
+                    proc_kw["procedural_bank"] = _wb
+                    proc_src = f"{proc_src} · 상자 배치는 이 지도의 학습 세계 것"
             run_max_props = int(proc_kw.get("procedural_max_props") or 0)
             if custom is None:
                 # How many of each drawn layout's pieces the session lays (11-06): default "uniform" = 1 .. all, as the training
