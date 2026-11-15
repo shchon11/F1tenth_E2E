@@ -76,6 +76,13 @@ a.episode_s = secs + 5.0                                   # one episode per car
 a.warps, a.track_scales = 0, None                          # the real map only
 a.prop_bank, a.prop_count = BANK, count
 a.opp_present, a.prop_fraction = 0.0, 1.0                  # alone, every world with boxes
+OPP = os.environ.get("BOX_REPLAY_OPP", "") == "1"
+if OPP:                                                    # 11-15: a car in every world, no boxes (car_nudge_value.py)
+    a.opp_present, a.prop_fraction = 1.0, 0.0
+    # one plain line-following kind: the scripted kinds' own state (lane kept, pass committed; alt_teachers.*) is not copied
+    # (NEVER_PART), and the copies' opponents then drift apart from the original's (self-test 11-15: 0.24 m in 3 s)
+    a.opp_slot = os.environ.get("BOX_REPLAY_OPP_SLOT", json.dumps({"kind": "raceline", "kind_mix": [], "reactive": {}, "events": [],
+                                                                    "event_rate": 0.0, "speed_scale": [0.5, 0.75]}))
 torch.manual_seed(SEED)
 env = SR.build_env(a, dev)
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
@@ -230,7 +237,7 @@ S1 = shot()
 env.reset(seed=SEED)
 obs.reset_rows(kL)
 S2 = shot()
-assert bool(env.sim.absent[others].all()) and not bool(env.sim.absent[lid].any()), "상대 차가 있는 세계가 섞였습니다"
+assert (OPP or bool(env.sim.absent[others].all())) and not bool(env.sim.absent[lid].any()), "상대 차가 있는 세계가 섞였습니다"
 DYN, SKIP = [], []
 for p in sorted(set(S0) | set(S1) | set(S2), key=pname):
     n = pname(p); leaf = n.split(".")[-1]
@@ -273,7 +280,7 @@ def clone_rows():
 
 # ---- the session ----
 T = int(round(secs / PS.DT)); PER = int(round(period_s / PS.DT))
-R = {k: [] for k in ("st", "pl", "rs", "cnt", "inc", "held", "sid", "pose", "tid")}
+R = {k: [] for k in ("st", "pl", "rs", "cnt", "inc", "held", "sid", "pose", "tid", "op")}
 SY = {k: [] for k in ("t", "div", "bvalid", "btau")}
 H_xy = torch.zeros(T + 1, G, 2, device=dev); H_yaw = torch.zeros(T + 1, G, device=dev)
 H_mem = torch.zeros(T + 1, G, int(actor.memory), device=dev)
@@ -285,7 +292,11 @@ prof = []                                                             # SELFTEST
 
 def snap():
     R["st"].append(env.sim.state[lid, :4].float().cpu())
-    R["sid"].append(po.p_sid[eid].to(torch.int16).cpu()); R["pose"].append(po.p_poses[eid].float().cpu())
+    R["op"].append(env.sim.state[others, :4].float().cpu())          # the other car (11-15; absent rows stay where they were)
+    if po is not None:
+        R["sid"].append(po.p_sid[eid].to(torch.int16).cpu()); R["pose"].append(po.p_poses[eid].float().cpu())
+    else:                                                 # BOX_REPLAY_OPP: no box layer in this world
+        R["sid"].append(torch.full((Bl, 1), -1, dtype=torch.int16)); R["pose"].append(torch.zeros(Bl, 1, 3))
     R["tid"].append(env.sim.tid[lid].to(torch.int16).cpu())
 
 
@@ -374,7 +385,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          grp=grp.cpu().numpy(), arm=arm.to(torch.int8).cpu().numpy(), period=np.array(PER),
          nudge_deg=np.array(NUDGE_RAD * 180.0 / np.pi), nudge_n=np.array(NUDGE_N), slow_k=np.array(SLOW_K), slow_n=np.array(SLOW_N), sync_t=np.array(SY["t"]),
          div=torch.stack(SY["div"]).numpy(), bvalid=torch.stack(SY["bvalid"]).numpy(), btau=torch.stack(SY["btau"]).numpy(),
-         copied=np.array([pname(p) for p, _ in DYN]), selftest=np.array(SELFTEST), seed=np.array(SEED), count=np.array(count),
+         copied=np.array([pname(p) for p, _ in DYN]), selftest=np.array(SELFTEST), opp=np.array(OPP), seed=np.array(SEED), count=np.array(count),
          bank=np.array(BANK), lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0))
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
