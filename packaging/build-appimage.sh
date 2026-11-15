@@ -48,8 +48,11 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
 # The GUI and its pure-Python dependencies, installed into the image. `--no-deps` for f1sim itself
 # because its declared dependencies include torch: the console package is imported by the window,
 # but the window's own import path does not touch it.
+# The window draws with moderngl (`viewer/console/viewport.py` imports it when its GL context comes up: without it the 3D view
+# stays black on "세션을 준비하는 중" while the worker runs -- 11-16, the lab PC), loads the car mesh with trimesh, fills
+# polygons with mapbox_earcut and takes hulls / contours with scipy (`viewer/gl_scene.py`, `viewer/contours.py`)
 python3 -m pip install --quiet --upgrade --target "$APPDIR/usr/lib/python" \
-    PyQt5 numpy pyyaml pillow
+    PyQt5 numpy pyyaml pillow moderngl glcontext trimesh mapbox_earcut scipy
 python3 -m pip install --quiet --no-deps --target "$APPDIR/usr/lib/python" "$REPO/f1sim" || true
 # An old setuptools (< 61, e.g. Ubuntu 22.04's 59.6 when the build is not isolated) does not read pyproject's [project]
 # table and installs an empty "UNKNOWN" package (11-16, the lab PC). The package is plain Python: copy its source instead.
