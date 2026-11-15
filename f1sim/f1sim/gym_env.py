@@ -2296,7 +2296,9 @@ class F1VecEnv:
                 raise RuntimeError("scene_replay and level_replay both set: one way of choosing a restart at a time")
             self._reset_envs_core(ids, fill=False)
             self.scene_replay.apply(self, ids)
-            return self._fill_scans(ids, self.sim.odom.state[ids, 3])
+            out = self._fill_scans(ids, self.sim.odom.state[ids, 3])
+            self.scene_replay.after_fill(self)               # the scene rows' scan / action histories as they stood (11-16)
+            return out
         if getattr(self, "level_replay", None) is None or ids.numel() == 0:
             return self._reset_envs_core(ids)
         M = self.M

@@ -19,7 +19,11 @@
 환경 변수: F1SIM_EXAM_DEVICE(cuda|cpu), F1SIM_EXAM_SEED, BOX_REPLAY_ARMS="3,1,1"(A, B, C 복제 수, 다섯 개면 + L, R),
   BOX_REPLAY_NUDGE="2.0,3"(L/R: 조향에 더하는 각 [deg], 복제 뒤 결정 수)
 (11-13) 복제 갈래 S = 복제 직후 몇 결정 동안 plan의 속도(명령과 다음 결정이 읽는 지난 plan 속도)에 배율을 곱함. 물음: 다가가는 속도가
-  지렛대인가(그만큼 느리면 피하나) / 그 대가로 잃는 거리. BOX_REPLAY_ARMS 여섯째 수 = S 복제 수, BOX_REPLAY_SLOW="0.8,10"(배율, 결정 수)"""
+  지렛대인가(그만큼 느리면 피하나) / 그 대가로 잃는 거리. BOX_REPLAY_ARMS 여섯째 수 = S 복제 수, BOX_REPLAY_SLOW="0.8,10"(배율, 결정 수)
+(11-16) 복제 갈래 V = 복제 직후 몇 결정 동안 조향 0으로 뒤로(속도 명령과 다음 결정이 읽는 plan 속도 = -속도). 물음: 앞이 막혀 선 차가
+  이어지는 후진으로 실제로 빠져나오나(그래야 '서 있을 때 속도 잡음 잇기'가 학습 신호를 만듦; 결정 하나의 잡음은 advantage 기울기 0,
+  nose_block_scan.py). BOX_REPLAY_ARMS 일곱째 수 = V 복제 수, BOX_REPLAY_REV="0.8,8"(속도 [m/s], 결정 수). 분석: stall_reverse_table.py
+(11-16) 세계는 checkpoint가 학습한 세계(world_of.py, exam_record.py와 같음; Korea 2025 checkpoint는 그대로 prop_banks_exam1)"""
 import os, sys, json, argparse, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -30,9 +34,11 @@ sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 BANK = "/home/shchon11/f1sim_runs/prop_banks_exam1"
 SEED = int(os.environ.get("F1SIM_EXAM_SEED", 20261112))
 SELFTEST = os.environ.get("BOX_REPLAY_SELFTEST", "") == "1"
-_arms = [int(x) for x in os.environ.get("BOX_REPLAY_ARMS", "3,1,1").split(",")] + [0, 0, 0]
-NA, NB, NC, NL, NR, NS = _arms[:6]
-K = 1 + NA + NB + NC + NL + NR + NS
+_arms = [int(x) for x in os.environ.get("BOX_REPLAY_ARMS", "3,1,1").split(",")] + [0, 0, 0, 0]
+NA, NB, NC, NL, NR, NS, NV = _arms[:7]
+K = 1 + NA + NB + NC + NL + NR + NS + NV
+_rv = os.environ.get("BOX_REPLAY_REV", "0.8,8").split(",")
+REV_V, REV_N = float(_rv[0]), int(_rv[1])
 _sl = os.environ.get("BOX_REPLAY_SLOW", "0.8,10").split(",")
 SLOW_K, SLOW_N = float(_sl[0]), int(_sl[1])
 _nd = os.environ.get("BOX_REPLAY_NUDGE", "2.0,3").split(",")
@@ -64,7 +70,9 @@ else:
 from f1sim.learn import state_rl as SR
 from f1sim.learn.graph_runtime import prepare_graph_runtime
 from f1sim.learn.plan_policy import PlanObs2, load_actor2, plan_v2, plan_world, PT_IDX
-from f1sim.learn.plan_rl import WORLD
+from world_of import world_path, exam_bank
+WORLD = world_path(ck)                                     # the world the checkpoint was trained in (11-16; exam_record.py's)
+BANK = exam_bank(WORLD)
 from f1sim import plan_steps as PS
 from f1sim import map_controller as M
 from f1sim.sim import CONTACT_FRAME_COLUMNS as CC
@@ -104,8 +112,10 @@ act0 = torch.zeros(B, env.act_dim, device=dev)
 kL = torch.arange(Bl, device=dev)
 grp, mem_j = kL // K, kL % K
 arm = torch.where(mem_j == 0, 0, torch.where(mem_j <= NA, 1, torch.where(mem_j <= NA + NB, 2, torch.where(
-    mem_j <= NA + NB + NC, 3, torch.where(mem_j <= NA + NB + NC + NL, 4, torch.where(mem_j <= NA + NB + NC + NL + NR, 5, 6))))))
+    mem_j <= NA + NB + NC, 3, torch.where(mem_j <= NA + NB + NC + NL, 4, torch.where(mem_j <= NA + NB + NC + NL + NR, 5,
+    torch.where(mem_j <= NA + NB + NC + NL + NR + NS, 6, 7)))))))
 slow_rows = arm == 6
+rev_rows = arm == 7
 nudge_dir = torch.where(arm == 4, 1.0, torch.where(arm == 5, -1.0, 0.0))     # L: + (left), R: -
 dk = torch.nonzero(mem_j != 0)[:, 0]; sk = grp[dk] * K     # replicate rows and their sources (into the learner rows)
 src = torch.arange(G, device=dev) * K
@@ -187,7 +197,7 @@ def differs(x, y):
     return bool((x != y).any())
 
 
-def decide(nudge=None, slow=None):
+def decide(nudge=None, slow=None, rev=None):
     """one decision of every learner row, as exam_record.py's ideal mode -> (plan points, restarted). `nudge` (Bl,) [rad] is
     added to the plan's steering commands (and so to the commands the next decision reads as its last ones)"""
     st = env.sim.state[lid].clone()
@@ -197,6 +207,11 @@ def decide(nudge=None, slow=None):
     if slow is not None:                                   # (B_l,) speed factor: the commands and the plan speeds read next
         p["cmd_v"] = p["cmd_v"] * slow[:, None].to(p["cmd_v"].dtype)
         p["pv"] = p["pv"] * slow[:, None].to(p["pv"].dtype)
+    if rev is not None:                                    # (B_l,) bool: straight back at REV_V (commands and the plan speeds read next)
+        r_ = rev[:, None]
+        p["cmd_v"] = torch.where(r_, torch.full_like(p["cmd_v"], -REV_V), p["cmd_v"])
+        p["pv"] = torch.where(r_, torch.full_like(p["pv"], -REV_V), p["pv"])
+        p["cmd_d"] = torch.where(r_, torch.zeros_like(p["cmd_d"]), p["cmd_d"])
     x, y, psi = plan_world(p, st)
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
     env.sim.ideal_vcap[lid] = 1e3
@@ -256,7 +271,7 @@ for p in sorted(set(S0) | set(S1) | set(S2), key=pname):
     (DYN if take else SKIP).append((p, ax))
 missing = sorted(FORCE - {pname(p) for p, _ in DYN})
 del S0, S1, S2
-print(f"B {B} · 학습 차 {Bl} = 묶음 {G} x (원본 1 + A {NA} + B {NB} + C {NC} + L {NL} + R {NR} + S {NS}, L/R {NUDGE_RAD * 180 / np.pi:g} deg x {NUDGE_N}결정, S 속도 x{SLOW_K:g} x {SLOW_N}결정) · 덮어쓸 텐서 {len(DYN)}개, 안 덮어쓰는 것 {len(SKIP)}개 "
+print(f"B {B} · 학습 차 {Bl} = 묶음 {G} x (원본 1 + A {NA} + B {NB} + C {NC} + L {NL} + R {NR} + S {NS} + V {NV}, L/R {NUDGE_RAD * 180 / np.pi:g} deg x {NUDGE_N}결정, S 속도 x{SLOW_K:g} x {SLOW_N}결정) · 덮어쓸 텐서 {len(DYN)}개, 안 덮어쓰는 것 {len(SKIP)}개 "
       f"({time.time() - t_build:.0f} s)", flush=True)
 print("  덮어씀: " + " ".join(pname(p) + ("[1]" if ax else "") for p, ax in DYN), flush=True)
 print("  안 덮어씀: " + " ".join(pname(p) for p, _ in SKIP), flush=True)
@@ -365,7 +380,8 @@ for kd in range(T):
     snap()
     c0 = counts()
     pts, restarted = decide(nudge_dir * NUDGE_RAD if (NL + NR > 0 and not SELFTEST and kd % PER < NUDGE_N) else None,
-                            torch.where(slow_rows, SLOW_K, 1.0) if (NS > 0 and not SELFTEST and kd % PER < SLOW_N) else None)
+                            torch.where(slow_rows, SLOW_K, 1.0) if (NS > 0 and not SELFTEST and kd % PER < SLOW_N) else None,
+                            rev_rows if (NV > 0 and not SELFTEST and kd % PER < REV_N) else None)
     c1 = counts()
     win_rs |= restarted
     if SELFTEST:
@@ -387,7 +403,8 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT), cols=np.array(COLS),
          name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
          grp=grp.cpu().numpy(), arm=arm.to(torch.int8).cpu().numpy(), period=np.array(PER),
-         nudge_deg=np.array(NUDGE_RAD * 180.0 / np.pi), nudge_n=np.array(NUDGE_N), slow_k=np.array(SLOW_K), slow_n=np.array(SLOW_N), sync_t=np.array(SY["t"]),
+         nudge_deg=np.array(NUDGE_RAD * 180.0 / np.pi), nudge_n=np.array(NUDGE_N), slow_k=np.array(SLOW_K), slow_n=np.array(SLOW_N),
+         rev_v=np.array(REV_V), rev_n=np.array(REV_N), world=np.array(WORLD), sync_t=np.array(SY["t"]),
          div=torch.stack(SY["div"]).numpy(), bvalid=torch.stack(SY["bvalid"]).numpy(), btau=torch.stack(SY["btau"]).numpy(),
          copied=np.array([pname(p) for p, _ in DYN]), selftest=np.array(SELFTEST), opp=np.array(OPP), seed=np.array(SEED), count=np.array(count),
          bank=np.array(BANK), lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0))

@@ -448,6 +448,11 @@ def main(argv=None):
                          "LO..HI m ahead and within 1 m of the car's side; elsewhere a fresh draw every decision (11-15: cloned cars "
                          "steered 2 deg away for 0.3 s at 1.5-4 m from a box hit it half as often at no cost; held noise everywhere "
                          "(plan26o) added wall hits and lost speed)")
+    ap.add_argument("--noise-corr-stall", default="",
+                    help="S,RHO: while the car has stood (|v| < 0.3 m/s) for S s, the first step's SPEED noise is held with RHO "
+                         "(11-16: a stalled car's speed noise drawn afresh every 0.1 s moves it cm and the advantage slope on it was "
+                         "0 +- 0.005 over 4838 stalled decisions; cloned stalled cars backed 1 m/s x 1.5 s were driving on 4 s later "
+                         "91 %% vs 21 %% left as they were)")
     ap.add_argument("--noise-corr-car", default="",
                     help="LO,HI [m]: as --noise-corr-box for the nearest other car (critic's column: LO..HI m ahead in the car's "
                          "frame, within 1.5 m of its side); with both, the noise is held when either holds (11-15: cloned cars "
@@ -760,6 +765,12 @@ def main(argv=None):
     _O0 = [k for i, k in enumerate(_PK) if i not in _PD].index("opp0_present")   # the nearest car's columns in the critic's input
     if args.noise_corr_steer:
         noise_rho[PS.N_STEP:] = 0.0                                 # the speed outputs: a fresh draw every decision
+    stall_on = bool(args.noise_corr_stall)
+    st_k, st_rho = 0, 0.0
+    if stall_on:
+        _s, _r = (float(x) for x in args.noise_corr_stall.split(","))
+        st_k, st_rho = max(int(round(_s / PS.DT)), 1), _r
+    still_n = torch.zeros(Bl, dtype=torch.long, device=dev)        # --noise-corr-stall: decisions stood in a row
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -901,6 +912,7 @@ def main(argv=None):
     for upd in range(1 + args.update_offset, args.updates + 1):
         frac = (upd - 1) / max(1, args.updates - 1)
         nc_near = 0.0                                              # --noise-corr-box: share of decisions with the noise held
+        nc_stall = 0.0                                             # --noise-corr-stall: share of decisions with the speed noise held
         if args.noise_corr_ramp:                                   # --noise-corr-ramp: in place, read by the rollout below
             _r0, _r1 = (float(x) for x in args.noise_corr_ramp.split(","))
             _rho = float(args.noise_corr) * min(1.0, max(0.0, (upd - _r0) / max(1.0, _r1 - _r0)))
@@ -988,7 +1000,7 @@ def main(argv=None):
                     br_n["arg_switch"] += float(((arg_ != arg_prev).float() * same_ep).sum())
                     br_n["pairs"] += float(same_ep.sum())
                     br_prev, arg_prev = br, arg_
-                if args.noise_corr > 0:
+                if args.noise_corr > 0 or stall_on:
                     # exploration noise that stays for several decisions (AR(1), each decision still N(0, 1) by itself; a
                     # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
                     # 2021) and coloured noise in PPO (Hollenstein et al. 2024) do
@@ -1004,6 +1016,12 @@ def main(argv=None):
                             _near |= (_o[:, 0] > 0.5) & (_o[:, 1] * 5.0 >= ncc_lo) & (_o[:, 1] * 5.0 <= ncc_hi) & ((_o[:, 2] * 5.0).abs() < 1.5)
                         rho_t = noise_rho[None, :] * _near[:, None].float()
                         nc_near += float(_near.float().mean())
+                    if stall_on:                                   # a car that has stood: its speed noise held (11-16)
+                        _st = still_n >= st_k
+                        rho_t = (rho_t if rho_t.ndim == 2 else rho_t[None, :]).expand(Bl, -1).clone()
+                        rho_t[:, PS.N_STEP:] = torch.where(_st[:, None], torch.full_like(rho_t[:, PS.N_STEP:], st_rho),
+                                                           rho_t[:, PS.N_STEP:])
+                        nc_stall += float(_st.float().mean())
                     eps_n = rho_t * eps_n + (1.0 - rho_t ** 2) ** 0.5 * torch.randn_like(mean)
                     eps = eps_n
                 else:
@@ -1113,7 +1131,10 @@ def main(argv=None):
                     sc_dec += int(in_rep0.sum()); sc_end += int(ended_.sum()); sc_end_hit += int((ended_ & rep_hit).sum())
                     rep_hit &= ~out["restarted"]
                 since = torch.where(out["restarted"], torch.zeros_like(since), since + 1)
-                if args.noise_corr > 0:
+                if stall_on:
+                    _ve = env.sim.state[lid, dyn.IVX].abs()
+                    still_n = torch.where(out["restarted"] | (_ve >= 0.3), torch.zeros_like(still_n), still_n + 1)
+                if args.noise_corr > 0 or stall_on:
                     eps_n = torch.where(out["restarted"][:, None], torch.randn_like(eps_n), eps_n)
                 cool += 1
                 if tailc:
@@ -1533,6 +1554,7 @@ def main(argv=None):
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
                "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
                "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
+               "noise_stall_share": nc_stall / max(T, 1) if stall_on else None,
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,

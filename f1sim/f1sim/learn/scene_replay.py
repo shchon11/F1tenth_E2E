@@ -16,9 +16,13 @@ A scene is the state `lag` decisions before the contact, and holds what the next
     vector (IMU, last commands, last plan, previous branch) and the memory. The memory is KEPT, not cleared: a box that
     was seen a lap earlier and is hidden now is exactly where a memory pays, and a scene that wiped it would train the
     moment without what the car knew (stored-state replay, Kapturowski et al. 2019, R2D2).
-Not restorable: what an opponent's planner holds inside (the lane it keeps, a pass it is committed to) and timed events
--- an opponent starts a scene as a fresh driver of its stored kind and pace, from its stored pose and speed. Box and
-wall scenes are exact, car scenes similar.
+(11-16) ... and EVERY other per-car tensor of the env (`ROW_STATE`: found by walking the env like tools/box_replay.py, whose
+copies are exact), minus a car's identity and role in the batch and the episode's own bookkeeping (a scene starts a fresh
+episode). Before, the opponents came back as fresh drivers: the follower's MPC warm start and last reference, its per-car
+delay and calibration, the drivers' committed side / lane, the timed events (defend, yield, corner mode and their clocks),
+the decision phase, the held commands -- all redrawn by the restart. Measured on Korea 2026 (tools/scene_selftest.py, sensor
+noise off, mean actions, 4 s): solo scenes came back within 8 mm, but 6 of 29 car scenes drifted more than 10 cm (up to
+1.6 m) -- the car scenes replayed in plan25z were other situations than the ones that ended in a contact.
 
 How it sits in the env: `F1VecEnv._reset_envs` does its ordinary reset, then calls `apply`, which writes a scene over
 every race of its own that reset whole, then the env takes one scan. A car rejoining its race (`restart_cars`) is not a
@@ -46,6 +50,72 @@ class SceneReplay:
     #: per-row pace handles of an opponent (`F1VecEnv._slot_speeds`), restored as they stood
     PACE = ("slot_scale", "opp_scale", "cap_scale")
 
+    #: never copied from one race to another: who a row is and what part it plays in the batch (tools/box_replay.py's lists),
+    #: the episode's bookkeeping (a scene is a fresh episode), and caches the next step rebuilds
+    NEVER_LEAF = set("""eid other_idx ideal_rows tid absent learner learner_ids race slot spawn_order_race teacher_race level_seed ext_mask
+external_driven on_policy pool_driven teacher_driven hold_rows map_rows opp_driver slot_cap slot_cap_set slot_scale_hi slot_scale_lo
+spawn_abreast _slot_mixed_rows slot_spawn_code ep_step ep_limit lap_start_step prev_lap ep_return ep_progress ep_contacts lap
+in_replay""".split())
+    NEVER_PART = ("_alt_rows.", "alt_teacher_mask.", ".params.", "_captures", "._g.", "_last_obs", "scene_replay.", "level_replay.")
+
+    @classmethod
+    def _rows_walk(cls, env) -> Dict[str, tuple]:
+        """{name: path} of every tensor reachable from the env through f1sim objects, lists and dicts whose axis 0 is the cars"""
+        B, out, seen = env.B, {}, set()
+
+        def rec(o, path, depth):
+            if id(o) in seen:
+                return
+            seen.add(id(o))
+            if torch.is_tensor(o):
+                if o.ndim >= 1 and o.shape[0] == B and o.numel() > 0:
+                    out[".".join(str(k) for _, k in path)] = path
+                return
+            if depth > 6 or isinstance(o, (torch.nn.Module, str, bytes, int, float, bool, type(None))):
+                return
+            if isinstance(o, dict):
+                for k, v in list(o.items()):
+                    rec(v, path + (("k", k),), depth + 1)
+            elif isinstance(o, (list, tuple)):
+                for i, v in enumerate(o):
+                    rec(v, path + (("i", i),), depth + 1)
+            elif type(o).__module__.startswith("f1sim"):
+                for k in (list(vars(o).keys()) if hasattr(o, "__dict__") else []):
+                    rec(getattr(o, k), path + (("a", k),), depth + 1)
+        rec(env, (), 0)
+        keep = {}
+        for name, path in out.items():
+            leaf = str(path[-1][1]) if path else ""
+            if leaf in cls.NEVER_LEAF or any(w in "." + name + "." for w in cls.NEVER_PART):
+                continue
+            keep[name] = path
+        return keep
+
+    @staticmethod
+    def _resolve(env, path):
+        o = env
+        try:
+            for kind, k in path:
+                o = getattr(o, k) if kind == "a" else o[k]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            return None
+        return o if torch.is_tensor(o) else None
+
+    @staticmethod
+    def _opp_state(env) -> Dict[str, torch.Tensor]:
+        """{key: (B, ...) live tensor} of what the opponents' drivers carry from step to step (11-16)"""
+        B, out = env.B, {}
+        for i, alt in enumerate(getattr(env, "alt_teachers", []) or []):
+            for k, v in vars(alt).items():
+                if (torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == B and k.startswith("_")
+                        and not any(w in k for w in ("rows", "mask", "code", "idx"))):
+                    out[f"opp_alt{i}{k}"] = v
+        solver = getattr(getattr(getattr(env, "tracker", None), "_inner", None), "_solver", None)
+        for j, v in enumerate(getattr(solver, "_out", None) or []):
+            if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == B:
+                out[f"opp_mpc{j}"] = v
+        return out
+
     def __init__(self, env, share: float, size: int, episode_steps: int, seed: int = 0):
         if not 0.0 < share <= 1.0:
             raise ValueError(f"share {share}: the part of the races that restart from scenes, in (0, 1]")
@@ -70,6 +140,8 @@ class SceneReplay:
         self._loaded = []                                         # (races, scene indices) since `take_loaded`
         self.n_loaded = 0
         self.n_added = 0
+        #: (11-16) every per-car tensor a scene carries besides the named ones: {name: path}, fixed at the first capture
+        self.row_paths: Optional[Dict[str, tuple]] = None
 
     # ------------------------------------------------------------------ taking
     def capture(self) -> Dict[str, torch.Tensor]:
@@ -94,6 +166,14 @@ class SceneReplay:
         if pr is not None and pr.C > 0:
             for k, v in pr.snapshot(lead).items():
                 d["box_" + k] = v
+        for k, v in self._opp_state(env).items():
+            d[k] = per_race(v)
+        if self.row_paths is None:
+            self.row_paths = self._rows_walk(env)
+        for name, path in self.row_paths.items():
+            t = self._resolve(env, path)
+            if t is not None and t.shape[0] == env.B:
+                d["row:" + name] = per_race(t)
         return d
 
     def add(self, scene: Dict[str, torch.Tensor]) -> None:
@@ -165,10 +245,39 @@ class SceneReplay:
         if "t_scale" in D:
             env.teacher.speed_scale[rows] = flat("t_scale")
         env._reset_bookkeeping(rows, speed)                  # follower, drivers, latches, counters: from the scene's cars
+        live = self._opp_state(env)                          # ... and then the drivers' own state as it stood (11-16)
+        for k, v in live.items():
+            if k in D:
+                v[rows] = flat(k).to(v.dtype)
+        for name, path in (self.row_paths or {}).items():    # ... and every other per-car tensor (11-16, `ROW_STATE`)
+            t = self._resolve(env, path)
+            if t is not None and ("row:" + name) in D and t.shape[1:] == D["row:" + name].shape[2:]:
+                t[rows] = flat("row:" + name).to(t.dtype)
         env.ep_limit[rows] = self.episode_steps
+        self._refill = (rows, idx.repeat_interleave(M), M)
         self.in_replay[g] = True
         self._loaded.append((g, idx))
         self.n_loaded += int(g.numel())
+
+    #: what `F1VecEnv._fill_scans` rewrites after a reset (a fresh scan stack, the action history) -- put back after it
+    FILLED = ("scan_hist", "hist", "hist2", "_fresh2")
+
+    def after_fill(self, env) -> None:
+        """called by `F1VecEnv._reset_envs` after `_fill_scans`: the scene rows' scan and action histories as they stood
+        (the fill rebuilt them from one fresh scan; the opponents' drivers read them -- 11-16)"""
+        r = getattr(self, "_refill", None)
+        self._refill = None
+        if r is None or self.data is None:
+            return
+        rows, idx_rows, M = r
+        D = self.data
+        g_of = idx_rows                                       # the scene of each row
+        seat = torch.arange(rows.numel(), device=rows.device) % M
+        for name in self.FILLED:
+            k = "row:" + name
+            t = getattr(env, name, None)
+            if k in D and torch.is_tensor(t) and t.shape[1:] == D[k].shape[2:]:
+                t[rows] = D[k][g_of, seat].to(t.dtype)
 
     def take_loaded(self):
         """(races, scene indices) loaded since the last call, for the trainer to put the policy's inputs back"""
