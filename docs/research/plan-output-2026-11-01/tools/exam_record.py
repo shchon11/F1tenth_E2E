@@ -199,6 +199,8 @@ kk = torch.zeros(env.B, PS.N_STEP, device=dev); vv = torch.zeros(env.B, PS.N_STE
 turn = torch.zeros(Bl, device=dev)                          # the frame the newest scan was taken in (SLIP)
 if SLIP:
     R["dlt"] = []; R["vy"] = []
+else:
+    R["vy"] = []                                            # 11-16: the side speed every decision -> slip angle (sliding)
     yaw0 = env.sim.P["mount_yaw"][lid].clone()
     # the scanner does turn with P["mount_yaw"] (a compiled scan path could have kept its angles): a scan taken 0.2 rad round
     # must be the scan before, 0.2 rad of beams along (one control step of a standing car, before the session's first decision)
@@ -260,6 +262,8 @@ t0 = time.time()
 for kd in range(T):
     snap()
     st = env.sim.state[lid].clone()
+    if not SLIP:
+        R["vy"].append(st[:, dyn.IVY].float().cpu())
     if SLIP:
         R["dlt"].append(turn.float().cpu()); R["vy"].append(st[:, dyn.IVY].float().cpu())
         st[:, dyn.IYAW] = st[:, dyn.IYAW] + turn            # the plan starts in the frame its scan was taken in

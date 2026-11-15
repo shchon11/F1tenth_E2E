@@ -23,15 +23,23 @@ s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, ca
                                     randomize=os.environ.get("F1SIM_LAPS_RANDOMIZE", "0") == "1",
                                     plan_speed_scale=float(os.environ.get("F1SIM_SLIP_SPEED_SCALE", "1.0"))), 0)
 env = s["env"]
-beta, alat, steer, v = [], [], [], []
+beta, alat, steer, v, along = [], [], [], [], []
+vx_prev = None
 for k in range(int(secs / 0.025)):
     w._step_once(s)
     st = env.sim.state[0]
     vx, vy, r = float(st[dyn.IVX]), float(st[dyn.IVY]), float(st[dyn.IR])
+    ax_ = 0.0 if vx_prev is None else (vx - vx_prev) / 0.025
+    vx_prev = vx
     if k > 80 and vx > 2.0:
-        beta.append(math.degrees(math.atan2(vy, vx))); alat.append(abs(math.hypot(vx, vy) * r)); v.append(vx)
+        beta.append(math.degrees(math.atan2(vy, vx))); alat.append(abs(math.hypot(vx, vy) * r)); v.append(vx); along.append(ax_)
         steer.append(float(env.last_cmd_raw[0, 0]) if getattr(env, "last_cmd_raw", None) is not None else float(st[dyn.ISTEER]))
-b = np.abs(np.array(beta)); a = np.array(alat); sd = np.array(steer)
+b = np.abs(np.array(beta)); a = np.array(alat); sd = np.array(steer); al = np.convolve(np.array(along), np.ones(8) / 8, mode="same")
+slide = b > 10
+if slide.any():
+    print(f"  10도 넘게 미끄러진 순간 {slide.mean() * 100:.0f} %: 그중 감속 중(-2 m/s^2 아래) {np.mean(al[slide] < -2) * 100:.0f} %, "
+          f"가속 중(+2 위) {np.mean(al[slide] > 2) * 100:.0f} %, 그 사이 {np.mean(np.abs(al[slide]) <= 2) * 100:.0f} % | "
+          f"전체 시간 중 감속 {np.mean(al < -2) * 100:.0f} %, 가속 {np.mean(al > 2) * 100:.0f} %")
 flip = np.mean(np.sign(np.diff(sd))[1:] * np.sign(np.diff(sd))[:-1] < 0) * 100      # steering-rate sign changes per step
 print(f"{os.environ.get('F1SIM_PLAN_MODE', 'map')}{' (예전 MAP)' if os.environ.get('F1SIM_MAP_OLD') == '1' else ''}: 미끄럼각 |beta| 중앙 {np.median(b):.1f}도, "
       f"90 % {np.percentile(b, 90):.1f}도, 5도 넘는 시간 {np.mean(b > 5) * 100:.0f} % | 옆가속 90 % {np.percentile(a, 90):.1f} m/s^2 "
