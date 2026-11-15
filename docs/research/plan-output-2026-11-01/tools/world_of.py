@@ -20,5 +20,9 @@ def map_name(world: str) -> str:
 
 
 def exam_bank(world: str) -> str:
+    """세계 json 의 "exam_bank" (11-15부터 new_map.sh / map_setup 이 씀), 없으면 예전 규칙(지도 이름)."""
+    eb = json.load(open(world)).get("exam_bank")
+    if eb:
+        return os.path.expanduser(str(eb))
     m = map_name(world)
     return EXAM_BANKS if m == "korea_2025_iccas" else f"{EXAM_BANKS}_{m}"

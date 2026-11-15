@@ -290,9 +290,54 @@ def scene_names() -> Tuple[str, ...]:
 
 
 def _real_entries() -> List[TrackEntry]:
-    return [TrackEntry(id=f"real/{slug}", family="real", display=display, legacy=f"real:{legacy}",
-                       source="bag", note=note)
-            for slug, legacy, display, note in _REAL]
+    out = [TrackEntry(id=f"real/{slug}", family="real", display=display, legacy=f"real:{legacy}",
+                      source="bag", note=note)
+           for slug, legacy, display, note in _REAL]
+    return out + _registered_entries(out)
+
+
+def _registered_entries(builtin: Sequence[TrackEntry]) -> List[TrackEntry]:
+    """Maps registered from recordings (`map_registry`): same family, same options, no code edit.
+    A registered id the hand-written list already has is skipped (`maps.refresh_registered` does the
+    same), and a slug that collides gets a number."""
+    from . import map_registry
+    legacy_taken = {e.legacy for e in builtin}
+    slugs = {e.slug for e in builtin}
+    out = []
+    for m in map_registry.entries():
+        if f"real:{m['id']}" in legacy_taken:
+            continue
+        slug = m["slug"] if m["slug"] not in slugs else map_registry.slug_for(m["slug"], slugs)
+        slugs.add(slug)
+        out.append(TrackEntry(id=f"real/{slug}", family="real", display=m["display"], legacy=f"real:{m['id']}",
+                              source="bag", note=m["note"]))
+    return out
+
+
+_REGISTRY_STAMP: List = [None]
+
+
+def _registry_stamp():
+    from . import map_registry
+    d = map_registry.maps_dir()
+    try:
+        return d, os.path.getmtime(d)
+    except OSError:
+        return d, None
+
+
+def refresh_registered(force: bool = False) -> None:
+    """Re-read the map registry: a map registered after this process started becomes a catalogue
+    entry without a restart (`get` and `id_of_legacy` call this on a miss). Cheap when nothing was
+    added: the maps dir's mtime is compared first."""
+    stamp = _registry_stamp()
+    if not force and stamp == _REGISTRY_STAMP[0]:
+        return
+    _REGISTRY_STAMP[0] = stamp
+    REGISTRY.clear()
+    REGISTRY.update({e.id: e for e in _real_entries()})
+    _LEGACY_TO_ID.clear()
+    _LEGACY_TO_ID.update({e.legacy: e.id for e in REGISTRY.values()})
 
 
 def _rt_entry(name: str) -> TrackEntry:
@@ -318,10 +363,12 @@ def _scene_entry(name: str) -> TrackEntry:
                       note="환경 에디터에서 만든 장면")
 
 
-#: Static part of the registry: the measured floors, keyed by id. Everything else is derived by
-#: rule, because `rt`, `gym` and `scene` are directory listings and `gen` is an infinite family.
-REGISTRY: Dict[str, TrackEntry] = {e.id: e for e in _real_entries()}
-_LEGACY_TO_ID: Dict[str, str] = {e.legacy: e.id for e in REGISTRY.values()}
+#: Static part of the registry: the measured floors, keyed by id (the hand-written ones and those
+#: registered from recordings, `map_registry`). Everything else is derived by rule, because `rt`,
+#: `gym` and `scene` are directory listings and `gen` is an infinite family.
+REGISTRY: Dict[str, TrackEntry] = {}
+_LEGACY_TO_ID: Dict[str, str] = {}
+refresh_registered(force=True)
 
 
 def get(track_id: str) -> TrackEntry:
@@ -351,6 +398,9 @@ def get(track_id: str) -> TrackEntry:
     if family == "scene":
         return _scene_entry(slug)
     if family == "real":
+        refresh_registered()                                # registered since this process started?
+        if track_id in REGISTRY:
+            return REGISTRY[track_id]
         raise TrackError(f"실측 맵을 찾지 못했습니다: {track_id!r} "
                          f"(있는 것: {', '.join(sorted(e.id for e in REGISTRY.values()))})")
     raise TrackError(f"알 수 없는 트랙 계열입니다: {family!r} ({'/'.join(FAMILIES)})")
@@ -359,11 +409,16 @@ def get(track_id: str) -> TrackEntry:
 def id_of_legacy(legacy: str) -> Optional[str]:
     """The canonical id for a *base* legacy name, or None when it names no catalogue track."""
     legacy = (legacy or "").strip()
+    if legacy.startswith("user:"):                         # `slam_map --install`'s old spelling of a registered map
+        legacy = "real:" + legacy[5:]
     if legacy in _LEGACY_TO_ID:
         return _LEGACY_TO_ID[legacy]
     family, _, rest = legacy.partition(":")
     if not rest:
         return None
+    if family == "real":
+        refresh_registered()
+        return _LEGACY_TO_ID.get(legacy)
     if family == "rt":
         return f"rt/{_rt_slug(rest)}" if rest in racetrack_dirs() else None
     if family == "gym":
@@ -381,6 +436,7 @@ def catalog(scenes: bool = True, gen_starters: bool = True,
             extra: Sequence[str] = ()) -> List[TrackEntry]:
     """Every base track worth offering, in list order: measured floors, circuits, generated,
     gym, and the editor's own scenes. `extra` pins ids that must appear (the split members)."""
+    refresh_registered()
     out: List[TrackEntry] = list(REGISTRY.values())
     out += [_rt_entry(n) for n in racetrack_dirs()]
     gen_ids: List[str] = []

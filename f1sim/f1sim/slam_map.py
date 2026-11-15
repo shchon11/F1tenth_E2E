@@ -10,11 +10,14 @@ the checks that say whether the map is fit to drive before an hour of training f
     python -m f1sim.slam_map ~/maps/venue.yaml --install venue     # + add it to the catalogue
     python -m f1sim.slam_map ~/maps/venue.png --seed-xy 1.2 0.4 --preview out.png
 
-`--install <id>` writes a cleaned copy into the user map directory, after which the map is an
-ordinary catalogue entry -- `--tracks user:venue`, the console's map list, `real:`-style modifiers
-(`user:venue~rev`), obstacles (`user:venue#line:3`) -- and nothing downstream knows it came from
-SLAM. Without it, the track is still usable by path (`--tracks /path/to/venue.yaml`), which is the
-quicker way to try one.
+`--install <id>` registers the map in the map registry (`map_registry`: one folder per map under
+`$F1SIM_MAPS` or `~/.f1sim/maps`, the pair as built + map.json with its loader keywords), after
+which it is an ordinary catalogue entry -- `--tracks real:venue` (`user:venue` is the same map), the
+console's map list (`real/<slug>`), modifiers (`real:venue~rev`, `real:venue+warp3`), obstacles
+(`real/venue#line:3`) -- and nothing downstream knows it came from SLAM. No code edit per map.
+Without it, the track is still usable by path (`--tracks /path/to/venue.yaml`), which is the
+quicker way to try one. `--from-bag <name>_bag.json` (written by `f1sim.bag_map`) carries the lane
+seed, the driving direction and the provenance over from the recording.
 
 What the defaults assume, and when to override:
 
@@ -40,8 +43,9 @@ import numpy as np
 
 from .track import Track
 
-#: Where `--install` puts maps. Outside the repository on purpose: a venue map is a recording, it
-#: belongs to whoever made it, and a training run that depends on one should say where it came from.
+#: Where `--install` puts maps (`map_registry.maps_dir()`). Outside the repository on purpose: a venue
+#: map is a recording, it belongs to whoever made it, and a training run that depends on one should
+#: say where it came from.
 USER_MAPS = os.path.abspath(os.path.expanduser(
     os.environ.get("F1SIM_MAPS") or os.path.join("~", ".f1sim", "maps")))
 
@@ -75,7 +79,7 @@ class MapReport:
         lines = [
             f"map           {self.name}   ({os.path.basename(self.image_path)} + "
             f"{os.path.basename(self.yaml_path)})",
-            f"grid          {w:.1f} x {h:.1f} m at {100 * self.resolution_m:.0f} mm/cell, "
+            f"grid          {w:.1f} x {h:.1f} m at {1000 * self.resolution_m:.0f} mm/cell, "
             f"{self.free_area_m2:.0f} m^2 of free space",
             f"lane          {self.lane_length_m:.1f} m round, half-width "
             f"{self.half_width_median_m:.2f} m median / {self.half_width_min_m:.2f} m at its tightest",
@@ -213,24 +217,52 @@ def inspect(track: Track, *, build_raceline: bool = True) -> MapReport:
         problems=tuple(problems))
 
 
-def preview(track: Track, out_path: str, *, raceline: bool = True) -> str:
-    """A PNG of what was imported: the grid, the traced lane, and the raceline on it.
+def preview(track: Track, out_path: str, *, raceline: bool = True, path_xy=None, seed_xy=None,
+            title: Optional[str] = None) -> str:
+    """A PNG of what was imported: walls (duct hose / tall), the traced lane centre with arrows in
+    the driving direction, its start, and optionally the raceline, the car's own driven path and the
+    lane seed.
 
     The one check that cannot be done in numbers. A map that traces a plausible loop through the
-    wrong part of the building reports perfectly good widths.
+    wrong part of the building reports perfectly good widths. `raceline` builds the minimum-time
+    line (20-70 min on a new map): off for a quick look.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import font_manager as fm
+    names = {f.name for f in fm.fontManager.ttflist}
+    for f in ("NanumGothic", "Noto Sans CJK KR", "Noto Sans CJK JP"):
+        if f in names:
+            plt.rcParams["font.family"] = f
+            break
     H, W = track.occupancy.shape
     ext = [track.origin[0], track.origin[0] + W * track.resolution,
            track.origin[1], track.origin[1] + H * track.resolution]
-    fig, ax = plt.subplots(figsize=(10, 10 * H / max(W, 1)), dpi=110)
-    ax.imshow(~track.occupancy, cmap="gray", origin="lower", extent=ext, interpolation="nearest")
+    img = np.ones((H, W, 3))
+    img[track.occupancy] = (0.82, 0.82, 0.82)          # solid for the car; the LiDAR sees floor there
+    duct = getattr(track, "duct", None)
+    tall = getattr(track, "tall", None)
+    if duct is not None and tall is not None:
+        img[tall] = (0.25, 0.25, 0.25)
+        img[duct] = (0.95, 0.55, 0.15)
+    else:
+        img[track.occupancy] = (0.25, 0.25, 0.25)
+    fig, ax = plt.subplots(figsize=(8, 8 * H / max(W, 1) * 0.9 + 1.2), dpi=110)
+    ax.imshow(img, origin="lower", extent=ext, interpolation="nearest")
+    if path_xy is not None and len(path_xy):
+        ax.plot(path_xy[:, 0], path_xy[:, 1], "-", color="#2da44e", lw=0.6, alpha=0.6, label="차가 실제로 달린 길 (bag)")
     if track.centerline is not None:
         c = np.vstack([track.centerline, track.centerline[:1]])
-        ax.plot(c[:, 0], c[:, 1], "-", color="#2f81f7", lw=1.6, label="lane centre")
-        ax.plot(c[0, 0], c[0, 1], "o", color="#2f81f7", ms=6)
+        L = float(np.linalg.norm(np.diff(c, axis=0), axis=1).sum())
+        ax.plot(c[:, 0], c[:, 1], "-", color="#2f81f7", lw=1.4, label=f"차선 가운데 ({L:.1f} m 한 바퀴)")
+        n = len(track.centerline)
+        for i in range(0, n, max(1, n // 14)):
+            p, q = track.centerline[i], track.centerline[(i + 3) % n]
+            ax.annotate("", xy=q, xytext=p, arrowprops=dict(arrowstyle="-|>", color="#2f81f7", lw=1.2))
+        ax.plot(c[0, 0], c[0, 1], "o", color="#2f81f7", ms=7, label="센터라인 시작점")
+    if seed_xy is not None:
+        ax.plot(seed_xy[0], seed_xy[1], "x", color="#cf222e", ms=9, mew=2, label="차선 위 기준점")
     if raceline:
         try:
             from .raceline import Raceline
@@ -240,74 +272,113 @@ def preview(track: Track, out_path: str, *, raceline: bool = True) -> str:
                     label=f"raceline ({rl.lap_time:.2f} s)")
         except Exception:
             pass
-    ax.set_title(track.name); ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
-    ax.legend(loc="lower right", fontsize=8); ax.set_aspect("equal")
+    from matplotlib.patches import Patch
+    h, _ = ax.get_legend_handles_labels()
+    h += [Patch(color=(0.95, 0.55, 0.15), label="덕트 호스 (LiDAR가 넘어 봄)"), Patch(color=(0.25, 0.25, 0.25), label="높은 벽 / 밖"),
+          Patch(color=(0.82, 0.82, 0.82), label="못 들어감 (LiDAR엔 바닥)")]
+    ax.legend(handles=h, loc="lower right", fontsize=7)
+    ax.set_title(title or track.name, fontsize=9); ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     fig.tight_layout(); fig.savefig(out_path); plt.close(fig)
     return out_path
 
 
-def install(track: Track, track_id: str, *, out_dir: str = USER_MAPS, overwrite: bool = False) -> str:
-    """Write the cleaned map (+ its centerline) into the user map directory as `user:<track_id>`.
+def install(yaml_path: str, track_id: str, *, boundary: str = "duct", min_clearance: float = 0.35, seed_xy=None,
+            despeckle_m2: float = 0.05, keep_region: bool = True, direction: str = "ccw", note: str = "",
+            display: str = "", source=None, out_dir: Optional[str] = None, overwrite: bool = False) -> str:
+    """Register the map as `real:<track_id>` (also `user:<track_id>`): the pair is copied as built
+    into the map registry (`map_registry`, one folder per map) with the keywords it was checked with,
+    and from then on loads exactly like a `maps.REAL` entry -- no code edit per map.
 
-    The cleaned grid, not a copy of the original: `keep_region`, despeckling and any downsampling
-    are what the track was traced on, so what gets catalogued is what was measured. The centerline
-    travels as a CSV beside it, which is also the file to hand-edit if the trace needs a correction.
-    """
-    d = os.path.join(out_dir, track_id)
-    if os.path.exists(d) and not overwrite:
-        raise FileExistsError(f"{d} exists; pass --overwrite to replace it")
-    if os.path.exists(d):
-        shutil.rmtree(d)
-    os.makedirs(d, exist_ok=True)
-    return track.save_ros_map(d, name=track_id)
-
-
-def user_map_yaml(track_id: str, out_dir: str = USER_MAPS) -> Optional[str]:
-    """The installed map's yaml, or None. Used by `maps.load` to resolve `user:<id>`."""
-    p = os.path.join(out_dir, track_id, track_id + ".yaml")
-    return p if os.path.exists(p) else None
-
-
-def user_map_ids(out_dir: str = USER_MAPS) -> Tuple[str, ...]:
-    if not os.path.isdir(out_dir):
-        return ()
-    return tuple(sorted(n for n in os.listdir(out_dir) if user_map_yaml(n, out_dir)))
+    The map itself rather than the cleaned grid: `keep_region` and despeckling are re-applied by
+    the loader every time, as for the hand-written entries, so what is registered is what was
+    measured and the cleaning can be changed in map.json without re-importing."""
+    from . import map_registry
+    meta = dict(display=display or track_id, note=note or f"{track_id}, from a recording", boundary=boundary,
+                min_clearance=float(min_clearance), seed_xy=[float(v) for v in seed_xy] if seed_xy is not None else None,
+                despeckle_m2=float(despeckle_m2), direction=direction,
+                from_ros_map=dict(keep_region=bool(keep_region)), source=source or {})
+    path = map_registry.install(yaml_path, track_id, meta, root=out_dir, overwrite=overwrite)
+    from . import maps, tracks
+    maps.refresh_registered()
+    tracks.refresh_registered(force=True)
+    return path
 
 
-def main() -> None:
+def user_map_yaml(track_id: str, out_dir: Optional[str] = None) -> Optional[str]:
+    """The registered map's yaml, or None."""
+    from . import map_registry
+    e = map_registry.get(track_id, out_dir)
+    return e["yaml"] if e else None
+
+
+def user_map_ids(out_dir: Optional[str] = None) -> Tuple[str, ...]:
+    from . import map_registry
+    return tuple(e["id"] for e in map_registry.entries(out_dir))
+
+
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser(
         description="Import a SLAM toolbox map (yaml + pgm/png) as a simulator track.")
     ap.add_argument("path", help="the map yaml, its image, or the directory holding them")
     ap.add_argument("--install", metavar="ID", default=None,
-                    help="also catalogue it as user:<ID> (usable as --tracks user:<ID>)")
-    ap.add_argument("--overwrite", action="store_true", help="replace an installed map of the same id")
+                    help="also register it as real:<ID> (= user:<ID>) in the map registry (F1SIM_MAPS, ~/.f1sim/maps)")
+    ap.add_argument("--overwrite", action="store_true", help="replace a registered map of the same id")
     ap.add_argument("--preview", metavar="PNG", default=None, help="write a picture of what was imported")
+    ap.add_argument("--no-raceline", action="store_true",
+                    help="skip the minimum-time raceline in the report and the picture (20-70 min on a new map)")
+    ap.add_argument("--from-bag", metavar="JSON", default=None,
+                    help="bag_map's <name>_bag.json: the lane seed, the driving direction, the driven path and the "
+                         "provenance come from the recording (a scan-built map also gets --despeckle-m2 0.15)")
     ap.add_argument("--boundary", choices=["duct", "wall"], default="duct",
                     help="what the occupied cells are: a duct hose a beam can see over (default), or tall walls")
     ap.add_argument("--seed-xy", type=float, nargs=2, metavar=("X", "Y"), default=None,
                     help="[m] a point on the lane, when the map has more than one free region")
+    ap.add_argument("--direction", choices=["ccw", "cw"], default=None, help="driving direction (default ccw, or the bag's)")
     ap.add_argument("--min-clearance", type=float, default=0.35,
                     help="[m] how far the traced centre stays off anything solid (default 0.35)")
     ap.add_argument("--no-keep-region", action="store_true",
                     help="keep every free region, including scan spray leaking out of the hall")
-    ap.add_argument("--despeckle-m2", type=float, default=0.05,
-                    help="[m^2] occupied specks smaller than this are scan noise, not obstacles")
+    ap.add_argument("--despeckle-m2", type=float, default=None,
+                    help="[m^2] occupied specks smaller than this are scan noise, not obstacles (default 0.05)")
     ap.add_argument("--name", default=None, help="track name in the report (default: the yaml's stem)")
-    a = ap.parse_args()
+    ap.add_argument("--display", default=None, help="name in the console's list (default: the id)")
+    ap.add_argument("--note", default=None, help="one line on where it came from")
+    a = ap.parse_args(argv)
 
-    track = load_map(a.path, boundary=a.boundary, seed_xy=a.seed_xy, min_clearance=a.min_clearance,
-                     keep_region=not a.no_keep_region, despeckle_m2=a.despeckle_m2, name=a.name)
+    bag = {}
+    if a.from_bag:
+        import json
+        bag = json.load(open(a.from_bag))
+    seed_xy = a.seed_xy if a.seed_xy is not None else bag.get("seed_xy")
+    direction = a.direction or bag.get("direction") or "ccw"
+    # a map built from scans keeps whatever stood on the track that day (a box, a parked car): blobs up
+    # to ~0.4 x 0.4 m standing free in the lane are dropped; the team's /map was cleaned by hand already
+    despeckle = a.despeckle_m2 if a.despeckle_m2 is not None else (0.15 if bag.get("source") == "slam" else 0.05)
+    track = load_map(a.path, boundary=a.boundary, seed_xy=seed_xy, min_clearance=a.min_clearance,
+                     keep_region=not a.no_keep_region, despeckle_m2=despeckle, name=a.name or a.install)
+    if track.centerline is not None and direction == "cw":
+        track.centerline = track.centerline[::-1].copy()
     yaml_path, img_path = resolve_paths(a.path)
-    report = inspect(track)
+    report = inspect(track, build_raceline=not a.no_raceline)
     report.yaml_path, report.image_path = yaml_path, img_path
     print(report.text())
     if a.preview:
-        print(f"\npreview      {preview(track, a.preview)}")
+        path_xy = None
+        if bag.get("path_csv") and os.path.exists(bag["path_csv"]):
+            path_xy = np.loadtxt(bag["path_csv"], delimiter=",").reshape(-1, 2)
+        title = (f"{a.install or track.name}: 출처 {bag.get('source', '?')}, 진행 방향 "
+                 f"{'반시계' if direction == 'ccw' else '시계'} (화살표), 한 바퀴 {report.lane_length_m:.1f} m, "
+                 f"가장 좁은 곳 {2 * report.half_width_min_m:.2f} m") if bag else None
+        print(f"\npreview      {preview(track, a.preview, raceline=not a.no_raceline, path_xy=path_xy, seed_xy=seed_xy, title=title)}")
     if a.install:
-        path = install(track, a.install, overwrite=a.overwrite)
+        src = {k: bag.get(k) for k in ("bag", "source", "window", "bagmap_scale", "compare", "slam") if k in bag}
+        path = install(yaml_path, a.install, boundary=a.boundary, min_clearance=a.min_clearance, seed_xy=seed_xy,
+                       despeckle_m2=despeckle, keep_region=not a.no_keep_region, direction=direction,
+                       note=a.note or (f"{a.install}, from {os.path.basename(str(bag.get('bag', '')))} ({bag.get('source')})" if bag else ""),
+                       display=a.display or a.install, source=src, overwrite=a.overwrite)
         print(f"\ninstalled    {path}\n"
-              f"             use it as   --tracks user:{a.install}   "
-              f"(also user:{a.install}~rev, user:{a.install}#line:3)")
+              f"             use it as   --tracks real:{a.install}   (= user:{a.install}; "
+              f"also real:{a.install}~rev, real:{a.install}+warp3)")
     elif report.fits:
         print(f"\n             use it as   --tracks {yaml_path}   "
               f"(or --install <id> to catalogue it)")
