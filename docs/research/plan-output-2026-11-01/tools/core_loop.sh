@@ -21,7 +21,8 @@ export F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555    # the run's tyr
                                                                 # evaluation refused the checkpoint and the u25 row was empty)
 cd /home/shchon11/F1tenth_E2E/f1sim
 L=$A/${NAME}_summary.log
-S="bash $T/slot5060.sh"
+# (11-16) EVAL_GPU=0: evaluations on the 4070 (one at a time, slot4070.sh) -- the 5060 may hold a training rank with no room left
+EG=${EVAL_GPU:-1}; [ "$EG" = 0 ] && S="bash $T/slot4070.sh" || S="bash $T/slot5060.sh"
 for UU in $(seq $U0 $STEP $U1); do
   C=$R/${NAME}/plan_u${UU}.pt
   [ -e $A/${NAME}_u${UU}.done ] && continue
@@ -30,16 +31,16 @@ for UU in $(seq $U0 $STEP $U1); do
   sleep 10
   echo "== u${UU} $(date +%H:%M)" >> $L
   python3 $T/trend_plot.py $NAME $A/${NAME}_trend.png > /dev/null 2>&1 && cp $A/${NAME}_trend.png $A/${NAME}_u${UU}_trend.png
-  CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 $T/plan_validate.py $C ideal ${CORE_VAL_ENVS:-1024} 40 "  u${UU} " 2>&1 | grep "^  u${UU}" >> $D/one_${NAME}_i.log
+  CUDA_VISIBLE_DEVICES=$EG $S timeout 2400 python3 $T/plan_validate.py $C ideal ${CORE_VAL_ENVS:-1024} 40 "  u${UU} " 2>&1 | grep "^  u${UU}" >> $D/one_${NAME}_i.log
   case " 25 50 100 150 " in *" $UU "*) EX=1 ;; *) EX=$(( UU > 150 && UU % 50 == 0 )) ;; esac
   [ "$EX" = 1 ] && bash $T/exam_judge.sh $NAME $UU
-  if [ $((UU % 50)) -eq 0 ]; then
+  if [ $((UU % 50)) -eq 0 ] && [ ! -e $D/.no_video ]; then      # (11-16) 사용자: "영상 뽑지마"
     V=$D/videos/${NAME}_u${UU}_train_4cases
-    CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 -u $T/train_video.py $C ${V}.mp4 40 256 > ${V}.log 2>&1
+    CUDA_VISIBLE_DEVICES=$EG $S timeout 2400 python3 -u $T/train_video.py $C ${V}.mp4 40 256 > ${V}.log 2>&1
     echo done > ${V}.done
   fi
   if [ $((UU % 100)) -eq 0 ]; then
-    CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 -u $T/lap_memory.py $C 256 60 > $A/${NAME}_u${UU}_lapmem.log 2>&1; grep "^요약" $A/${NAME}_u${UU}_lapmem.log >> $L
+    CUDA_VISIBLE_DEVICES=$EG $S timeout 2400 python3 -u $T/lap_memory.py $C 256 60 > $A/${NAME}_u${UU}_lapmem.log 2>&1; grep "^요약" $A/${NAME}_u${UU}_lapmem.log >> $L
   fi
   echo done > $A/${NAME}_u${UU}.done
 done

@@ -5,6 +5,8 @@
 각 `secs` 초를 한 mp4로(0.1 s마다 한 장, 20 fps = 실제의 2배 빠르기). 왼쪽 = 그 차의 트랙 전체, 오른쪽 = 차 주변 8 m.
 인자: checkpoint 출력mp4 [초, 기본 40] [환경 수, 기본 256]"""
 import os, sys
+if os.path.exists("/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out/.no_video"):
+    print("영상 안 만듦 (out/.no_video, 11-16 사용자: \"영상 뽑지마\")"); sys.exit(0)
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
