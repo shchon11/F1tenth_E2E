@@ -183,7 +183,7 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
   <div class="sec"><h2>학습 중 기록</h2><span class="sub">학습 rollout (탐색 잡음 포함)</span>
     <span class="legend" id="legend"></span><span class="sub" id="xnote"></span></div>
   <div class="zbar" id="zbar"><span>가로 범위</span>
-    <button data-z="all" class="on">전체</button><button data-z="fork">재개 이후</button><button data-z="last200">마지막 200 update</button><button data-z="last50">마지막 50</button>
+    <button data-z="cmp" class="on">비교 구간</button><button data-z="all">전체</button><button data-z="fork">재개 이후</button><button data-z="last200">마지막 200 update</button><button data-z="last50">마지막 50</button>
     <span>· 그래프에서 끌면 그 구간 확대 · Shift+끌기 이동 · Ctrl+휠 확대·축소 · 두 번 클릭 전체 · 범례 누르면 그 run 숨김 (모든 그래프가 같이 움직임)</span></div>
   <div class="charts">
     <div class="card"><h3>바퀴 / 분</h3><div class="cbox"><canvas id="c_laps"></canvas></div></div>
@@ -260,6 +260,13 @@ let OFF = {run: 0, ref: 0};
 // (11-16, the user: "사이트에두") where the run (and the runs before it) resumed from a checkpoint: dashed lines on every chart
 let FORKS = [], LASTX = 0;
 if (window.ChartZoom) Chart.register(window.ChartZoom);
+function rangeOf(z) {
+  const lastFork = FORKS.length ? FORKS[FORKS.length - 1].x : null;
+  if (z === "all") return null;
+  if (z === "cmp") return CMPX;
+  if (z === "fork") return lastFork == null ? null : {min: lastFork - 10, max: LASTX + 5};
+  return {min: LASTX - (z === "last200" ? 200 : 50), max: LASTX + 2};
+}
 document.addEventListener("click", (e) => {
   const lg = e.target.closest("#legend > span[data-run]");
   if (lg) {                                                       // a run on/off in every chart
@@ -269,12 +276,8 @@ document.addEventListener("click", (e) => {
   }
   const b = e.target.closest("#zbar button");
   if (!b) return;
-  const z = b.dataset.z, lastFork = FORKS.length ? FORKS[FORKS.length - 1].x : null;
-  const r = z === "all" ? null : z === "fork" ? (lastFork == null ? null : {min: lastFork - 10, max: LASTX + 5})
-          : {min: LASTX - (z === "last200" ? 200 : 50), max: LASTX + 2};
   for (const c of Object.values(charts)) c.resetZoom?.("none");
-  setXR(r);
-  document.querySelectorAll("#zbar button").forEach((x) => x.classList.toggle("on", x === b));
+  setXR(rangeOf(b.dataset.z), null, b.dataset.z);
 });
 const forkLines = {id: "forks", afterDatasetsDraw(c) {
   if (!FORKS.length) return;
@@ -284,7 +287,8 @@ const forkLines = {id: "forks", afterDatasetsDraw(c) {
     const px = x.getPixelForValue(f.x);
     if (px < a.left || px > a.right) return;
     ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
-    ctx.fillText(f.label, px - 3, a.top + 10 + 11 * i);
+    const w = ctx.measureText(f.label).width, left = px - 3 - w < a.left;    // near the left edge: write it to the right of the line
+    ctx.textAlign = left ? "left" : "right"; ctx.fillText(f.label, left ? px + 3 : px - 3, a.top + 10 + 11 * i);
   });
   ctx.restore();
 }};
@@ -292,11 +296,11 @@ const series = (rows, f, off = 0) => rows.map((r) => ({x: r.update - off, y: f(r
 function sm(pts) { const y = smooth(pts.map((p) => p.y)); return pts.map((p, i) => ({x: p.x, y: y[i]})); }
 // (11-16, the user: "그래프 인터랙션좀 가능하게좀") one x range for every chart: drag to zoom, shift+drag to pan, ctrl+wheel,
 // double click = everything; HIDDEN = runs switched off from the legend
-let XR = null, HIDDEN = new Set();
+let XR = null, HIDDEN = new Set(), ZMODE = "cmp", CMPX = null;    // ZMODE: the range button in force; "user" after a drag
 function applyX(c) { c.options.scales.x.min = XR ? XR.min : undefined; c.options.scales.x.max = XR ? XR.max : undefined; }
-function setXR(r, from) {
-  XR = r;
-  document.querySelectorAll("#zbar button").forEach((b) => b.classList.toggle("on", !r && b.dataset.z === "all"));
+function setXR(r, from, mode = "user") {
+  XR = r; ZMODE = mode;
+  document.querySelectorAll("#zbar button").forEach((b) => b.classList.toggle("on", b.dataset.z === mode));
   for (const c of Object.values(charts)) { if (c === from) continue; applyX(c); c.update("none"); }
 }
 function syncFrom({chart: c}) { setXR({min: c.scales.x.min, max: c.scales.x.max}, c); }
@@ -312,13 +316,13 @@ function chart(id, sets, zero = true) {
                       wheel: {enabled: true, modifierKey: "ctrl"}, pinch: {enabled: true}, mode: "x", onZoomComplete: syncFrom},
                pan: {enabled: true, mode: "x", modifierKey: "shift", onPanComplete: syncFrom}},
         tooltip: {callbacks: {title: (it) => (OFF.run || OFF.ref ? "이 지도에서 update " : "update ") + it[0].parsed.x, label: (it) => ` ${it.dataset.label}: ${(+it.parsed.y).toPrecision(3)}`}}},
-      scales: {x: {type: "linear", grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 6}},
+      scales: {x: {type: "linear", bounds: "data", grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 6}},
                y: {beginAtZero: zero, grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 5}}},
       elements: {point: {radius: 0, hitRadius: 8, hoverRadius: 4}, line: {borderWidth: 2, tension: 0.2}}}});
   applyX(charts[id]); charts[id].update("none");
-  $(id).addEventListener("dblclick", () => { charts[id].resetZoom?.("none"); setXR(null); });
+  $(id).addEventListener("dblclick", () => { charts[id].resetZoom?.("none"); setXR(null, null, "all"); });
 }
-const ds = (label, pts, color, dashed) => ({label, runName: String(label).split(" ")[0], data: sm(pts), borderColor: color, backgroundColor: color, borderDash: dashed ? [5, 4] : [], borderWidth: dashed ? 1.6 : 2});
+const ds = (label, pts, color, dashed) => ({label, runName: String(label).split(" ")[0], data: sm(pts), borderColor: color, backgroundColor: color, borderDash: dashed ? [6, 3] : [], borderWidth: dashed ? 2.2 : 2});
 async function j(u) { const r = await fetch(u); if (!r.ok) throw new Error(u); return r.json(); }
 
 // the live strip
@@ -379,6 +383,12 @@ async function refresh() {
   $("runnote").innerHTML = `<span class="chip">${esc(mapName(meta.map))}</span> ` + (meta.parent ? `${esc(meta.parent)} u${meta.cut}의 checkpoint에서 이어 시작 (u${meta.cut}까지 기록은 ${esc(meta.parent)} 것). ` : "") + esc(meta.note || "");
   $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run)"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw dash" style="border-color:var(--ref)"></span>${esc(ref)}</span>` : "");
   LASTX = (own.length ? own[own.length - 1].update : 0) - offOf(run);
+  {   // (11-16, the user: "주황색이 안보이네") the default view starts where the comparison run has data, so both lines show
+    const oR = ref ? offOf(ref) : 0, r0 = rr.length ? rr[0].update - oR : null, f0 = FORKS.length ? FORKS[0].x : null;
+    const lo = r0 != null ? Math.max(0, r0 - 30) : (f0 != null ? Math.max(0, FORKS[FORKS.length - 1].x - 30) : null);
+    CMPX = lo != null && lo > 0 ? {min: lo, max: Math.max(LASTX, rr.length ? rr[rr.length - 1].update - oR : 0) + 3} : null;
+    if (ZMODE !== "user") XR = rangeOf(ZMODE);
+  }
   const R = (r) => r.reward == null ? null : r.reward * 900 * 7.5, C = (r) => r.contact_cost == null ? null : r.contact_cost * 900 * 7.5;
   OFF = {run: offOf(run), ref: ref ? offOf(ref) : 0};
   const two = (f) => [ds(run, series(rows, f, OFF.run), css("--run"), false)].concat(rr.length ? [ds(ref, series(rr, f, OFF.ref), css("--ref"), true)] : []);
