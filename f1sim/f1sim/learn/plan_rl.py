@@ -614,6 +614,9 @@ def main(argv=None):
     ap.add_argument("--scene-min-speed", type=float, default=0.0,
                     help="[m/s] a scene is kept only if the car was at least this fast at the scene's moment (the approach)")
     ap.add_argument("--scene-episode-s", type=float, default=5.0, help="[s] an episode that starts from a scene lasts this long")
+    ap.add_argument("--scene-from", type=int, default=0,
+                    help="no scene is taken before this update, so none is replayed either (11-16, the user: '이 장면 반복을 어떤 비율로, "
+                         "언제 넣을지'): from scratch the first updates' hard contacts are the policy not driving yet, not edge cases")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dist-world", type=int, default=1, help="(11-14) processes training ONE policy together, one per GPU, each "
@@ -1108,7 +1111,7 @@ def main(argv=None):
                     hit = (hd.sum(1) > 0) & ~out["restarted"]
                     hit_take = (hd[:, scene_kinds] > 0).any(1) & ~out["restarted"]
                     # 3. a scene from every one outside a scene episode: the state `lag` decisions earlier in the same episode
-                    take = hit_take & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi)
+                    take = hit_take & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi) & (upd >= args.scene_from)
                     if bool(take.any()):
                         rows_ = torch.nonzero(take)[:, 0]
                         k_ = torch.randint(lag_lo, lag_hi + 1, (rows_.numel(),), device=dev, generator=scene.gen)
