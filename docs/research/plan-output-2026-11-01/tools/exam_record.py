@@ -58,6 +58,11 @@ HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent 
 # before the decision whenever the opponent is within R m ("near:R"), or at random on a share P of the decisions with NO car
 # within R ("rand:P:R", the control: what wiping costs anyway); the wiped rows go to the record ("wiped")
 WIPE = os.environ.get("F1SIM_EXAM_WIPE", "")
+# (11-16) wiping is confounded: a random 5 % wipe alone cost 85 m / 90 s on the empty track (the memory carries the car's own
+# pace). FREEZE keeps the memory as it was (not updated) instead: "near:R" while the opponent is within R m; the control
+# "rand:P:L:R" freezes L decisions from a random start (chance P a decision) in races WITHOUT an opponent -- the cost of a
+# stale memory alone. The frozen rows go to the record ("frozen")
+FREEZE = os.environ.get("F1SIM_EXAM_FREEZE", "")
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -286,8 +291,24 @@ for kd in range(T):
         if getattr(obs, "mem_h", None) is not None:
             obs.mem_h[_wipe] = 0.0
         R.setdefault("wiped", []).append(_wipe.cpu())
+    if FREEZE:
+        _f = FREEZE.split(":")
+        _near = (~absent[others]) & ((env.sim.state[lid, :2] - env.sim.state[others, :2]).norm(dim=1) < float(_f[-1]))
+        if _f[0] == "near":
+            _fz = _near
+        else:
+            if kd == 0:
+                fz_left = torch.zeros(Bl, dtype=torch.long, device=dev)
+            _st = absent[others] & (fz_left == 0) & (torch.rand(Bl, device=dev) < float(_f[1]))
+            fz_left[_st] = int(_f[2])
+            _fz = fz_left > 0
+            fz_left = (fz_left - 1).clamp_min(0)
+        h_prev = obs.mem_h.clone() if getattr(obs, "mem_h", None) is not None else None
+        R.setdefault("frozen", []).append(_fz.cpu())
     cmd_d0 = obs.cmd_d.clone()
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
+    if FREEZE and h_prev is not None:
+        obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
         MEM["mem"].append(obs.mem_h.half().cpu())
     x, y, psi = plan_world(p, st)
@@ -354,7 +375,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["wipe"] = np.array(WIPE)
+D["wipe"] = np.array(WIPE); D["freeze"] = np.array(FREEZE)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
