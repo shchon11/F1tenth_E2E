@@ -42,6 +42,27 @@ for fn in sys.argv[1:]:
     ratio[ok_] = op[:T, :, 3][ok_] / v_solo[np.floor(opos[ok_] / BIN).astype(int) % nb]
     ok = sn > 0
     line = np.stack([sx[ok] / sn[ok], sy[ok] / sn[ok]], 1)
+    if len(line) == 0:
+        # (11-17) a record without solo empty-track sessions (oppexam_run.sh: an opponent in every session): the own line and
+        # its speeds from the same checkpoint's frozen exam (OWN_LINE=that npz, or the exam1 file named after this one)
+        import os, re as _re
+        ref = os.environ.get("OWN_LINE") or os.path.join(os.path.dirname(os.path.abspath(fn)), "..", "exam",
+                                                          _re.sub(r"^oppexam_(.*)_u(\d+)\.npz$", r"exam1_\1_u\2_ideal_uniform_n256.npz",
+                                                                  os.path.basename(fn)))
+        zr = np.load(ref, allow_pickle=True)
+        st_r, rs_r, on_r, sid_r = zr["st"].astype(float), zr["rs"], zr["on"], zr["sid"]
+        Tr = rs_r.shape[0]
+        pos_r = np.mod(L - zr["rem"][:Tr].astype(float), L)
+        k_r = np.floor(np.nan_to_num(pos_r) / BIN).astype(int) % nb
+        sel_r = (~on_r.any(0) & ~(sid_r[0] >= 0).any(-1))[None, :] & ~rs_r & np.isfinite(pos_r)
+        sx, sy, sn = np.zeros(nb), np.zeros(nb), np.zeros(nb)
+        np.add.at(sx, k_r[sel_r], st_r[:Tr, :, 0][sel_r]); np.add.at(sy, k_r[sel_r], st_r[:Tr, :, 1][sel_r]); np.add.at(sn, k_r[sel_r], 1)
+        if "sv" in dir():
+            sv = np.zeros(nb); np.add.at(sv, k_r[sel_r], st_r[:Tr, :, 3][sel_r])
+        line = np.stack([sx[sn > 0] / sn[sn > 0], sy[sn > 0] / sn[sn > 0]], 1)
+        v_solo = np.where(sn > 0, sv / np.maximum(sn, 1), np.nan)          # the speeds behind `ratio` from the same sessions
+        ratio[ok_] = op[:T, :, 3][ok_] / v_solo[np.floor(opos[ok_] / BIN).astype(int) % nb]
+        print(f"  (혼자 세션 없음: 내 길은 {os.path.basename(ref)}에서)")
     tang = np.roll(line, -1, 0) - np.roll(line, 1, 0)
     tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
 
@@ -69,6 +90,8 @@ for fn in sys.argv[1:]:
     off_plan = np.abs(lat(pl[tt, bb])).max(-1)
     # control: the same progress bins, solo empty track (where the car is when no car is ahead)
     cs = sel.copy(); cs[T - NEXT:] = False
+    if not cs.any():                                   # no solo sessions in this record: no control column
+        cs = ahead.copy()
     ct, cb = np.nonzero(cs)
     rng = np.random.default_rng(0)
     pick = rng.choice(len(ct), min(len(ct), 40000), replace=False)
