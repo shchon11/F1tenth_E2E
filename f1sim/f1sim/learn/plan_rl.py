@@ -1329,7 +1329,10 @@ def main(argv=None):
             torch.cuda.empty_cache()
             continue
         tu0 = time.time()
-        if args.accum_actor_auto and (upd - 1) % max(1, args.noise_probe_every) == 0:
+        # (11-16) also whenever there is no measurement yet: a fork (--update-offset) used to start with b_noise = nan, i.e. ONE
+        # minibatch per actor step (64 steps in the first update instead of 4) until the next multiple of the probe period --
+        # every fork's first update moved the policy KL 0.14-0.16 with 42-45 % clipped (kr26c/d u1001, kr26e3 u1476)
+        if args.accum_actor_auto and ((upd - 1) % max(1, args.noise_probe_every) == 0 or not math.isfinite(b_noise)):
             # the policy gradient's noise scale on this rollout, at the policy that drove it (no step): per minibatch the
             # gradient of the policy loss at ratio 1 (advantage normalised per minibatch, as the epochs do), then
             # |G|^2 and tr(Sigma) from the minibatch gradients and their mean (two batch sizes), smoothed over updates
