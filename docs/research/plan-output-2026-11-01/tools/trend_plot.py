@@ -3,7 +3,10 @@
 출력: 강화학습 행동인 첫 단계 조향·속도 두 개, 속도는 run의 --speed-std-floor 하한을 적용한 실제 값), KL, 상자 치운 판, critic 오차.
 --chain 시작run (11-09, 사용자: "아니 씨발 지금 그럼 세개를 학습하고 있는거야?"): 지금 run이 이어 받은 checkpoint(args.json의 init)를 시작 run까지
 거슬러 한 줄로 이어 붙임 -- x = 이어 온 update 수, 단계가 바뀐 곳에 세로 점선 + 그 단계에서 바꾼 것.
-인자: run 이름 출력png --chain 시작run   (예전 방식: run 이름 출력png [비교 run 이름 [비교 run 시작 update 차이]])"""
+인자: run 이름 출력png --chain 시작run   (예전 방식: run 이름 출력png [비교 run 이름 [비교 run 시작 update 차이]])
+(11-16, 사용자: "추세 그림도 그 이어받았던거 그거도 포함해서 그려줘. 언제 재개했는지만 표기") 비교 run 없이 부르면 이어 받은 run은 늘
+처음 run까지 거슬러 이어 그림. --update-offset으로 update 번호를 이어 센 run(kr26c 등)은 번호 그대로 놓음(두 번 더하지 않음).
+세로 점선 = 다시 시작한 곳(이어 받은 checkpoint의 update)."""
 import os, re, sys, json
 import numpy as np
 import matplotlib
@@ -14,7 +17,7 @@ for _f in ("NanumGothic", "Noto Sans CJK KR", "Noto Sans CJK JP"):
     if any(_f == x.name for x in fm.fontManager.ttflist):
         plt.rcParams["font.family"] = _f; break
 plt.rcParams["axes.unicode_minus"] = False
-from run_chain import R, STAGE_NOTE, chain, run_args
+from run_chain import R, STAGE_NOTE, chain, run_args, parent
 
 
 def load(name):
@@ -47,15 +50,19 @@ def smooth(y, n=5):
 
 
 run, out = sys.argv[1], sys.argv[2]
-if len(sys.argv) > 4 and sys.argv[3] == "--chain":
+if (len(sys.argv) > 4 and sys.argv[3] == "--chain") or (len(sys.argv) <= 3 and parent(run)[0]):
     segs = []
     off = 0
-    for name, cut in chain(run, sys.argv[4]):
+    prev_cut = None
+    for name, cut in chain(run, sys.argv[4] if len(sys.argv) > 4 else None):
         rows = [r for r in load(name) if cut is None or r["update"] <= cut]
         if not rows:
             continue
+        if prev_cut is not None and rows[0]["update"] > prev_cut:
+            off = 0                          # --update-offset: this run numbers its updates on from its parent's
         segs.append((name, off, rows))
         off += cut if cut is not None else rows[-1]["update"]
+        prev_cut = cut
     ref = None
 else:
     segs = [(run, 0, load(run))]
@@ -88,10 +95,12 @@ for pi, (ax, (title, fn)) in enumerate(zip(axs.flat, panels)):
             y = fn(rows)
             ax.plot(x, y, color="tab:blue", lw=0.6, alpha=0.4)
             ax.plot(x, smooth(y), color="tab:blue", lw=1.8)
+        x0 = off + float(rows[0]["update"]) - 1          # where this stage started (its parent's checkpoint)
         if si > 0:
-            ax.axvline(off, color="0.3", ls="--", lw=1)
+            ax.axvline(x0, color="0.3", ls="--", lw=1)
         if pi < 4 and len(segs) > 1:      # stage names along the top row
-            ax.text(off + 1, 1.0, f" {name}", transform=ax.get_xaxis_transform(), fontsize=8, color="0.3", va="top", ha="left")
+            ax.text(x0 + 1, 1.0 - 0.07 * si, f" {name}" + (f" 재개 u{int(x0)}" if si > 0 else ""), transform=ax.get_xaxis_transform(),
+                    fontsize=8, color="0.3", va="top", ha="right" if si > 0 else "left")    # stacked: close forks do not overlap
     if fn is None:
         ax.legend(fontsize=8)
     if ref and fn is not None:
@@ -105,7 +114,7 @@ for pi, (ax, (title, fn)) in enumerate(zip(axs.flat, panels)):
 last = segs[-1]
 upto = int(col(last[2], "update")[-1])
 if len(segs) > 1:
-    stages = "  →  ".join(f"{n} ({o + 1}-{o + int(col(r, 'update')[-1])}: {STAGE_NOTE.get(n, '')})" for n, o, r in segs)
+    stages = "  →  ".join(f"{n} (u{o + int(col(r, 'update')[0])}-{o + int(col(r, 'update')[-1])}: {STAGE_NOTE.get(n, '')})" for n, o, r in segs)
     fig.suptitle(f"지금 학습 {run} 추이 (update {upto}까지, 굵은 선 = 5 update 평균, 세로 점선 = 단계가 바뀐 곳)\n{stages}", fontsize=12)
 else:
     fig.suptitle(f"{run} 학습 추이 (update {upto}까지, 굵은 선 = 5 update 평균, 점선 = {ref or '없음'})", fontsize=13)
