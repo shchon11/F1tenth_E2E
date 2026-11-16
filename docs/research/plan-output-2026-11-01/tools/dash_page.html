@@ -371,10 +371,15 @@ function setUrl() { const u = new URL(location); u.searchParams.set("run", $("ru
 async function refresh() {
   const run = $("run").value, ref = $("ref").value;
   const [p, pr] = await Promise.all([j(`/api/progress?run=${run}`), ref && ref !== run ? j(`/api/progress?run=${ref}`) : Promise.resolve({rows: []})]);
-  const s = p.status, own = p.rows, rr = pr.rows, meta = runsCache.find((r) => r.name === run) || {};
+  // (11-16, the user: "왜자꾸 끊기게 냅두는건데 이어서 한건 그 전까지 표기해놓으라니까") the comparison run is drawn with the runs it
+  // was continued from too, like the run itself -- not starting in mid-air at its fork
+  const s = p.status, own = p.rows, rrOwn = pr.rows || [], meta = runsCache.find((r) => r.name === run) || {};
+  const rr = (pr.chain || []).flatMap((c) => c.rows).concat(rrOwn);
   const ch = p.chain || [];                                         // the runs this one continued from, oldest first
   const rows = ch.flatMap((c) => c.rows).concat(own);              // drawn as one line, the resume points dashed
-  FORKS = ch.map((c) => ({x: c.cut - offOf(run), label: `${c.next} 재개 u${c.cut}`}));
+  FORKS = ch.map((c) => ({x: c.cut - offOf(run), label: `${c.next} 재개 u${c.cut}`}))
+    .concat((pr.chain || []).filter((c) => !ch.some((d) => d.cut === c.cut && d.next === c.next))
+      .map((c) => ({x: c.cut - (ref ? offOf(ref) : 0), label: `${c.next} 재개 u${c.cut}`})));
   const pct = s.total ? 100 * s.update / s.total : 0, L = own[own.length - 1] || {};
   const live = s.alive > 0 ? '<span class="chip live">학습 중</span>' : '<span class="chip">멈춤</span>';
   $("kpis").innerHTML = `
@@ -388,9 +393,12 @@ async function refresh() {
   $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run);border-top-width:3.6px;opacity:.6"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw" style="border-color:var(--ref);border-top-width:2px"></span>${esc(ref)}</span>` : "");
   LASTX = (own.length ? own[own.length - 1].update : 0) - offOf(run);
   {   // (11-16, the user: "주황색이 안보이네") the default view starts where the comparison run has data, so both lines show
-    const oR = ref ? offOf(ref) : 0, r0 = rr.length ? rr[0].update - oR : null, f0 = FORKS.length ? FORKS[0].x : null;
-    const lo = r0 != null ? Math.max(0, r0 - 30) : (f0 != null ? Math.max(0, FORKS[FORKS.length - 1].x - 30) : null);
-    CMPX = lo != null && lo > 0 ? {min: lo, max: Math.max(LASTX, rr.length ? rr[rr.length - 1].update - oR : 0) + 3} : null;
+    const oR = ref ? offOf(ref) : 0, r0 = rrOwn.length ? rrOwn[0].update - oR : null, f0 = FORKS.length ? FORKS[0].x : null;
+    // from where the earlier of the two runs' OWN updates begin (the run may be behind the comparison run, or ahead)
+    const s0 = own.length ? own[0].update - offOf(run) : null;
+    const starts = [r0, s0].filter((v) => v != null && v > 1);
+    const lo = starts.length ? Math.max(0, Math.min(...starts) - 30) : (f0 != null ? Math.max(0, FORKS[FORKS.length - 1].x - 30) : null);
+    CMPX = lo != null && lo > 0 ? {min: lo, max: Math.max(LASTX, rrOwn.length ? rrOwn[rrOwn.length - 1].update - oR : 0) + 3} : null;
     if (ZMODE !== "user") XR = rangeOf(ZMODE);
   }
   const R = (r) => r.reward == null ? null : r.reward * 900 * 7.5, C = (r) => r.contact_cost == null ? null : r.contact_cost * 900 * 7.5;
