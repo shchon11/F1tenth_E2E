@@ -479,6 +479,10 @@ def main(argv=None):
                     "sizes, dir_<key> unit vectors over its trainable weights, + = the way that drove better). Every optimizer step's "
                     "move of the actor is projected on each, and in the first epoch each loss term's gradient too; saved per update "
                     "as <run>/track/t<N>.npz. Training itself is unchanged")
+    ap.add_argument("--lr-warmup", type=int, default=0,
+                    help="the first N updates of this run (a fork's too) step at k/N of the learning rate, k = 1..N (11-16: a fork "
+                         "starts Adam from nothing -- its first update moved the policy KL 0.11-0.18 against 0.006-0.01 after, "
+                         "and the exam after kr26e3's fork was worse until the next one)")
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
     ap.add_argument("--stall-s", type=float, default=0.0,
@@ -719,6 +723,8 @@ def main(argv=None):
             raise SystemExit("--self-opp needs --format v2 and a world with another car")
         drv.opp = SelfOpponents(env, lim, args.self_opp, seed=args.seed, max_pool=args.self_opp_pool, p_newest=args.self_opp_newest,
                                 vcap=args.self_opp_vcap)
+        opp_index = torch.full((env.B,), -1, dtype=torch.long, device=dev)      # env row -> its place in drv.opp's rows
+        opp_index[drv.opp.rows] = torch.arange(drv.opp.rows.numel(), device=dev)
     hold = args.hold_p > 0
     if hold and not v2:
         raise SystemExit("--hold-p needs --format v2 or v3")
@@ -770,8 +776,8 @@ def main(argv=None):
               if args.level_replay > 0 else None)
     scene = None
     if args.scene_replay > 0:
-        if not v2 or v3 or levels is not None or args.self_opp > 0 or args.hold_p > 0:
-            raise SystemExit("--scene-replay needs --format v2, without --level-replay / --self-opp / --hold-p")
+        if not v2 or v3 or levels is not None or args.hold_p > 0:
+            raise SystemExit("--scene-replay needs --format v2, without --level-replay / --hold-p")
         if not torch.equal(lid, torch.arange(Bl, device=dev) * env.M):
             raise SystemExit("--scene-replay: the learner is expected in the first seat of every race")
         if args.scene_replay_auto:
@@ -965,8 +971,9 @@ def main(argv=None):
             noise_rho.fill_(_rho)
             if args.noise_corr_steer:
                 noise_rho[PS.N_STEP:] = 0.0
+        _wu = min(1.0, (upd - args.update_offset) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
         for gp in opt.param_groups + (opt_c.param_groups if opt_c is not None else []):
-            gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
+            gp["lr"] = (args.lr + (args.lr_end - args.lr) * frac) * _wu
         if upd <= args.actor_freeze:
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
         S, X, PV, U, LP, V, R, D, VT, FM, HM = [], [], [], [], [], [], [], [], [], [], []
@@ -1136,6 +1143,12 @@ def main(argv=None):
                     # 1. races that began from a scene in this decision: the policy's inputs as they were at the scene (the
                     #    env's part is in place); before any scene is added below -- the store's places are reused
                     g_l, i_l = scene.take_loaded()
+                    if g_l.numel() and drv.opp is not None:
+                        # (11-16) --self-opp: a scene is replayed with the scripted driver it was taken with (scenes come
+                        # from races without a copy, below); `SelfOpponents.after` has drawn this race already
+                        oi_ = opp_index[others[g_l, 0]]
+                        drv.opp.on[oi_] = False
+                        drv.opp.obs.reset_rows(oi_)
                     if g_l.numel():
                         Dd = scene.data
                         obs.scans[g_l] = Dd["pol_scans"][i_l]
@@ -1155,6 +1168,9 @@ def main(argv=None):
                     hit_take = (hd[:, scene_kinds] > 0).any(1) & ~out["restarted"]
                     # 3. a scene from every one outside a scene episode: the state `lag` decisions earlier in the same episode
                     take = hit_take & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi) & (upd >= args.scene_from)
+                    if drv.opp is not None:
+                        # (11-16) no scene from a race a copy drives in: the copy's own inputs and memory are not in a scene
+                        take = take & ~drv.opp.on[opp_index[others[:, 0]]]
                     if bool(take.any()):
                         rows_ = torch.nonzero(take)[:, 0]
                         k_ = torch.randint(lag_lo, lag_hi + 1, (rows_.numel(),), device=dev, generator=scene.gen)
