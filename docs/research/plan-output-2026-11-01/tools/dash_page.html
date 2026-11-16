@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>F1TENTH 학습 현황</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
 :root {
   color-scheme: light;
@@ -92,6 +94,11 @@ button.lnk { border: 0; background: none; color: var(--run); font: inherit; font
 button.pill { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
 /* charts */
 .legend { display: flex; gap: 16px; align-items: center; font-size: 12.5px; color: var(--ink2); }
+.legend > span { cursor: pointer; user-select: none; }
+.legend > span.off { opacity: .35; text-decoration: line-through; }
+.zbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0 10px; font-size: 12px; color: var(--muted); }
+.zbar button { font: inherit; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--grid); background: transparent; color: var(--ink2); cursor: pointer; }
+.zbar button.on { background: var(--run); color: #fff; border-color: var(--run); }
 .sw { display: inline-block; width: 22px; height: 0; border-top: 2.5px solid; vertical-align: middle; margin-right: 6px; }
 .sw.dash { border-top-style: dashed; }
 .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: 12px; }
@@ -175,6 +182,9 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
 
   <div class="sec"><h2>학습 중 기록</h2><span class="sub">학습 rollout (탐색 잡음 포함)</span>
     <span class="legend" id="legend"></span><span class="sub" id="xnote"></span></div>
+  <div class="zbar" id="zbar"><span>가로 범위</span>
+    <button data-z="all" class="on">전체</button><button data-z="fork">재개 이후</button><button data-z="last200">마지막 200 update</button><button data-z="last50">마지막 50</button>
+    <span>· 그래프에서 끌면 그 구간 확대 · Shift+끌기 이동 · Ctrl+휠 확대·축소 · 두 번 클릭 전체 · 범례 누르면 그 run 숨김 (모든 그래프가 같이 움직임)</span></div>
   <div class="charts">
     <div class="card"><h3>바퀴 / 분</h3><div class="cbox"><canvas id="c_laps"></canvas></div></div>
     <div class="card"><h3>평균 속도 <span class="sub">m/s</span></h3><div class="cbox"><canvas id="c_speed"></canvas></div></div>
@@ -183,6 +193,10 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
       <div class="trio"><div><h4>벽</h4><div class="cbox"><canvas id="c_cw"></canvas></div></div>
         <div><h4>상자</h4><div class="cbox"><canvas id="c_cb"></canvas></div></div>
         <div><h4>상대 차</h4><div class="cbox"><canvas id="c_cc2"></canvas></div></div></div></div>
+    <div class="card"><h3>박는 plan 비율 <span class="sub">% · 벽·상자·차를 지나가는 plan</span></h3><div class="cbox"><canvas id="c_phit"></canvas></div></div>
+    <div class="card"><h3>plan ↔ 실제로 간 길 <span class="sub">cm · plan의 0.5초 점</span></h3><div class="cbox"><canvas id="c_t05"></canvas></div></div>
+    <div class="card"><h3>plan ↔ 실제로 간 길 <span class="sub">cm · plan의 1.0초 점</span></h3><div class="cbox"><canvas id="c_t10"></canvas></div></div>
+    <div class="card"><h3>속도 짐작 오차 <span class="sub">m/s · policy가 짐작한 속도 - 실제</span></h3><div class="cbox"><canvas id="c_vest"></canvas></div></div>
     <div class="card"><h3>학습 보상 <span class="sub">90 s당 초 환산</span></h3><div class="cbox"><canvas id="c_rew"></canvas></div></div>
     <div class="card"><h3>접촉 값 <span class="sub">90 s당 초, 보상에서 빠진 몫</span></h3><div class="cbox"><canvas id="c_cc"></canvas></div></div>
     <div class="card"><h3>KL <span class="sub">update마다 policy가 바뀐 정도</span></h3><div class="cbox"><canvas id="c_kl"></canvas></div></div>
@@ -244,7 +258,24 @@ function smooth(a) {
 }
 let OFF = {run: 0, ref: 0};
 // (11-16, the user: "사이트에두") where the run (and the runs before it) resumed from a checkpoint: dashed lines on every chart
-let FORKS = [];
+let FORKS = [], LASTX = 0;
+if (window.ChartZoom) Chart.register(window.ChartZoom);
+document.addEventListener("click", (e) => {
+  const lg = e.target.closest("#legend > span[data-run]");
+  if (lg) {                                                       // a run on/off in every chart
+    const n = lg.dataset.run; HIDDEN.has(n) ? HIDDEN.delete(n) : HIDDEN.add(n); lg.classList.toggle("off", HIDDEN.has(n));
+    for (const c of Object.values(charts)) { c.data.datasets.forEach((d) => { d.hidden = HIDDEN.has(d.runName); }); c.update("none"); }
+    return;
+  }
+  const b = e.target.closest("#zbar button");
+  if (!b) return;
+  const z = b.dataset.z, lastFork = FORKS.length ? FORKS[FORKS.length - 1].x : null;
+  const r = z === "all" ? null : z === "fork" ? (lastFork == null ? null : {min: lastFork - 10, max: LASTX + 5})
+          : {min: LASTX - (z === "last200" ? 200 : 50), max: LASTX + 2};
+  for (const c of Object.values(charts)) c.resetZoom?.("none");
+  setXR(r);
+  document.querySelectorAll("#zbar button").forEach((x) => x.classList.toggle("on", x === b));
+});
 const forkLines = {id: "forks", afterDatasetsDraw(c) {
   if (!FORKS.length) return;
   const {ctx, chartArea: a, scales: {x}} = c;
@@ -259,19 +290,35 @@ const forkLines = {id: "forks", afterDatasetsDraw(c) {
 }};
 const series = (rows, f, off = 0) => rows.map((r) => ({x: r.update - off, y: f(r)}));
 function sm(pts) { const y = smooth(pts.map((p) => p.y)); return pts.map((p, i) => ({x: p.x, y: y[i]})); }
+// (11-16, the user: "그래프 인터랙션좀 가능하게좀") one x range for every chart: drag to zoom, shift+drag to pan, ctrl+wheel,
+// double click = everything; HIDDEN = runs switched off from the legend
+let XR = null, HIDDEN = new Set();
+function applyX(c) { c.options.scales.x.min = XR ? XR.min : undefined; c.options.scales.x.max = XR ? XR.max : undefined; }
+function setXR(r, from) {
+  XR = r;
+  document.querySelectorAll("#zbar button").forEach((b) => b.classList.toggle("on", !r && b.dataset.z === "all"));
+  for (const c of Object.values(charts)) { if (c === from) continue; applyX(c); c.update("none"); }
+}
+function syncFrom({chart: c}) { setXR({min: c.scales.x.min, max: c.scales.x.max}, c); }
 function chart(id, sets, zero = true) {
   const grid = css("--grid"), ink = css("--muted");
-  if (charts[id]) { charts[id].data.datasets = sets; charts[id].update("none"); return; }
+  sets.forEach((d) => { d.hidden = HIDDEN.has(d.runName); });
+  if (charts[id]) { charts[id].data.datasets = sets; applyX(charts[id]); charts[id].update("none"); return; }
   charts[id] = new Chart($(id), {type: "line", data: {datasets: sets}, plugins: [forkLines],
     options: {responsive: true, maintainAspectRatio: false, animation: false, parsing: false, normalized: true,
       interaction: {mode: "nearest", axis: "x", intersect: false},
       plugins: {legend: {display: false},
+        zoom: {zoom: {drag: {enabled: true, backgroundColor: "rgba(42,125,225,.12)", borderColor: "rgba(42,125,225,.5)", borderWidth: 1},
+                      wheel: {enabled: true, modifierKey: "ctrl"}, pinch: {enabled: true}, mode: "x", onZoomComplete: syncFrom},
+               pan: {enabled: true, mode: "x", modifierKey: "shift", onPanComplete: syncFrom}},
         tooltip: {callbacks: {title: (it) => (OFF.run || OFF.ref ? "이 지도에서 update " : "update ") + it[0].parsed.x, label: (it) => ` ${it.dataset.label}: ${(+it.parsed.y).toPrecision(3)}`}}},
       scales: {x: {type: "linear", grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 6}},
                y: {beginAtZero: zero, grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 5}}},
       elements: {point: {radius: 0, hitRadius: 8, hoverRadius: 4}, line: {borderWidth: 2, tension: 0.2}}}});
+  applyX(charts[id]); charts[id].update("none");
+  $(id).addEventListener("dblclick", () => { charts[id].resetZoom?.("none"); setXR(null); });
 }
-const ds = (label, pts, color, dashed) => ({label, data: sm(pts), borderColor: color, backgroundColor: color, borderDash: dashed ? [5, 4] : [], borderWidth: dashed ? 1.6 : 2});
+const ds = (label, pts, color, dashed) => ({label, runName: String(label).split(" ")[0], data: sm(pts), borderColor: color, backgroundColor: color, borderDash: dashed ? [5, 4] : [], borderWidth: dashed ? 1.6 : 2});
 async function j(u) { const r = await fetch(u); if (!r.ok) throw new Error(u); return r.json(); }
 
 // the live strip
@@ -330,7 +377,8 @@ async function refresh() {
     <div class="kpi"><span>바퀴/분 · 속도</span><b>${f1(L.laps_per_min, 2)}</b> <small>· ${f1(L.speed, 2)} m/s</small></div>
     <div class="kpi"><span>마지막 기록</span><b style="font-size:15px">${fmtTime(s.last_mtime)}</b></div>`;
   $("runnote").innerHTML = `<span class="chip">${esc(mapName(meta.map))}</span> ` + (meta.parent ? `${esc(meta.parent)} u${meta.cut}의 checkpoint에서 이어 시작 (u${meta.cut}까지 기록은 ${esc(meta.parent)} 것). ` : "") + esc(meta.note || "");
-  $("legend").innerHTML = `<span><span class="sw" style="border-color:var(--run)"></span>${esc(run)}</span>` + (rr.length ? `<span><span class="sw dash" style="border-color:var(--ref)"></span>${esc(ref)}</span>` : "");
+  $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run)"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw dash" style="border-color:var(--ref)"></span>${esc(ref)}</span>` : "");
+  LASTX = (own.length ? own[own.length - 1].update : 0) - offOf(run);
   const R = (r) => r.reward == null ? null : r.reward * 900 * 7.5, C = (r) => r.contact_cost == null ? null : r.contact_cost * 900 * 7.5;
   OFF = {run: offOf(run), ref: ref ? offOf(ref) : 0};
   const two = (f) => [ds(run, series(rows, f, OFF.run), css("--run"), false)].concat(rr.length ? [ds(ref, series(rr, f, OFF.ref), css("--ref"), true)] : []);
@@ -340,6 +388,10 @@ async function refresh() {
   chart("c_cw", two((r) => r.contacts_wall_per_min));
   chart("c_cb", two((r) => r.contacts_prop_per_min));
   chart("c_cc2", two((r) => r.contacts_car_per_min));
+  chart("c_phit", two((r) => r.plan_hit_share == null ? null : 100 * r.plan_hit_share));
+  chart("c_t05", two((r) => r.tail_next_05 == null ? null : 100 * r.tail_next_05));
+  chart("c_t10", two((r) => r.tail_driven_10 == null ? null : 100 * r.tail_driven_10));
+  chart("c_vest", two((r) => r.vest_mae));
   chart("c_rew", two(R), false);
   chart("c_cc", two(C), false);
   chart("c_kl", two((r) => r.kl));
