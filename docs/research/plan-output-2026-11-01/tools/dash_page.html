@@ -243,12 +243,26 @@ function smooth(a) {
   return a.map((v, i) => { const w = a.slice(Math.max(0, i - 4), i + 1).filter((x) => x != null); return w.length ? w.reduce((s, x) => s + x, 0) / w.length : null; });
 }
 let OFF = {run: 0, ref: 0};
+// (11-16, the user: "사이트에두") where the run (and the runs before it) resumed from a checkpoint: dashed lines on every chart
+let FORKS = [];
+const forkLines = {id: "forks", afterDatasetsDraw(c) {
+  if (!FORKS.length) return;
+  const {ctx, chartArea: a, scales: {x}} = c;
+  ctx.save(); ctx.strokeStyle = css("--muted"); ctx.fillStyle = css("--muted"); ctx.setLineDash([4, 4]); ctx.lineWidth = 1; ctx.font = "10px sans-serif"; ctx.textAlign = "right";
+  FORKS.forEach((f, i) => {
+    const px = x.getPixelForValue(f.x);
+    if (px < a.left || px > a.right) return;
+    ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
+    ctx.fillText(f.label, px - 3, a.top + 10 + 11 * i);
+  });
+  ctx.restore();
+}};
 const series = (rows, f, off = 0) => rows.map((r) => ({x: r.update - off, y: f(r)}));
 function sm(pts) { const y = smooth(pts.map((p) => p.y)); return pts.map((p, i) => ({x: p.x, y: y[i]})); }
 function chart(id, sets, zero = true) {
   const grid = css("--grid"), ink = css("--muted");
   if (charts[id]) { charts[id].data.datasets = sets; charts[id].update("none"); return; }
-  charts[id] = new Chart($(id), {type: "line", data: {datasets: sets},
+  charts[id] = new Chart($(id), {type: "line", data: {datasets: sets}, plugins: [forkLines],
     options: {responsive: true, maintainAspectRatio: false, animation: false, parsing: false, normalized: true,
       interaction: {mode: "nearest", axis: "x", intersect: false},
       plugins: {legend: {display: false},
@@ -302,8 +316,11 @@ function setUrl() { const u = new URL(location); u.searchParams.set("run", $("ru
 async function refresh() {
   const run = $("run").value, ref = $("ref").value;
   const [p, pr] = await Promise.all([j(`/api/progress?run=${run}`), ref && ref !== run ? j(`/api/progress?run=${ref}`) : Promise.resolve({rows: []})]);
-  const s = p.status, rows = p.rows, rr = pr.rows, meta = runsCache.find((r) => r.name === run) || {};
-  const pct = s.total ? 100 * s.update / s.total : 0, L = rows[rows.length - 1] || {};
+  const s = p.status, own = p.rows, rr = pr.rows, meta = runsCache.find((r) => r.name === run) || {};
+  const ch = p.chain || [];                                         // the runs this one continued from, oldest first
+  const rows = ch.flatMap((c) => c.rows).concat(own);              // drawn as one line, the resume points dashed
+  FORKS = ch.map((c) => ({x: c.cut - offOf(run), label: `${c.next} 재개 u${c.cut}`}));
+  const pct = s.total ? 100 * s.update / s.total : 0, L = own[own.length - 1] || {};
   const live = s.alive > 0 ? '<span class="chip live">학습 중</span>' : '<span class="chip">멈춤</span>';
   $("kpis").innerHTML = `
     <div class="kpi"><span>상태</span>${live}<div><small>${s.jobs.length ? "평가 중: " + esc(s.jobs[0].split(" ")[0]) : "평가 대기"}</small></div></div>

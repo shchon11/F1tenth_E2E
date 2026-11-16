@@ -121,6 +121,24 @@ def progress(name):
     return rows
 
 
+def chain_rows(name):
+    """(11-16, the user: "사이트에두") the runs this one was continued from, oldest first, each up to the update it was taken
+    at -- drawn before the run's own rows with a dashed line where it resumed. Only a run that numbers its updates on from
+    its parent's (--update-offset) and trains on the same map (else the x axis would not line up)."""
+    out, cur = [], name
+    for _ in range(10):
+        par, cut = parent(cur)
+        if not par or not ok_run(par) or run_map(par) != run_map(cur):
+            break
+        own = memo(("p", cur), 10, lambda n=cur: progress(n))
+        if not own or (own[0].get("update") or 0) <= cut:
+            break
+        rows = [r for r in memo(("p", par), 10, lambda n=par: progress(n)) if (r.get("update") or 0) <= cut]
+        out.append({"run": par, "cut": cut, "next": cur, "rows": rows})
+        cur = par
+    return out[::-1]
+
+
 def status(name):
     rows = progress(name)
     try:
@@ -327,7 +345,8 @@ class H(BaseHTTPRequestHandler):
             if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes", "/api/overview") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":
-                return self._json({"rows": memo(("p", name), 10, lambda: progress(name)), "status": memo(("s", name), 10, lambda: status(name))})
+                return self._json({"rows": memo(("p", name), 10, lambda: progress(name)), "status": memo(("s", name), 10, lambda: status(name)),
+                                   "chain": memo(("c", name), 30, lambda: chain_rows(name))})
             if u.path == "/api/table":
                 return self._json(memo(("t", name), 60, lambda: table(name)))
             if u.path == "/api/header":
