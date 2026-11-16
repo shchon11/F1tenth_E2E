@@ -166,7 +166,7 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     <div class="controls">
       <label>run <select id="run"></select></label>
       <label>비교 run <select id="ref"></select></label>
-      <label><input type="checkbox" id="smooth" checked> 5 update 평균</label>
+      <label title="TensorBoard처럼 지수 이동 평균(앞부분 치우침 보정). 0 = 원래 값">EMA <input type="range" id="ema" min="0" max="0.99" step="0.01" value="0.8" style="width:120px;vertical-align:middle"> <b id="ema_v">0.80</b></label>
     </div>
     <div class="kpis" id="kpis"></div>
     <div class="note" id="runnote"></div>
@@ -252,9 +252,13 @@ function showTab(t) {
 }
 
 // charts
+// (11-16, the user: "mean average 5 체크 말고 그래프쪽에서 ema 값 조정할 수 있게") exponential moving average with the start-up
+// bias taken out (TensorBoard's smoothing): weight w on the past, 0 = the raw values
 function smooth(a) {
-  if (!$("smooth").checked) return a;
-  return a.map((v, i) => { const w = a.slice(Math.max(0, i - 4), i + 1).filter((x) => x != null); return w.length ? w.reduce((s, x) => s + x, 0) / w.length : null; });
+  const w = +$("ema").value;
+  if (!(w > 0)) return a;
+  let last = 0, n = 0;
+  return a.map((v) => { if (v == null || !isFinite(v)) return null; last = last * w + (1 - w) * v; n += 1; return last / (1 - Math.pow(w, n)); });
 }
 let OFF = {run: 0, ref: 0};
 // (11-16, the user: "사이트에두") where the run (and the runs before it) resumed from a checkpoint: dashed lines on every chart
@@ -533,7 +537,10 @@ async function all() {
 }
 (async () => {
   await loadRuns();
-  $("run").onchange = () => { pickRef(); all(); }; $("ref").onchange = all; $("smooth").onchange = refresh;
+  $("run").onchange = () => { pickRef(); all(); }; $("ref").onchange = all; $("ema").oninput = () => { $("ema_v").textContent = (+$("ema").value).toFixed(2); };
+  $("ema").onchange = () => { try { localStorage.setItem("dash_ema", $("ema").value); } catch (e) {} const u = new URL(location); u.searchParams.set("ema", $("ema").value); history.replaceState(null, "", u); refresh(); };
+  { const e0 = new URL(location).searchParams.get("ema") ?? (() => { try { return localStorage.getItem("dash_ema"); } catch (e) { return null; } })();
+    if (e0 != null && isFinite(+e0)) { $("ema").value = e0; $("ema_v").textContent = (+e0).toFixed(2); } }
   await loadLive();
   await all();
   const t = q.get("tab"); if (t && t !== "train") showTab(t);
