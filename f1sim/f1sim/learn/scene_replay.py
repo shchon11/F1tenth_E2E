@@ -140,6 +140,8 @@ in_replay""".split())
         self._loaded = []                                         # (races, scene indices) since `take_loaded`
         self.n_loaded = 0
         self.n_added = 0
+        #: (11-16) the chance a designated race that resets takes a scene (1 = always; --scene-replay-auto moves it)
+        self.p_load = 1.0
         #: (11-16) every per-car tensor a scene carries besides the named ones: {name: path}, fixed at the first capture
         self.row_paths: Optional[Dict[str, tuple]] = None
 
@@ -209,6 +211,11 @@ in_replay""".split())
         if self.to_boundary > 0:
             env.ep_limit[rows] = int(self.to_boundary)       # the fresh grid lasts until the decision is over
             return
+        if self.p_load < 1.0:                               # (11-16) --scene-replay-auto: only this part of them takes a scene;
+            keep = torch.rand(g.numel(), device=dev, generator=self.gen) < self.p_load    # the rest drive a fresh grid
+            g = g[keep]
+            if g.numel() == 0:
+                return
         idx = torch.randint(self.n, (g.numel(),), device=dev, generator=self.gen)
         self.load(g, idx)
 

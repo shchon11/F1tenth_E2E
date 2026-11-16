@@ -620,6 +620,11 @@ def main(argv=None):
     ap.add_argument("--scene-min-speed", type=float, default=0.0,
                     help="[m/s] a scene is kept only if the car was at least this fast at the scene's moment (the approach)")
     ap.add_argument("--scene-episode-s", type=float, default=5.0, help="[s] an episode that starts from a scene lasts this long")
+    ap.add_argument("--scene-replay-auto", default="",
+                    help="LO,HI: the share of races in scene episodes follows how often the replayed scenes still end in a hard "
+                         "contact (EMA over updates): <= 20 %% -> LO, >= 60 %% -> HI, linear between (11-16, the user: edge-case "
+                         "scenes raised hard when a bias has formed and lowered once solved -- kr26c forgot the spots within "
+                         "100-200 updates without scenes, kr26e kept losing speed at a fixed 25 %%). --scene-replay must be HI")
     ap.add_argument("--scene-from", type=int, default=0,
                     help="no scene is taken before this update, so none is replayed either (11-16, the user: '이 장면 반복을 어떤 비율로, "
                          "언제 넣을지'): from scratch the first updates' hard contacts are the policy not driving yet, not edge cases")
@@ -754,11 +759,16 @@ def main(argv=None):
             raise SystemExit("--scene-replay needs --format v2, without --level-replay / --self-opp / --hold-p")
         if not torch.equal(lid, torch.arange(Bl, device=dev) * env.M):
             raise SystemExit("--scene-replay: the learner is expected in the first seat of every race")
+        if args.scene_replay_auto:
+            _lo, _hi = (float(x) for x in args.scene_replay_auto.split(","))
+            if abs(_hi - args.scene_replay) > 1e-9 or not 0.0 <= _lo <= _hi:
+                raise SystemExit("--scene-replay-auto LO,HI needs --scene-replay HI and 0 <= LO <= HI")
         scene = SceneReplay(env, args.scene_replay, args.scene_size, int(round(args.scene_episode_s / PS.DT)) * PS.SUB,
                             seed=args.seed)
         env.scene_replay = scene
         drv.scene = scene
     lag_lo, lag_hi = max(args.scene_lag // 2, 1), args.scene_lag + args.scene_lag // 2
+    scene_rehit = None                                    # --scene-replay-auto: EMA of the scene episodes' hard-contact share
     _KIND = {"wall": 0, "box": 1, "car": 2}
     scene_kinds = torch.tensor([_KIND[k.strip()] for k in args.scene_kinds.split(",") if k.strip()], dtype=torch.long, device=dev)
     hist = collections.deque(maxlen=lag_hi + 1)                    # the last decisions' states, the newest last
@@ -1332,7 +1342,7 @@ def main(argv=None):
         # (11-16) also whenever there is no measurement yet: a fork (--update-offset) used to start with b_noise = nan, i.e. ONE
         # minibatch per actor step (64 steps in the first update instead of 4) until the next multiple of the probe period --
         # every fork's first update moved the policy KL 0.14-0.16 with 42-45 % clipped (kr26c/d u1001, kr26e3 u1476)
-        if args.accum_actor_auto and ((upd - 1) % max(1, args.noise_probe_every) == 0 or not math.isfinite(b_noise)):
+        if args.accum_actor_auto and ((upd - 1) % max(1, args.noise_probe_every) == 0 or math.isnan(b_noise)):
             # the policy gradient's noise scale on this rollout, at the policy that drove it (no step): per minibatch the
             # gradient of the policy loss at ratio 1 (advantage normalised per minibatch, as the epochs do), then
             # |G|^2 and tr(Sigma) from the minibatch gradients and their mean (two batch sizes), smoothed over updates
@@ -1611,6 +1621,17 @@ def main(argv=None):
                        branch_switch=br_n["switch"] / max(br_n["pairs"], 1.0),
                        branch_arg_switch=br_n["arg_switch"] / max(br_n["pairs"], 1.0))
         if scene is not None:
+            if args.scene_replay_auto and sc_end > 0:
+                # how often the scene episodes that ended this update had a hard contact -> the share for the next update
+                _lo, _hi = (float(x) for x in args.scene_replay_auto.split(","))
+                # weighted by how many ended (a handful of episodes moves it little); starts at 0.6 = HI (a fork
+                # from a trained policy has its biases -- the scenes are what it fails at)
+                rh_ = sc_end_hit / sc_end
+                a_ = 0.1 * min(1.0, sc_end / 50.0)
+                scene_rehit = (0.6 if scene_rehit is None else scene_rehit) * (1.0 - a_) + a_ * rh_
+                share_ = _lo + (_hi - _lo) * min(1.0, max(0.0, (scene_rehit - 0.2) / 0.4))
+                scene.p_load = share_ / _hi if _hi > 0 else 0.0
+            row.update(scene_p_load=scene.p_load, scene_rehit=scene_rehit)
             row.update(scene_store=scene.n, scene_new=[int(x_) for x_ in sc_new], scene_share=sc_dec / (T * Bl),
                        scene_ended=sc_end, scene_ended_hit=sc_end_hit)
         if drv.opp is not None:
