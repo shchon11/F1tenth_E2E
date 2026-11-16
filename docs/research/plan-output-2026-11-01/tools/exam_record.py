@@ -63,6 +63,9 @@ WIPE = os.environ.get("F1SIM_EXAM_WIPE", "")
 # "rand:P:L:R" freezes L decisions from a random start (chance P a decision) in races WITHOUT an opponent -- the cost of a
 # stale memory alone. The frozen rows go to the record ("frozen")
 FREEZE = os.environ.get("F1SIM_EXAM_FREEZE", "")
+# (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
+# the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
+CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -112,7 +115,8 @@ if OPP_SLOT:
 if mode == "map":
     a.plan_format, a.repeat = "tw", 4
 torch.manual_seed(SEED)
-env = SR.build_env(a, dev, extra={"spawn_speed_max": 0.0} if REST else None)
+_extra = dict({"spawn_speed_max": 0.0} if REST else {}, **({"procedural_raceline_corridor": "on"} if CORRIDOR else {}))
+env = SR.build_env(a, dev, extra=_extra or None)
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 if mode == "ideal":
     env.enable_ideal()
@@ -375,7 +379,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["wipe"] = np.array(WIPE); D["freeze"] = np.array(FREEZE)
+D["wipe"] = np.array(WIPE); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
