@@ -50,7 +50,14 @@ sleep 5
 if [ "$G" != 1 ]; then      # (a background `[ ] || cmd &` list kept a subshell holding this script's stdout open)
   setsid nohup bash tools/gpu_guard3.sh "plan_[r]l --name $N " out/guard4070_$N.done > out/guard4070_$N.log 2>&1 < /dev/null &
 fi
-CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
+# (11-16, 사용자: "평가는 그 충돌맵으로 100 iter마다 해", "각자 gpu에서 하게 하자") frozen exam만 100 update마다, 학습 GPU에서
+# (예전 25마다 core_loop.sh는 EVAL=core 로)
+if [ "${EVAL:-exam}" = core ]; then
+  CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
+else
+  EG=$([ "$G" = 1 ] && echo 1 || echo 0)
+  setsid nohup bash tools/exam_loop.sh $N $(( (OFF / 100 + 1) * 100 )) $U1 $EG > out/exam_loop_$N.out 2>&1 < /dev/null &
+fi
 mkdir -p $R/watch_$N
 # the console's list gets the new run at the top (11-15: the list had gone stale -- the console keeps it current only if the
 # launcher does; memory: console picks must be current)

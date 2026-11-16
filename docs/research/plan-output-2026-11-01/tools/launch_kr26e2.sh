@@ -6,6 +6,5 @@ until [ -e $R/out/one_kr26e.done ]; do sleep 30; done
 while pgrep -f "plan_rl --name kr26e " > /dev/null; do sleep 5; done
 cd $R
 EVAL_GPU=0 LAUNCH_GPU=0 LAUNCH_ENVS=512 bash tools/launch_run.sh kr26e2 korea_2026_competition 1800 /home/shchon11/f1sim_runs/kr26e/plan_u1400.pt 1400 --scene-replay 0.25
-setsid nohup bash tools/eval_latest_only.sh kr26e2 > out/eval_latest_only_kr26e2.out 2>&1 < /dev/null &
 setsid nohup bash tools/lab_watch_sync.sh kr26e2 > out/lab_watch_sync_e2.log 2>&1 < /dev/null &
 echo "$(date +%T) kr26e2 시작"
