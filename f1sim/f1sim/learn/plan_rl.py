@@ -414,6 +414,12 @@ def main(argv=None):
                     help="with --accum-actor-auto: the minibatches per actor step never go back down (11-14, plan26i: at u236 the "
                          "noise scale read 190k -> 56k -> 15k as the policy got worse, the rule dropped 16 -> 4 -> 1 minibatches, "
                          "4-16x the actor steps per update, KL 3-8x, contacts 3x, training reward down -- a feedback loop)")
+    ap.add_argument("--horizon-auto", type=int, default=1,
+                    help="KMAX: the decisions per update grow with the policy gradient's noise scale -- each update collects "
+                         "K x --horizon decisions per car, K the smallest whole number whose rollout covers the measured noise scale, "
+                         "1 <= K <= KMAX, never going back down (as --accum-ratchet); the minibatches scale with K so one minibatch "
+                         "keeps its size (11-16, the user: 'update당 결정 수를 유동적으로 늘릴 수 있게': kr26e stalled with a noise scale "
+                         "of ~58k decisions against a 32.8k rollout, the actor capped at one step per rollout). Needs --accum-actor-auto")
     ap.add_argument("--noise-probe-every", type=int, default=1,
                     help="with --accum-actor-auto: measure the noise scale every N updates (it is smoothed over updates and moves "
                          "slowly; the measurement is one more forward/backward over the whole rollout, ~1/5 of an update)")
@@ -898,6 +904,10 @@ def main(argv=None):
     print(f"[plan_rl] {args.name}: 환경 {env.B} (학습 차 {Bl}), 결정 0.1 s, 롤아웃 {args.horizon}결정, LiDAR {obs.beams}빔 x {3}장, "
           f"critic 추가 입력 {priv_dim}", flush=True)
     T = args.horizon
+    K_h = 1                                        # --horizon-auto: rollouts' worth of decisions per update (K x --horizon)
+    MB = args.minibatches                          # minibatches per epoch (scales with K_h: a minibatch keeps its size)
+    if args.horizon_auto > 1 and not args.accum_actor_auto:
+        raise SystemExit("--horizon-auto needs --accum-actor-auto (it reads the noise scale that measures)")
     log = open(os.path.join(run, "progress.jsonl"), "a")
     t0 = time.time()
     trk = None
@@ -913,6 +923,14 @@ def main(argv=None):
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1 + args.update_offset, args.updates + 1):
+        if args.horizon_auto > 1 and math.isfinite(b_noise):
+            # the smallest K whose rollout (all processes) covers the noise scale; never down (the noise scale reads lower as
+            # a policy gets worse -- the accumulation rule's feedback loop, --accum-ratchet). The same on every process: the
+            # noise scale is computed from all-reduced sums
+            per_k = args.horizon * Bl * (args.dist_world if args.dist_world > 1 else 1)
+            K_h = max(K_h, min(args.horizon_auto, max(1, math.ceil(b_noise / per_k))))
+            T = args.horizon * K_h
+            MB = args.minibatches * K_h
         frac = (upd - 1) / max(1, args.updates - 1)
         nc_near = 0.0                                              # --noise-corr-box: share of decisions with the noise held
         nc_stall = 0.0                                             # --noise-corr-stall: share of decisions with the speed noise held
@@ -1202,10 +1220,10 @@ def main(argv=None):
 
         def batches():
             if args.memory:
-                for sq in torch.randperm(seq_idx.shape[1], device=dev).chunk(args.minibatches):
+                for sq in torch.randperm(seq_idx.shape[1], device=dev).chunk(MB):
                     yield seq_idx[:, sq]
             else:
-                for mb_ in torch.randperm(N, device=dev).chunk(args.minibatches):
+                for mb_ in torch.randperm(N, device=dev).chunk(MB):
                     yield mb_
 
         def heads_on(fc, mb_):
@@ -1343,12 +1361,12 @@ def main(argv=None):
             ns_ema = (G2_, tr_) if ns_ema is None else (0.9 * ns_ema[0] + 0.1 * G2_, 0.9 * ns_ema[1] + 0.1 * tr_)
             b_noise = ns_ema[1] / ns_ema[0] if ns_ema[0] > 0 else float("inf")
             k_ = 1
-            bstep_ = bb_ / args.minibatches                     # decisions in one minibatch step (all processes)
+            bstep_ = bb_ / MB                                   # decisions in one minibatch step (all processes)
             if args.accum_auto_frac > 0:
-                while k_ * 2 <= args.minibatches and k_ * 2 * bstep_ <= args.accum_auto_frac * b_noise:
+                while k_ * 2 <= MB and k_ * 2 * bstep_ <= args.accum_auto_frac * b_noise:
                     k_ *= 2
             else:
-                while k_ * 2 <= args.minibatches and k_ * bstep_ < b_noise:
+                while k_ * 2 <= MB and k_ * bstep_ < b_noise:
                     k_ *= 2
             if args.accum_ratchet:
                 k_ = max(k_, args.accum_actor)
@@ -1555,7 +1573,7 @@ def main(argv=None):
         if args.accum_actor_auto:
             print(f"[plan_rl] update {upd}: policy gradient 잡음 크기 {b_noise:.0f} 결정 -> actor는 minibatch {args.accum_actor}개를 합쳐 한 걸음", flush=True)
         row = {"update": upd, "min": (time.time() - t0) / 60, "t_roll": t_roll, "t_upd": t_upd,
-               "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None,
+               "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None, "horizon": T,
                "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
                "noise_stall_share": nc_stall / max(T, 1) if stall_on else None,
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
