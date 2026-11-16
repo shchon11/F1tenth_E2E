@@ -841,6 +841,14 @@ class EnvConfig:
     # because the alternative is a baseline whose collisions are the layout's fault and a result
     # nobody can read.
     procedural_raceline_corridor: str = "on"
+    #: (11-16) with the corridor "off": races WITH an opponent keep their boxes out of the opponents' racing-line corridor
+    #: (the same test as "on", per race), races without one keep boxes anywhere. The opponents' planners hit ~0.55 boxes a
+    #: minute per box on their line (exam kr26e3 u1600: opponent restarts 2.66/min with 6.4 boxes, 1.24 with 2, 0.06 with
+    #: the corridor -- no boxes: 0.07), so a box race with an opponent taught "a car that crashes and reappears". Bank
+    #: layouts only. False: as before (nothing drawn differently, the random streams unchanged).
+    procedural_opp_corridor: bool = False
+    #: (11-16) at most this many boxes in a race with an opponent (0 = no cap; bank layouts only)
+    procedural_opp_keep: int = 0
     # One layout for the whole batch instead of one per env (or per race). The console runs this:
     # it draws one track, and every car on it has to be driving through the crates that are drawn.
     # The layout is redrawn only when every env resets together -- the console's 리셋, a new
@@ -1154,6 +1162,9 @@ class F1VecEnv:
                 place=str(e.procedural_place), bank=str(e.procedural_bank or ""),
                 shapes=str(getattr(e, "procedural_shapes", "all") or "all"))
             self.sim.track.attach_env_props(self.procedural)
+            self.procedural.opp_keep = int(e.procedural_opp_keep)
+            if (e.procedural_opp_corridor or e.procedural_opp_keep > 0) and self.procedural.place != "bank":
+                raise ValueError("procedural_opp_corridor / procedural_opp_keep need bank layouts (procedural_bank)")
             # how far a prop centre can be from the car's and still touch it: the contact tests cull
             # to the slots inside this, and count anything they dropped that was not
             self.sim.prop_reach = float(self.sim.corners.norm(dim=1).max()) + self.procedural.max_radius
@@ -1971,6 +1982,12 @@ class F1VecEnv:
             from .opponent_slots import build_teacher, kind_of
             self.alt_teachers = [build_teacher(kind_of(name), teacher, self)
                                  for name in self.alt_teacher_kinds]
+        if self.procedural is not None and self.ecfg.procedural_raceline_corridor == "off" and self.ecfg.procedural_opp_corridor:
+            # the corridor only for races with an opponent (`procedural_opp_corridor`): the band is built, the global
+            # filter stays off, `ProceduralObstacles._redraw_bank` applies it to the races the reset says have one
+            self.procedural.set_raceline(teacher)
+            self.procedural.has_raceline = False
+            self.procedural.opp_corridor = True
         if self.procedural is not None and self.ecfg.procedural_raceline_corridor != "off":
             # The teacher is pure pursuit on a raceline built from the occupancy grid, and the
             # procedural props are not in the grid: it cannot see them and will not steer round
@@ -2342,13 +2359,22 @@ class F1VecEnv:
             if e.resample_track_on_reset and self.sim.track.T > 1:
                 new_tid = torch.randint(self.sim.track.T, (full.shape[0],), device=self.device, generator=gen)
                 self.sim.tid[ids] = torch.where(is_full, new_tid[race], self.sim.tid[ids])
-            self._redraw_layouts(ids, n, full=full)
+            # (11-16) `procedural_opp_corridor` / `procedural_opp_keep`: who is in the race is drawn before the layout, which
+            # depends on it; off: drawn below, as always (the random streams unchanged)
+            empty_pre, opp_race = None, None
+            if e.procedural_opp_corridor or e.procedural_opp_keep > 0:
+                if e.spawn_as_race and getattr(self, "_present_p", None) is not None:
+                    empty_pre = torch.rand(full.shape[0], self.M, device=self.device, generator=gen) >= self._present_p[None, :]
+                    opp_race = ~empty_pre[:, 1:].all(1)
+                else:
+                    opp_race = torch.ones(full.shape[0], dtype=torch.bool, device=self.device)
+            self._redraw_layouts(ids, n, full=full, opp_race=opp_race)
             L = self.sim.track.length[self.sim.tid[ids]]
             gap = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(n, device=self.device, generator=gen)
             base = torch.rand(full.shape[0], device=self.device, generator=gen)   # leader position, fraction of a lap
             abreast_rows = torch.zeros(n, dtype=torch.bool, device=self.device)
-            empty_g = None
-            if e.spawn_as_race and getattr(self, "_present_p", None) is not None:
+            empty_g = empty_pre
+            if empty_g is None and e.spawn_as_race and getattr(self, "_present_p", None) is not None:
                 # Who is in the race is drawn before the grid is laid out, not after: an empty seat
                 # must neither hold the race's placement up nor be what an abreast row makes room for.
                 empty_g = torch.rand(full.shape[0], self.M, device=self.device, generator=gen) >= self._present_p[None, :]
@@ -2695,7 +2721,8 @@ class F1VecEnv:
 
         return scan, scan_true, scan_type
 
-    def _redraw_layouts(self, ids: torch.Tensor, n: int, full: Optional[torch.Tensor] = None) -> None:
+    def _redraw_layouts(self, ids: torch.Tensor, n: int, full: Optional[torch.Tensor] = None,
+                        opp_race: Optional[torch.Tensor] = None) -> None:
         """Draw a fresh obstacle layout for the envs that are resetting. No-op when off.
 
         Called *before* the grid is laid out rather than just before the spawn, for two reasons.
@@ -2723,7 +2750,8 @@ class F1VecEnv:
         if races.numel():
             rows = (races[:, None] * self.M + torch.arange(self.M, device=self.device)[None]).reshape(-1)
             src = torch.arange(races.numel(), device=self.device).repeat_interleave(self.M)
-            self.procedural.redraw(self.sim.tid[races * self.M], rows, src)
+            self.procedural.redraw(self.sim.tid[races * self.M], rows, src,
+                                   opp=None if opp_race is None else opp_race[races])
 
     def _spawn_order(self, ids: torch.Tensor, race: torch.Tensor, is_full: torch.Tensor,
                      n_races: int, gen: torch.Generator) -> torch.Tensor:

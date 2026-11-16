@@ -506,6 +506,10 @@ class ProceduralObstacles:
         big = torch.full_like(self.lane_l, 1e3)
         self.rl_hi, self.rl_lo = -big, big
         self.has_raceline = False
+        #: (11-16) `EnvConfig.procedural_opp_corridor` / `procedural_opp_keep`: the corridor test and a box cap for the races
+        #: `redraw(..., opp=)` marks as having an opponent (bank layouts)
+        self.opp_corridor = False
+        self.opp_keep = 0
 
     def _load_bank(self, path: str):
         """`bank` (11-03 night, user: "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): layouts drawn by
@@ -551,17 +555,27 @@ class ProceduralObstacles:
         self.place = "bank"
         print(f"[procedural] bank {path}: {int(self.b_n.min())}-{int(self.b_n.max())} layouts per track, {T} tracks", flush=True)
 
-    def _redraw_bank(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor):
+    def _redraw_bank(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor, opp: Optional[torch.Tensor] = None):
         """`bank`: one stored layout of the env's own track, 1 .. all of its pieces (count "uniform") or all ("fixed")."""
         D, C, dev = int(t.numel()), self.C, self.device
         k_idx = (self._rand((D,)) * self.b_n[t]).long().clamp_max(self.b_n[t] - 1)
         sid = self.b_sid[t, k_idx]                                               # (D, C)
         pose = self.b_pose[t, k_idx]
         live = sid >= 0
+        if opp is not None and self.opp_corridor:
+            # (11-16) a race with an opponent: only the pieces clear of the opponents' racing-line corridor, before the count
+            # is drawn (so the count is of boxes that stay)
+            j_, v_ = self.b_j[t, k_idx], self.b_v[t, k_idx]
+            tq_ = t[:, None].expand(D, C)
+            a_ = 0.5 * self.sh_across[sid.clamp_min(0)] + CURVE_INSET
+            clear_ = (v_ - a_ >= self.rl_hi[tq_, j_]) | (v_ + a_ <= self.rl_lo[tq_, j_])
+            live = live & (clear_ | ~opp[:, None])
         n_live = live.sum(1, keepdim=True)
         k = n_live if self.count == "fixed" else 1 + torch.floor(self._rand((D, 1)) * n_live).long()
         if self.keep > 0:
             k = k.clamp_max(self.keep)
+        if opp is not None and self.opp_keep > 0:
+            k = torch.where(opp[:, None], k.clamp_max(self.opp_keep), k)
         r = torch.where(live, self._rand((D, C)), torch.full((D, C), 2.0, device=dev))
         live = live & (r.argsort(1).argsort(1) < k) & (self._rand((D, 1)) < self.fraction)
         sid = sid.clamp_min(0)
@@ -728,7 +742,7 @@ class ProceduralObstacles:
 
     # ------------------------------------------------------------------ the draw
     @torch.no_grad()
-    def redraw(self, draw_tid: torch.Tensor, dst: torch.Tensor, src: torch.Tensor):
+    def redraw(self, draw_tid: torch.Tensor, dst: torch.Tensor, src: torch.Tensor, opp: Optional[torch.Tensor] = None):
         """Draw `len(draw_tid)` layouts and write them into env rows `dst` (layout `src[i]` each).
 
         `dst`/`src` are what make a race share one layout: the cars of a race drive the same track
@@ -741,7 +755,7 @@ class ProceduralObstacles:
         if self.place == "uniform":
             return self._redraw_uniform(draw_tid, dst, src)
         if self.place == "bank":
-            return self._redraw_bank(draw_tid, dst, src)
+            return self._redraw_bank(draw_tid, dst, src, opp)
         t = draw_tid
         P, Q = self.P, self.Q
         dev = self.device

@@ -527,6 +527,13 @@ def main(argv=None):
                          " (11-10, the user: \"ㅇㅋ\" to 0.95): at 1 the policy drove >= 95 %% of it 29 %% of the time, where the table's"
                          " flat top needs 18 -> 24 deg (lock) for the last 5 %% -- a real car's follower had no steering left to correct"
                          " with and the car wobbled. Every Limits of this run (and its evaluations, read from the checkpoint) use it")
+    ap.add_argument("--opp-box-corridor", action="store_true",
+                    help="races with an opponent keep their boxes out of the opponents' racing-line corridor (11-16: the "
+                         "opponents' planners hit ~0.55 boxes a minute per box on their line; restarts 2.66/min -> 0.06)")
+    ap.add_argument("--opp-box-keep", type=int, default=0, help="at most this many boxes in a race with an opponent (0 = no cap)")
+    ap.add_argument("--opp-scale", default="",
+                    help="LO,HI: the opponents' speed scale range over the world's (11-16: the world's 0.4-1.2 put 64 %% of the "
+                         "opponents under 0.7x our pace; at 1.0 they run 0.77x, above 1.1 they crash into walls)")
     ap.add_argument("--box-range", type=float, default=0.0,
                     help="> 0: the boxes ahead -- the critic's box block and --mem-aux's target -- counted ALONG THE TRACK within this many"
                          " metres (`track_boxes`) instead of the straight-line 12 m that also lists boxes behind a wall (11-10). 0 = as before")
@@ -678,6 +685,14 @@ def main(argv=None):
     if args.track_scales:
         ov["track_scales"] = (list(SR.TRACK_SCALES_25) if args.track_scales == "korea25"
                               else [int(x_) for x_ in args.track_scales.split(",")])
+    if args.opp_box_corridor:
+        ov["opp_box_corridor"] = 1
+    if args.opp_box_keep > 0:
+        ov["opp_box_keep"] = int(args.opp_box_keep)
+    if args.opp_scale:
+        _slot = json.loads(json.load(open(args.world)).get("opp_slot", "") or "{}")
+        _slot["speed_scale"] = [float(x_) for x_ in args.opp_scale.split(",")]
+        ov["opp_slot"] = json.dumps(_slot)
     env, lim, world = build(args.world, args.envs, args.seed, dev, overrides=ov, fmt=args.format)
     if args.opp_every > 0:
         env.opp_every = int(args.opp_every)
