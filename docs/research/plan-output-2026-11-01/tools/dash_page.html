@@ -166,7 +166,6 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     <div class="controls">
       <label>run <select id="run"></select></label>
       <label>비교 run <select id="ref"></select></label>
-      <label title="TensorBoard처럼 지수 이동 평균(앞부분 치우침 보정). 0 = 원래 값">EMA <input type="range" id="ema" min="0" max="0.99" step="0.01" value="0.8" style="width:120px;vertical-align:middle"> <b id="ema_v">0.80</b></label>
     </div>
     <div class="kpis" id="kpis"></div>
     <div class="note" id="runnote"></div>
@@ -182,7 +181,7 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
 
   <div class="sec"><h2>학습 중 기록</h2><span class="sub">학습 rollout (탐색 잡음 포함)</span>
     <span class="legend" id="legend"></span><span class="sub" id="xnote"></span></div>
-  <div class="zbar" id="zbar"><span>가로 범위</span>
+  <div class="zbar" id="zbar"><label title="TensorBoard처럼 지수 이동 평균(앞부분 치우침 보정). 0 = 원래 값" style="margin-right:12px">EMA <input type="range" id="ema" min="0" max="0.99" step="0.01" value="0.8" style="width:140px;vertical-align:middle"> <b id="ema_v">0.80</b></label><span>가로 범위</span>
     <button data-z="cmp" class="on">비교 구간</button><button data-z="all">전체</button><button data-z="fork">재개 이후</button><button data-z="last200">마지막 200 update</button><button data-z="last50">마지막 50</button>
     <span>· 그래프에서 끌면 그 구간 확대 · Shift+끌기 이동 · Ctrl+휠 확대·축소 · 두 번 클릭 전체 · 범례 누르면 그 run 숨김 (모든 그래프가 같이 움직임)</span></div>
   <div class="charts">
