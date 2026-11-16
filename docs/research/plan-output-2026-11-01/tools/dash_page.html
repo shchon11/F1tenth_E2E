@@ -322,6 +322,7 @@ function chart(id, sets, zero = true) {
   applyX(charts[id]); charts[id].update("none");
   $(id).addEventListener("dblclick", () => { charts[id].resetZoom?.("none"); setXR(null, null, "all"); });
 }
+const rgba = (hex, a) => { const n = parseInt(String(hex).trim().replace("#", ""), 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
 const ds = (label, pts, color, dashed) => ({label, runName: String(label).split(" ")[0], data: sm(pts), borderColor: color, backgroundColor: color, borderDash: dashed ? [6, 3] : [], borderWidth: dashed ? 2.2 : 2});
 async function j(u) { const r = await fetch(u); if (!r.ok) throw new Error(u); return r.json(); }
 
@@ -381,7 +382,7 @@ async function refresh() {
     <div class="kpi"><span>바퀴/분 · 속도</span><b>${f1(L.laps_per_min, 2)}</b> <small>· ${f1(L.speed, 2)} m/s</small></div>
     <div class="kpi"><span>마지막 기록</span><b style="font-size:15px">${fmtTime(s.last_mtime)}</b></div>`;
   $("runnote").innerHTML = `<span class="chip">${esc(mapName(meta.map))}</span> ` + (meta.parent ? `${esc(meta.parent)} u${meta.cut}의 checkpoint에서 이어 시작 (u${meta.cut}까지 기록은 ${esc(meta.parent)} 것). ` : "") + esc(meta.note || "");
-  $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run)"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw dash" style="border-color:var(--ref)"></span>${esc(ref)}</span>` : "");
+  $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run);border-top-width:3.6px;opacity:.6"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw" style="border-color:var(--ref);border-top-width:2px"></span>${esc(ref)}</span>` : "");
   LASTX = (own.length ? own[own.length - 1].update : 0) - offOf(run);
   {   // (11-16, the user: "주황색이 안보이네") the default view starts where the comparison run has data, so both lines show
     const oR = ref ? offOf(ref) : 0, r0 = rr.length ? rr[0].update - oR : null, f0 = FORKS.length ? FORKS[0].x : null;
@@ -391,7 +392,10 @@ async function refresh() {
   }
   const R = (r) => r.reward == null ? null : r.reward * 900 * 7.5, C = (r) => r.contact_cost == null ? null : r.contact_cost * 900 * 7.5;
   OFF = {run: offOf(run), ref: ref ? offOf(ref) : 0};
-  const two = (f) => [ds(run, series(rows, f, OFF.run), css("--run"), false)].concat(rr.length ? [ds(ref, series(rr, f, OFF.ref), css("--ref"), true)] : []);
+  // (11-16, the user: "실선으로 바꿔줘, 겹쳐있는건 우짜지") both solid: the run a wide, slightly see-through band, the comparison a
+  // thinner line drawn over it -- where they overlap the orange runs inside the blue, so neither hides the other
+  const two = (f) => [Object.assign(ds(run, series(rows, f, OFF.run), rgba(css("--run"), 0.6), false), {borderWidth: 3.6})]
+    .concat(rr.length ? [Object.assign(ds(ref, series(rr, f, OFF.ref), css("--ref"), false), {borderWidth: 1.6})] : []);
   chart("c_laps", two((r) => r.laps_per_min));
   chart("c_speed", two((r) => r.speed));
   chart("c_stop", two((r) => r.stopped == null ? null : 100 * r.stopped));
