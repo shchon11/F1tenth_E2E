@@ -106,12 +106,18 @@ if len(runs) == 1:
     x = [u for _, u, _ in ch]
     yh = [hard_per_session(p) for _, _, p in ch]
     yd = []
-    for _, _, p in ch:
-        R = rec(p)
-        st = R.st.astype(float)
-        step = np.where(R.rs, 0.0, np.hypot(np.diff(st[:, :, 0], axis=0), np.diff(st[:, :, 1], axis=0)))
-        solo = ~R.on.astype(bool).any(0) & ~(R.sid >= 0).any((0, 2))
-        yd.append(float(step.sum(0)[solo].mean()))
+    for _, _, p in ch:                                     # distance ALONG THE TRACK (grad_step_table.py's: what the lap counts,
+        R = rec(p)                                          # not the path length -- a wider line is not more progress)
+        z = R.z
+        T_ = z["cnt"].shape[0]
+        r_ = z["rem"].astype(float).copy()
+        for t_ in range(1, r_.shape[0]):
+            bad = ~np.isfinite(r_[t_]); r_[t_, bad] = r_[t_ - 1, bad]
+        r_[~np.isfinite(r_)] = 0.0
+        L_ = float(z["lapL"][int(z["tid"][0, 0])])
+        dd = np.mod(r_[:-1] - r_[1:] + 0.5 * L_, L_) - 0.5 * L_
+        solo = ~z["on"][:T_].any(0) & ~(z["sid"][0] >= 0).any(-1)
+        yd.append(float(dd.sum(0)[solo].mean()))
     for a_, y_, lab, col in ((ax, yh, "세게 닿음 / 세션 (90 s)", "#2a7de1"), (ax2, yd, "혼자·빈 트랙 거리 / 90 s [m]", "#2f9e44")):
         a_.plot(x, y_, "-o", color=col, lw=2, ms=5)
         for xx, yy in zip(x, y_):
