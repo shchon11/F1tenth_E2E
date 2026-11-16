@@ -8,6 +8,7 @@ Tailscale 주소에만 열림(공개 인터넷 X). 페이지는 30 s마다 스�
   - 연구 기록: out/research_log.md (날짜별 분석·결정, 최근 것부터) · run 상태 메모: out/run_notes.json {run: 멈춘 이유 등}
   - 이어 시작한 run(--init ...plan_uN.pt): 학습 표에 부모 run의 u<=N 행을 '이어 받음'으로 채움
 실행: python3 dash_server.py [주소 100.99.253.65] [포트 8765]"""
+import gzip
 import json, os, re, subprocess, sys, time, threading, html, glob
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
@@ -115,7 +116,7 @@ def progress(name):
                 r = json.loads(line)
             except ValueError:
                 continue
-            row = {k: r.get(k) for k in FIELDS}
+            row = {k: (float(f"{r[k]:.5g}") if isinstance(r.get(k), float) else r.get(k)) for k in FIELDS}   # 5 digits: half the bytes
             sd = r.get("std")
             row["std_steer"] = sd[0] if isinstance(sd, list) and sd else None
             rows.append(row)
@@ -310,8 +311,16 @@ class H(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, str):
             body = body.encode()
+        # (11-16, the user: "불러오는데 시간이 5초정도 걸리는거 같은데") the progress of a run with its earlier runs is ~1 MB of
+        # JSON a request, over Tailscale; it compresses ~8x -- the server answers in < 0.2 s, the transfer was the wait
+        gz = (len(body) > 2048 and ("json" in ctype or "text" in ctype or "html" in ctype)
+              and "gzip" in (self.headers.get("Accept-Encoding") or ""))
+        if gz:
+            body = gzip.compress(body, 5)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if gz:
+            self.send_header("Content-Encoding", "gzip"); self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
