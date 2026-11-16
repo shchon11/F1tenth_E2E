@@ -54,6 +54,10 @@ SAVE_VALUE = os.environ.get("F1SIM_EXAM_SAVE_VALUE", "") == "1"  # the critic's 
 OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
 REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
 HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent starts half a lap away (the user's events)
+# (11-16, the user: "gru 네트워크가 ... 상대차에 관해서 도움을 줄 수도 있나? ... 근데 이거 측정이 거의 불가할 것 같은데") the memory wiped
+# before the decision whenever the opponent is within R m ("near:R"), or at random on a share P of the decisions with NO car
+# within R ("rand:P:R", the control: what wiping costs anyway); the wiped rows go to the record ("wiped")
+WIPE = os.environ.get("F1SIM_EXAM_WIPE", "")
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -275,6 +279,13 @@ for kd in range(T):
     if SAVE_VALUE:
         _pv = priv_now()
         VAL["priv"].append(_pv.half().cpu()); VAL["value"].append(critic(obs.scans, obs.state(), _pv).float().cpu())
+    if WIPE:
+        _w = WIPE.split(":")
+        _near = (~absent[others]) & ((env.sim.state[lid, :2] - env.sim.state[others, :2]).norm(dim=1) < float(_w[-1]))
+        _wipe = _near if _w[0] == "near" else (~_near) & (torch.rand(Bl, device=dev) < float(_w[1]))
+        if getattr(obs, "mem_h", None) is not None:
+            obs.mem_h[_wipe] = 0.0
+        R.setdefault("wiped", []).append(_wipe.cpu())
     cmd_d0 = obs.cmd_d.clone()
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
     if SAVE_MEM:
@@ -343,6 +354,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
+D["wipe"] = np.array(WIPE)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
