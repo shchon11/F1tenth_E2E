@@ -14,6 +14,10 @@ import numpy as np
 RNG = np.random.default_rng(0)
 HYST = 1.0          # [m] a pass counts once the gap has changed sign by this much
 STALL_S = 2.0
+# (11-18, the user: "0.3을 기준으로 걸어놓으니까 0.3보다 빠르게 와리가리치는장면들이 종종 보이네") stuck = STALL_S with less than
+# STUCK_M along the track. The speed rule (|v| < 0.3 m/s) let a car rocking back and forth at a box (|v| up to ~1 m/s, no
+# progress) count as driving: qual26c u125 had sessions stuck 18-84 s after a box hit, two of them past the box removal
+STUCK_M = 1.0
 
 
 def ci(v, stat=np.mean, n=2000):
@@ -86,9 +90,13 @@ def score(fn):
     d = np.clip(np.diff(np.concatenate([np.zeros((1, B, 6)), cnt], 0), axis=0), 0, None)      # new contacts per decision
     hard = d[:, :, 3:6]; anyc = d[:, :, 0:3]
     n1 = int(round(1.0 / dt)); n_st = int(round(STALL_S / dt))
-    slow = v < 0.3; slow[:n1] = False
-    stalls, longest = runs(slow, n_st)
     P, _ = progress(z["rem"], L)
+    # stuck: the STALL_S window starting at each decision moves the car less than STUCK_M along the track
+    adv = np.full((T, B), np.inf)
+    adv[:T - n_st] = P[n_st:T] - P[:T - n_st]
+    slow = adv < STUCK_M; slow[:n1] = False
+    stalls, longest = runs(slow, 1)
+    longest = np.where(longest > 0, longest + n_st - 1, 0)          # decisions, window start to window end
     # laps: a lap ends when the net count of line crossings reaches a new high
     net = np.cumsum(lapsig, 0); S = {}
     laps = [[] for _ in range(B)]                        # (start s, end s, hard contacts inside)
@@ -144,8 +152,8 @@ def score(fn):
             continue
         key = label.replace(" ", "")
         out.append(f"[{label}] 세션 {n}개")
-        out.append(f"  깨끗한 세션(세게 닿음 0번·2 s 넘게 선 적 없음) {pct(clean[m])} | 한 번도 안 닿은 세션 {pct(anyc.sum((0, 2))[m] == 0)} | "
-                   f"2 s 넘게 선 세션 {pct(stalls[m] > 0)} (5 s 넘게 {pct(longest[m] * dt > 5.0)})")
+        out.append(f"  깨끗한 세션(세게 닿음 0번·2 s 동안 1 m도 못 간 적 없음) {pct(clean[m])} | 한 번도 안 닿은 세션 {pct(anyc.sum((0, 2))[m] == 0)} | "
+                   f"2 s 동안 1 m도 못 간 세션 {pct(stalls[m] > 0)} (그렇게 5 s 넘게 {pct(longest[m] * dt > 5.0)})")
         out.append(f"  세션당 세게 닿음: 벽 {mean(h_all[m, 0])} · 상자 {mean(h_all[m, 1])} · 차 {mean(h_all[m, 2])} | 달린 거리 {med(P[-1, m], ' m', '{:.0f}')}")
         out.append(f"  한 바퀴(세션 중앙값) {med(lap_med[m], ' s')} · 세션에서 가장 빠른 바퀴 {med(lap_min[m], ' s')} · 세션 안 바퀴 흔들림 "
                    f"{med(lap_sd[m], ' s')} · 온전한 바퀴 수 {med(lap_n[m], '', '{:.0f}')} · 세게 닿지 않고 이어 달린 바퀴 {med(stk[m], '', '{:.0f}')}")
@@ -156,7 +164,7 @@ def score(fn):
         row[key + "_clean"] = clean[m]; row[key + "_lap"] = lap_med[m]
         if label.endswith("상자"):
             hb, ha = hard[:k_rm].sum(0), hard[k_rm:].sum(0)
-            sb = runs(slow[:k_rm], n_st)[0]; sa = runs(slow[k_rm:], n_st)[0]
+            sb = runs(slow[:k_rm], 1)[0]; sa = runs(slow[k_rm:], 1)[0]
             lb = np.array([lap_stats(b, 0.0, rm_t)[0] for b in range(B)]); la = np.array([lap_stats(b, rm_t)[0] for b in range(B)])
             out.append(f"  상자 있는 동안(0-{rm_t:g} s): 깨끗한 세션 {pct(((hb.sum(1) == 0) & (sb == 0))[m])} | 세게 닿음 벽 {mean(hb[m, 0])} · 상자 "
                        f"{mean(hb[m, 1])} · 차 {mean(hb[m, 2])} | 한 바퀴 {med(lb[m], ' s')}")
