@@ -142,6 +142,15 @@ in_replay""".split())
         self.n_added = 0
         #: (11-16) the chance a designated race that resets takes a scene (1 = always; --scene-replay-auto moves it)
         self.p_load = 1.0
+        #: (11-17, the user: "같은 상자를 계속 박는다" / "구조적으로 깔끔하게") `keep_unsolved`: a slot is given up by the scene driven
+        #: clean the most times in a row, the oldest among equals -- a scene the policy keeps failing stays until it is
+        #: driven clean (the FIFO store dropped every scene after ~26 updates and ~12 tries, solved or not; 42-46 % of the
+        #: replays still ended in a hard contact). Off: the oldest first, as before.
+        self.keep_unsolved = False
+        self.clean = torch.zeros(self.size, dtype=torch.long, device=dev)   # consecutive replays without a hard contact
+        self.tries = torch.zeros(self.size, dtype=torch.long, device=dev)
+        self.age = torch.zeros(self.size, dtype=torch.long, device=dev)     # when the slot was written (the order of `add`s)
+        self.cur = torch.full((self.G,), -1, dtype=torch.long, device=dev)  # the slot each race is replaying (-1: none)
         #: (11-16) every per-car tensor a scene carries besides the named ones: {name: path}, fixed at the first capture
         self.row_paths: Optional[Dict[str, tuple]] = None
 
@@ -190,9 +199,26 @@ in_replay""".split())
             raise KeyError(f"a scene's entries changed: {sorted(set(scene) ^ set(self.data))}")
         if n > self.size:
             scene, n = {k: v[-self.size:] for k, v in scene.items()}, self.size
-        at = (self.head + torch.arange(n, device=self.env.device)) % self.size
+        if self.keep_unsolved and self.n + n > self.size:
+            # the free slots, then the scenes driven clean the most times in a row (oldest first among equals); never a
+            # slot a race is replaying now (its result is still to come)
+            dev = self.env.device
+            free = torch.arange(self.n, self.size, device=dev)
+            k_ = n - free.numel()
+            score = self.clean[:self.n].double() * 1e9 - self.age[:self.n].double()
+            busy = self.cur[self.cur >= 0]
+            score[busy[busy < self.n]] = float("-inf")
+            k_ = min(k_, int(torch.isfinite(score).sum()))
+            take = torch.topk(score, k_).indices if k_ > 0 else free[:0]
+            at = torch.cat([free, take])
+            scene = {k: v[-at.numel():] for k, v in scene.items()}
+            n = at.numel()
+        else:
+            at = (self.head + torch.arange(n, device=self.env.device)) % self.size
         for k, v in scene.items():
             self.data[k][at] = v
+        self.clean[at] = 0; self.tries[at] = 0
+        self.age[at] = self.n_added + torch.arange(n, device=self.env.device)
         self.head = (self.head + n) % self.size
         self.n = min(self.n + n, self.size)
         self.n_added += n
@@ -263,6 +289,7 @@ in_replay""".split())
         env.ep_limit[rows] = self.episode_steps
         self._refill = (rows, idx.repeat_interleave(M), M)
         self.in_replay[g] = True
+        self.cur[g] = idx
         self._loaded.append((g, idx))
         self.n_loaded += int(g.numel())
 
@@ -285,6 +312,18 @@ in_replay""".split())
             t = getattr(env, name, None)
             if k in D and torch.is_tensor(t) and t.shape[1:] == D[k].shape[2:]:
                 t[rows] = D[k][g_of, seat].to(t.dtype)
+
+    def report(self, g: torch.Tensor, hit: torch.Tensor) -> None:
+        """(11-17) races `g` whose scene episode just ended, `hit` (same length, bool): it had a hard contact. The scene's
+        record of consecutive clean replays (`keep_unsolved` reads it)"""
+        if g.numel() == 0:
+            return
+        s_ = self.cur[g]
+        ok = s_ >= 0
+        s_, hit = s_[ok], hit[ok]
+        self.tries[s_] += 1
+        self.clean[s_] = torch.where(hit, torch.zeros_like(self.clean[s_]), self.clean[s_] + 1)
+        self.cur[g] = -1
 
     def take_loaded(self):
         """(races, scene indices) loaded since the last call, for the trainer to put the policy's inputs back"""

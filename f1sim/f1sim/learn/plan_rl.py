@@ -625,6 +625,10 @@ def main(argv=None):
     ap.add_argument("--scene-lag", type=int, default=20,
                     help="a scene is the state this many decisions before the contact, drawn per scene from 0.5x to 1.5x of it")
     ap.add_argument("--scene-size", type=int, default=1024, help="scenes kept (the oldest make room)")
+    ap.add_argument("--scene-keep-unsolved", action="store_true",
+                    help="a slot is given up by the scene driven clean the most times in a row, not by the oldest: a scene the "
+                         "policy keeps failing stays until it is driven clean (11-17: the FIFO store dropped every scene after "
+                         "~26 updates, solved or not; 42-46 %% of the replays still ended in a hard contact)")
     ap.add_argument("--scene-kinds", default="wall,box,car",
                     help="which hard contacts give scenes (11-15: 'box' = only box hits -- 44 %% of plan26l u200's hard box hits "
                          "were fast approaches to a box seen < 1 s before, 6 %% of the passes)")
@@ -788,6 +792,7 @@ def main(argv=None):
                             seed=args.seed)
         env.scene_replay = scene
         drv.scene = scene
+        scene.keep_unsolved = bool(args.scene_keep_unsolved)
     lag_lo, lag_hi = max(args.scene_lag // 2, 1), args.scene_lag + args.scene_lag // 2
     scene_rehit = None                                    # --scene-replay-auto: EMA of the scene episodes' hard-contact share
     _KIND = {"wall": 0, "box": 1, "car": 2}
@@ -982,6 +987,7 @@ def main(argv=None):
         br_n = {k: 0.0 for k in ("b0", "gap", "switch", "arg_switch", "pmax", "pairs")}
         sc_new = torch.zeros(3, device=dev)                    # --scene-replay: scenes taken this update, by what was hit
         sc_dec = sc_end = sc_end_hit = 0
+        sc_end_kind = torch.zeros(3, dtype=torch.long, device=dev); sc_hit_kind = torch.zeros(3, dtype=torch.long, device=dev)
         AX = []                                                # --mem-aux: the boxes ahead at each decision
         DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
         n_removed = 0
@@ -1190,6 +1196,13 @@ def main(argv=None):
                     # 4. how the scene episodes go
                     rep_hit |= hit & in_rep0
                     ended_ = out["restarted"] & in_rep0
+                    if bool(ended_.any()):
+                        g_e = torch.nonzero(ended_).flatten()           # learner i drives race i (checked at the start)
+                        s_e = scene.cur[g_e]; ok_e = s_e >= 0
+                        k_e = scene.data["hit_kind"][s_e[ok_e]].long()  # what the scene was taken for: wall, box, car
+                        sc_end_kind += torch.bincount(k_e, minlength=3)
+                        sc_hit_kind += torch.bincount(k_e[rep_hit[g_e][ok_e]], minlength=3)
+                        scene.report(g_e, rep_hit[g_e])
                     sc_dec += int(in_rep0.sum()); sc_end += int(ended_.sum()); sc_end_hit += int((ended_ & rep_hit).sum())
                     rep_hit &= ~out["restarted"]
                 since = torch.where(out["restarted"], torch.zeros_like(since), since + 1)
@@ -1664,7 +1677,9 @@ def main(argv=None):
                 scene.p_load = share_ / _hi if _hi > 0 else 0.0
             row.update(scene_p_load=scene.p_load, scene_rehit=scene_rehit)
             row.update(scene_store=scene.n, scene_new=[int(x_) for x_ in sc_new], scene_share=sc_dec / (T * Bl),
-                       scene_ended=sc_end, scene_ended_hit=sc_end_hit)
+                       scene_ended=sc_end, scene_ended_hit=sc_end_hit,
+                       scene_ended_kind=[int(x_) for x_ in sc_end_kind], scene_hit_kind=[int(x_) for x_ in sc_hit_kind],
+                       scene_solved=int((scene.clean[:scene.n] >= 2).sum()), scene_tries_mean=float(scene.tries[:scene.n].float().mean()) if scene.n else 0.0)
         if drv.opp is not None:
             row.update(self_opp_share=drv.opp.share_on(), self_opp_pool=[int(t_) for t_ in drv.opp.tags])
         if levels is not None:

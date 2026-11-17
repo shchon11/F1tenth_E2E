@@ -42,6 +42,29 @@ def test_the_store_is_a_ring_and_its_entries_are_fixed():
     assert sc.n == 3
 
 
+def test_keep_unsolved_gives_up_the_scene_driven_clean_most_and_keeps_the_failing_ones():
+    """(11-17) `keep_unsolved`: a full store gives up the scene with the longest clean streak (oldest among equals), never a
+    slot a race is replaying now; a failed replay sets the streak back to 0"""
+    env = _env(2)
+    sc = SceneReplay(env, share=0.5, size=3, episode_steps=40)
+    sc.keep_unsolved = True
+    mk = lambda v: {"a": torch.full((1, 2), float(v)), "b": torch.tensor([v])}
+    for v in range(3):
+        sc.add(mk(v))                                            # slots 0, 1, 2 hold 0, 1, 2
+    # scene 1 driven clean twice, scene 2 once, scene 0 failed
+    for slot, hit in ((1, False), (1, False), (2, False), (0, True)):
+        sc.cur[0] = slot
+        sc.report(torch.tensor([0]), torch.tensor([hit]))
+    assert sc.clean.tolist() == [0, 2, 1] and sc.tries.tolist() == [1, 2, 1] and int(sc.cur[0]) == -1
+    sc.add(mk(3))                                                # the cleanest (scene 1) makes room
+    assert sorted(sc.data["b"].tolist()) == [0, 2, 3]
+    sc.cur[0] = 2                                                # scene 2 is being replayed: not given up now
+    sc.add(mk(4))
+    assert sorted(sc.data["b"].tolist()) == [2, 3, 4]            # 0 (oldest, never clean) went, 2 (busy) stayed
+    sc.report(torch.tensor([0]), torch.tensor([True]))           # scene 2's replay failed: its streak is 0 again
+    assert int(sc.clean[(sc.data["b"] == 2).nonzero()[0, 0]]) == 0
+
+
 def test_a_stored_moment_comes_back_exactly_and_drives_the_same():
     env = _env()
     n = env.B
