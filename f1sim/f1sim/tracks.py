@@ -930,6 +930,11 @@ SPLIT_ALIASES = {"train": "train", "eval": "heldout", "heldout": "heldout",
                  "eval_obstacles": "heldout_obstacles", "heldout_obstacles": "heldout_obstacles"}
 
 #: The three groups the UI is allowed to show, and the one sentence each one has to earn.
+#: The maps the console offers (11-17, the user: "맵들도 싹 지워. 필요한거만 남겨"): the two venues the work is about --
+#: Korea 2026 (training, exams) and Korea 2025 -- and the 2026 venue rebuilt from a recording. Everything else stays
+#: loadable by name (tools, tests, old runs) but is no longer listed or searchable in the console.
+CONSOLE_TRACKS = ("real/korea26", "real/iccas25", "real/korea26-scan")
+
 GROUP_TRAIN = "학습"
 GROUP_HELDOUT = "검증"
 GROUP_SCENES = "내 환경"

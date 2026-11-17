@@ -908,6 +908,15 @@ class SimWorker:
                           "props": T.scene_props(e.id) or 0}
                    for e in T.catalog(extra=[t for ids in groups.values() for t in ids])}
         summaries = {g: T.split_summary(T.GROUP_SPLIT[g]) for g in groups if g in T.GROUP_SPLIT}
+        # only the maps the work is about (tracks.CONSOLE_TRACKS); the rest stays loadable by name. Each keeps the group
+        # the split gives it; one the split never placed (Korea 2026, the venue every current run trains on) is 학습.
+        keep = [t for t in T.CONSOLE_TRACKS if t in entries]
+        if keep:
+            placed = {t for ids in groups.values() for t in ids}
+            groups = {g: [t for t in ids if t in keep] for g, ids in groups.items()}
+            groups[T.GROUP_TRAIN] = groups.get(T.GROUP_TRAIN, []) + [t for t in keep if t not in placed]
+            groups = {g: ids for g, ids in groups.items() if ids}
+            entries = {t: entries[t] for t in keep}
         return {"groups": groups, "entries": entries, "splits": summaries}
 
     def describe_checkpoint(self, run: str) -> dict:
