@@ -946,6 +946,8 @@ def main(argv=None):
             dist.all_reduce(t_)
         return t_
 
+    Bl_all = int(dist_sum(Bl)[0]) if args.dist_world > 1 else Bl       # the learner cars of every process
+
     def norm_snap():
         return [(m_.mean.double().clone(), m_.var.double().clone(), m_.count.double().clone()) for m_ in (actor.norm, critic.norm)]
 
@@ -1000,7 +1002,10 @@ def main(argv=None):
             # the smallest K whose rollout (all processes) covers the noise scale; never down (the noise scale reads lower as
             # a policy gets worse -- the accumulation rule's feedback loop, --accum-ratchet). The same on every process: the
             # noise scale is computed from all-reduced sums
-            per_k = args.horizon * Bl * (args.dist_world if args.dist_world > 1 else 1)
+            # (11-18) every process's cars, summed: Bl x dist_world was each process's own count twice over, and with 608 + 416
+            # cars the two disagreed on K the first time it moved (qual26e u52: rank 1 went to 256, rank 0 stayed at 128 ->
+            # gloo "Received data size doesn't match expected size")
+            per_k = args.horizon * Bl_all
             K_h = max(K_h, min(args.horizon_auto, max(1, math.ceil(args.horizon_auto_mult * b_noise / per_k))))
             T = args.horizon * K_h
             MB = args.minibatches * K_h
