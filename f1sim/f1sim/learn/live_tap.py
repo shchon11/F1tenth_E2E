@@ -44,9 +44,11 @@ class LiveTap:
                     fps[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
                 except Exception:
                     pass
+        # (11-18) the car's length and width: the page draws the plan's footprints and the half-width band with them
+        car = np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)])
         np.savez(os.path.join(run_dir, "live_tracks.npz"), edt=tr.edt.float().cpu().numpy(), t_off=tr.t_off.cpu().numpy(),
                  t_H=tr.t_H.cpu().numpy(), t_W=tr.t_W.cpu().numpy(), t_res=tr.t_res.cpu().numpy(),
-                 t_origin=tr.t_origin.cpu().numpy(), **fps)
+                 t_origin=tr.t_origin.cpu().numpy(), car=car, **fps)
         sim = env.sim
         self.beam_every = int(beam_every)
         self.angles = sim.lidar.angles.float()[::self.beam_every].cpu().numpy()

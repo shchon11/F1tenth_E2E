@@ -347,11 +347,24 @@ def live_track(name, tid):
     org = np.asarray(z["t_origin"]).reshape(-1, 2)
     org = org[tid] if len(org) > tid else org[0]
     g = z["edt"][off:off + H * W].reshape(H, W)
-    img = np.where(g > 0, 246, 70).astype(np.uint8)[::-1]          # lane light, walls dark; row 0 = top (largest y)
+    # (11-18, the user: "그 폭이 장애물이나 벽에 보이게끔 ... plan이 닿는걸 좀 보게") the car's footprint (the plan-hit cost's:
+    # `sim.corners`, symmetric about the CoG) and, on the image, the band within half its width of a wall: lane 246, band 160,
+    # wall 70 -- a car centre in the band has its side in the wall
+    car = np.asarray(z["car"], float).tolist() if "car" in z.files else [0.58, 0.31]
+    img = np.where(g <= 0, 70, np.where(g <= 0.5 * car[1], 160, 246)).astype(np.uint8)[::-1]   # row 0 = top (largest y)
     buf = io.BytesIO(); Image.fromarray(img, "L").save(buf, "PNG")
     fps = {k[3:]: np.asarray(z[k]).round(3).tolist() for k in z.files if k.startswith("fp_")}
+    # how far into a plan the run's plan-hit cost looks (boxes / walls) and its weight (0 = off: drawn all the same)
+    a = {}
+    try:
+        a = json.load(open(os.path.join(RUNS, os.path.basename(name), "args.json"))).get("args", {})
+    except Exception:
+        pass
+    hit_s = float(a.get("plan_hit_s") or 1.0)
+    hit_wall_s = float(a["plan_hit_wall_s"]) if a.get("plan_hit_wall_s") is not None else hit_s
     return {"png": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), "x0": float(org[0]),
-            "y0": float(org[1]), "res": res, "W": W, "H": H, "fp": fps}
+            "y0": float(org[1]), "res": res, "W": W, "H": H, "fp": fps, "car": car,
+            "hit_s": hit_s, "hit_wall_s": min(hit_wall_s, hit_s), "hit_share": float(a.get("plan_hit_share") or 0.0)}
 
 
 class H(BaseHTTPRequestHandler):
