@@ -52,7 +52,6 @@
   .key { position: absolute; left: 14px; bottom: 10px; right: 230px; display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--ink-2); font-size: 12px; pointer-events: none; }
   .key i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   .key i.box { width: 9px; height: 9px; border-radius: 2px; }
-  #mini { position: absolute; right: 10px; top: 10px; width: 150px; height: 190px; border-radius: 8px; background: rgba(13,15,18,0.85); border: 1px solid var(--line); cursor: pointer; }
   .viewbar { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; align-items: center; }
   /* (11-17, the user: "update 반영중을 좀 지도 뿌옇게 하고 문구를 박아놔. 렉걸린줄 알잖아") between rollouts the car stands still on
      purpose: the map goes hazy and says so */
@@ -106,7 +105,6 @@
     <canvas id="map"></canvas>
     <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span></div>
       <div class="sub" id="hud_sub">-</div></div>
-    <canvas id="mini" width="300" height="380"></canvas>
     <div class="key">
       <span><i style="background:var(--s-car)"></i>우리 차 · 자취</span>
       <span><i style="background:var(--s-plan)"></i>실제로 몬 plan</span>
@@ -194,14 +192,6 @@ $("v_track").onclick = () => setMode("track");
   const up = () => { drag = null; c.classList.remove("drag"); };
   c.addEventListener("pointerup", up); c.addEventListener("pointercancel", up);
   c.addEventListener("dblclick", toggleFollow);
-  // the inset: click a place to look there
-  $("mini").addEventListener("click", (e) => {
-    if (!LAST || !LAST.mini || VIEW.mode === "follow") return;
-    const r = $("mini").getBoundingClientRect(), m = LAST.mini;
-    VIEW.cx = m.T.x0 + (e.clientX - r.left - m.ox) / m.s; VIEW.cy = m.T.y0 + (m.sh * m.s - (e.clientY - r.top - m.oy)) / m.s;
-    if (VIEW.mode !== "free") VIEW.span = Math.min(VIEW.span, 9);
-    setMode("free");
-  });
 })();
 
 async function loadRuns() {
@@ -383,24 +373,6 @@ function drawMap(f, carP, oppP, T, trail) {
   }
 }
 
-function drawMini(T, carP, oppP) {
-  const { g, W, H } = fit($("mini"));
-  g.clearRect(0, 0, W, H);
-  const sw = T.W * T.res, sh = T.H * T.res, s = Math.min((W - 10) / sw, (H - 10) / sh);
-  const ox = (W - sw * s) / 2, oy = (H - sh * s) / 2;
-  g.drawImage(T.img, ox, oy, sw * s, sh * s);
-  const P = (x, y) => [ox + (x - T.x0) * s, oy + sh * s - (y - T.y0) * s];
-  // what the big map shows, as a frame
-  if (LAST && LAST.s) {
-    const [a, b] = P(LAST.cx - LAST.W / 2 / LAST.s, LAST.cy + LAST.H / 2 / LAST.s), [c2, d] = P(LAST.cx + LAST.W / 2 / LAST.s, LAST.cy - LAST.H / 2 / LAST.s);
-    g.strokeStyle = C["ink-2"]; g.lineWidth = 1; g.strokeRect(a, b, c2 - a, d - b);
-    LAST.mini = { T, s, ox, oy, sh };
-  }
-  const dot = (p, col) => { const [x, y] = P(p[0], p[1]); g.fillStyle = col; g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill(); g.strokeStyle = C.surface; g.lineWidth = 1.5; g.stroke(); };
-  if (oppP) dot(oppP, C["s-opp"]);
-  dot(carP, C["s-car"]);
-}
-
 // ---------------------------------------------------------------- strips (one time axis: now at the right edge)
 function strip(id, series, opt) {
   const { g, W, H } = fit($(id)), padL = 40, padR = 6, padT = 6, padB = 16;
@@ -513,7 +485,6 @@ async function frame() {
     const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;
     const T = TRACK[RUN + ":" + F1.tid] || await track(F1.tid);
     drawMap(F1, carP, oppP, T, F1.trail || []);
-    drawMini(T, carP, oppP);
     $("hud_v").textContent = carP[3].toFixed(1);
     $("hud_v").style.color = F1.hit.some((x) => x > 0) ? C.critical : C.ink;
   }
