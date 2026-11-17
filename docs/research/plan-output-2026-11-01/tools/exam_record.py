@@ -106,6 +106,10 @@ from world_of import world_path, exam_bank, map_name
 WORLD = world_path(ck)                                     # the world the checkpoint was trained in (11-14)
 BANK = exam_bank(WORLD)
 a = argparse.Namespace(**json.load(open(WORLD)))
+if getattr(a, "stage", "race") != "race":
+    # (11-17) a single-seat world (the qualifier, stage "props"): this record reads every car's opponent seat, so the exam runs
+    # the same world as two-seat races with the seat left empty -- the ego meets and sees exactly what it trained in
+    a.stage, a.opp_present = "race", 0.0
 a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
