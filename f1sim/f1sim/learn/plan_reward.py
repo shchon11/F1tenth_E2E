@@ -168,6 +168,10 @@ class PlanReward:
         self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
         # the plan-hit cost's share of a contact and how far into the plan it looks (poses on the control grid; None = all)
         self.plan_hit_share, self.plan_hit_n = PLAN_HIT_SHARE, None
+        # (11-18) walls looked at only this far (poses; None = as far as boxes): a plan's far end is ~0.19 m off the path
+        # the car then drives (tail error, qual26b u344), so on an empty track 7 % of plans graze a wall 0.5-1.0 s ahead that
+        # the car never touches -- priced like boxes that is half the lap reward, for prediction error, not driving
+        self.plan_hit_wall_n = None
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
         # (11-13) the stall price of 11-06 ("--stall-mode progress"): each second the car's progress over the last
@@ -275,6 +279,8 @@ class PlanReward:
         pts = torch.stack([cx, cy], -1)
         tt = tid[:, None, None].expand_as(cx)
         hit = (self.env.sim.track.sample_edt(pts, tt) <= 0.0).any(-1)                  # (B_l, n)
+        if self.plan_hit_wall_n is not None:                                          # walls: only the plan's first poses
+            hit[:, self.plan_hit_wall_n + 1:] = False
         proc = getattr(self.env, "procedural", None)
         if proc is not None:
             eid = self.env.sim.eid[self.lid][:, None, None].expand_as(cx).reshape(-1)

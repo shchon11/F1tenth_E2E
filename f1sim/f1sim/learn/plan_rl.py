@@ -494,6 +494,8 @@ def main(argv=None):
                     help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices); "
                          "default: the world json's \"contact_scale\" (6.59 s / the map's raceline lap, 11-15), else 1")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
+    ap.add_argument("--plan-hit-wall-s", type=float, default=None,
+                    help="(11-18) walls only this far into the plan [s] (boxes still --plan-hit-s); default: as --plan-hit-s")
     ap.add_argument("--hold-p", type=float, default=0.0,
                     help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
     ap.add_argument("--hold-len", default="2,4", help="a held plan drives this many decisions, drawn uniformly (2,4 = 0.2-0.4 s)")
@@ -719,6 +721,8 @@ def main(argv=None):
     pr.contact_scale = float(args.contact_scale)
     pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)
     pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
+    if args.plan_hit_wall_s is not None and args.plan_hit_wall_s < min(args.plan_hit_s, PS.N_STEP * PS.DT):
+        pr.plan_hit_wall_n = int(round(args.plan_hit_wall_s / PS.DT * PS.SUB))
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
