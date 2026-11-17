@@ -463,6 +463,11 @@ def main(argv=None):
                          "(11-16: a stalled car's speed noise drawn afresh every 0.1 s moves it cm and the advantage slope on it was "
                          "0 +- 0.005 over 4838 stalled decisions; cloned stalled cars backed 1 m/s x 1.5 s were driving on 4 s later "
                          "91 %% vs 21 %% left as they were)")
+    ap.add_argument("--online-boxes", type=float, default=0.0,
+                    help="P: that share of box draws keeps the bank layout's pieces on the policy's own empty-track line first "
+                         "(the line: where the learner cars drive with no box on the track, per 0.25 m of lap, fading 0.8 an update); "
+                         "the layout, its count and the empty-track share as always (11-18, the user: '나머지 절반의 상자 에피소드에는 "
+                         "내 길 위 만드는거 굿. 너무 자주하진 말자'); 0 = off")
     ap.add_argument("--stuck-noise", type=float, default=0.0,
                     help="RHO: while the car is stuck -- less than 1 m along the track over the last 2 s, whatever its speed -- the "
                          "first step's SPEED noise is held with RHO (11-18: --noise-corr-stall's |v| < 0.3 m/s missed cars rocking "
@@ -848,6 +853,18 @@ def main(argv=None):
         if stall_on:
             raise SystemExit("--stuck-noise or --noise-corr-stall, not both")
         stall_on, st_rho = True, float(args.stuck_noise)
+    # (11-18) --online-boxes: the policy's own line per track, sums of where the box-free learner cars are per lap bin
+    online_on = args.online_boxes > 0
+    online_share = None
+    if online_on:
+        if env.procedural is None or env.procedural.place != "bank":
+            raise SystemExit("--online-boxes needs a box bank (the world's prop_bank)")
+        ONL_BIN, ONL_FADE, ONL_MIN = 0.25, 0.8, 20.0
+        T_tr = int(pr.goal.lap.numel())
+        ONL_NB = int(math.ceil(float(pr.goal.lap.max()) / ONL_BIN)) + 1
+        onl_w = torch.zeros(T_tr * ONL_NB, device=dev)
+        onl_xy = torch.zeros(T_tr * ONL_NB, 2, device=dev)
+        env.procedural.online_p = float(args.online_boxes)
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -998,6 +1015,15 @@ def main(argv=None):
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1 + args.update_offset, args.updates + 1):
+        if online_on and upd > 1 + args.update_offset:
+            # (11-18) the line the boxes are kept on this rollout: the bins measured often enough, older laps fading
+            if dist is not None:
+                dist.all_reduce(onl_w); dist.all_reduce(onl_xy)
+                onl_w /= args.dist_world; onl_xy /= args.dist_world   # every process the same line (its mean, as the sums)
+            _ok = (onl_w >= ONL_MIN).view(T_tr, ONL_NB)
+            _line = (onl_xy / onl_w.clamp_min(1e-6)[:, None]).view(T_tr, ONL_NB, 2)
+            online_share = env.procedural.set_driven_line(_line, _ok)
+            onl_w *= ONL_FADE; onl_xy *= ONL_FADE
         if args.horizon_auto > 1 and math.isfinite(b_noise):
             # the smallest K whose rollout (all processes) covers the noise scale; never down (the noise scale reads lower as
             # a policy gets worse -- the accumulation rule's feedback loop, --accum-ratchet). The same on every process: the
@@ -1273,6 +1299,16 @@ def main(argv=None):
                     prog_i += 1
                     prog_n = torch.where(_rs, torch.zeros_like(prog_n), (prog_n + 1).clamp(max=STUCK_K))
                     stuck_now = (prog_n >= STUCK_K) & (prog_hist.sum(0) < STUCK_M)
+                if online_on:                                     # where the box-free cars drive, per 0.25 m of lap
+                    _free = ~(env.procedural.p_sid[lid] >= 0).any(1)
+                    if scene is not None:
+                        _free = _free & ~scene.in_replay[lid // env.M]
+                    _t = env.sim.tid[lid]
+                    _L = pr.goal.lap[_t]
+                    _i = _t * ONL_NB + (torch.remainder(_L - pr.d_prev, _L) / ONL_BIN).long().clamp(0, ONL_NB - 1)
+                    _w = _free.float()
+                    onl_w.index_add_(0, _i, _w)
+                    onl_xy.index_add_(0, _i, env.sim.state[lid, :2].float() * _w[:, None])
                 if args.noise_corr > 0 or stall_on:
                     eps_n = torch.where(out["restarted"][:, None], torch.randn_like(eps_n), eps_n)
                 cool += 1
@@ -1697,6 +1733,7 @@ def main(argv=None):
                "accum_actor": args.accum_actor, "noise_scale": b_noise if math.isfinite(b_noise) else None, "horizon": T,
                "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
                "noise_stall_share": nc_stall / max(T, 1) if stall_on else None,
+               "online_piece_share": online_share,
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,

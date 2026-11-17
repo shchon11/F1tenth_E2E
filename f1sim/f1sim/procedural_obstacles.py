@@ -510,6 +510,12 @@ class ProceduralObstacles:
         #: `redraw(..., opp=)` marks as having an opponent (bank layouts)
         self.opp_corridor = False
         self.opp_keep = 0
+        #: (11-18, the user: "부딧히는 장애물들이 거의 9할 이상은 빈 트랙에서 갈 path에 ... 나머지 절반의 상자 에피소드에는 내 길 위
+        #: 만드는거 굿. 너무 자주하진 말자") `online_p`: that share of bank draws keeps the pieces on the policy's own driven line
+        #: first (`b_online`, set by `set_driven_line`), the layout and its count drawn as always. qual26e u100's exam: all 23
+        #: hard box hits were boxes within 0.40 m of the line the policy drives on an empty track, 0 of 857 passes beyond it
+        self.online_p = 0.0
+        self.b_online = None
 
     def _load_bank(self, path: str):
         """`bank` (11-03 night, user: "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): layouts drawn by
@@ -555,6 +561,25 @@ class ProceduralObstacles:
         self.place = "bank"
         print(f"[procedural] bank {path}: {int(self.b_n.min())}-{int(self.b_n.max())} layouts per track, {T} tracks", flush=True)
 
+    def set_driven_line(self, line: torch.Tensor, ok: torch.Tensor, near: float = 0.40) -> float:
+        """(11-18) the policy's own line per track, `line` (T, n, 2) points along the lap and `ok` (T, n) the ones measured:
+        every bank piece whose centre is within `near` of a measured point is marked on the line (`b_online`). Returns the
+        share of the bank's pieces marked."""
+        if self.place != "bank":
+            raise ValueError("set_driven_line: only bank layouts are drawn from a list of pieces")
+        T, K, C = self.b_sid.shape
+        out = torch.zeros(T, K, C, dtype=torch.bool, device=self.device)
+        for ti in range(T):
+            pts = line[ti][ok[ti]].float().to(self.device)
+            if pts.shape[0] == 0:
+                continue
+            xy = self.b_pose[ti, :, :, :2].reshape(-1, 2)
+            d = torch.cdist(xy, pts).amin(1)
+            out[ti] = (d <= near).reshape(K, C) & (self.b_sid[ti] >= 0)
+        self.b_online = out
+        real = self.b_sid >= 0
+        return float(out.sum()) / max(1, int(real.sum()))
+
     def _redraw_bank(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor, opp: Optional[torch.Tensor] = None):
         """`bank`: one stored layout of the env's own track, 1 .. all of its pieces (count "uniform") or all ("fixed")."""
         D, C, dev = int(t.numel()), self.C, self.device
@@ -577,6 +602,10 @@ class ProceduralObstacles:
         if opp is not None and self.opp_keep > 0:
             k = torch.where(opp[:, None], k.clamp_max(self.opp_keep), k)
         r = torch.where(live, self._rand((D, C)), torch.full((D, C), 2.0, device=dev))
+        if self.online_p > 0 and self.b_online is not None:
+            # (11-18) this share of the draws: the pieces on the policy's own line are the first kept (ranked below the rest)
+            on_ = (self._rand((D, 1)) < self.online_p) & self.b_online[t, k_idx] & live
+            r = torch.where(on_, r - 1.0, r)
         live = live & (r.argsort(1).argsort(1) < k) & (self._rand((D, 1)) < self.fraction)
         sid = sid.clamp_min(0)
         if self.has_raceline:
