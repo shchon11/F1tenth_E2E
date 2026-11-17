@@ -150,6 +150,18 @@ class GoalField:
         return torch.where(inside, d, torch.full_like(d, float("nan")))
 
 
+def _outline(corners: torch.Tensor, step: float) -> torch.Tensor:
+    """(k, 2) points round a rectangle given by its four corners (any order, symmetric about the origin), at most `step`
+    apart, corners included"""
+    hl, hw = float(corners[:, 0].abs().max()), float(corners[:, 1].abs().max())
+    ring = [(hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw), (hl, hw)]
+    pts = []
+    for (a0, b0), (a1, b1) in zip(ring[:-1], ring[1:]):
+        m = max(1, int(np.ceil(np.hypot(a1 - a0, b1 - b0) / step)))
+        pts += [(a0 + (a1 - a0) * i / m, b0 + (b1 - b0) * i / m) for i in range(m)]
+    return torch.tensor(pts, dtype=torch.float32, device=corners.device)
+
+
 class PlanReward:
     """Per learner row: `begin(rows)` after resets, `control_step()` after every control step, and once a decision's
     control steps are done `decision(pts)` with the plan just driven (its 10 points in the world); `plan_cost(...)` prices
@@ -166,6 +178,11 @@ class PlanReward:
         self.seen_t = torch.full((Bl,), 1e9, device=device)    # [s] since a beam last hit a car
         self.n_contacts = torch.zeros(Bl, 3, device=device)
         self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
+        # (11-18) the footprint's outline, a point every <= 7.5 cm, for boxes: the four corners alone let a box narrower than
+        # the car (0.27-0.42 m boxes, a 0.31 m car) pass between them dead centre -- 12 of 680 on-path passes on qual26b
+        # u300. A box is at least 0.27 m deep and the poses are 0.025 s apart (<= 0.2 m at 8 m/s), so the front edge
+        # cannot step over one
+        self.outline = _outline(self.corners, 0.075)
         # the plan-hit cost's share of a contact and how far into the plan it looks (poses on the control grid; None = all)
         self.plan_hit_share, self.plan_hit_n = PLAN_HIT_SHARE, None
         # (11-18) walls looked at only this far (poses; None = as far as boxes): a plan's far end is ~0.19 m off the path
@@ -274,17 +291,20 @@ class PlanReward:
         is in a wall or a box, and its price [laps] (0 for a clear plan). The pose now (index 0) is the car, not the plan."""
         tid = self.env.sim.tid[self.lid]
         c, s = torch.cos(psi)[..., None], torch.sin(psi)[..., None]
-        cx = x[..., None] + self.corners[:, 0] * c - self.corners[:, 1] * s           # (B_l, n, 4)
-        cy = y[..., None] + self.corners[:, 0] * s + self.corners[:, 1] * c
-        pts = torch.stack([cx, cy], -1)
-        tt = tid[:, None, None].expand_as(cx)
-        hit = (self.env.sim.track.sample_edt(pts, tt) <= 0.0).any(-1)                  # (B_l, n)
-        if self.plan_hit_wall_n is not None:                                          # walls: only the plan's first poses
-            hit[:, self.plan_hit_wall_n + 1:] = False
+        place = lambda P: torch.stack([x[..., None] + P[:, 0] * c - P[:, 1] * s, y[..., None] + P[:, 0] * s + P[:, 1] * c], -1)
+        if self.plan_hit_wall_n == 0:                                                 # (11-18) walls not looked at
+            hit = torch.zeros(x.shape, dtype=torch.bool, device=x.device)
+        else:
+            pts = place(self.corners)                                                 # (B_l, n, 4, 2)
+            tt = tid[:, None, None].expand(pts.shape[:-1])
+            hit = (self.env.sim.track.sample_edt(pts, tt) <= 0.0).any(-1)              # (B_l, n)
+            if self.plan_hit_wall_n is not None:                                      # walls: only the plan's first poses
+                hit[:, self.plan_hit_wall_n + 1:] = False
         proc = getattr(self.env, "procedural", None)
         if proc is not None:
-            eid = self.env.sim.eid[self.lid][:, None, None].expand_as(cx).reshape(-1)
-            cl = proc.clearance(pts.reshape(-1, 2), eid).reshape(cx.shape)
+            ol = place(self.outline)                                                  # (B_l, n, k, 2): the whole outline
+            eid = self.env.sim.eid[self.lid][:, None, None].expand(ol.shape[:-1]).reshape(-1)
+            cl = proc.clearance(ol.reshape(-1, 2), eid).reshape(ol.shape[:-1])
             hit = hit | (cl <= 0.0).any(-1)
         hit[:, 0] = False
         if self.plan_hit_n is not None:                                               # only the plan's first poses
@@ -314,8 +334,13 @@ class PlanReward:
             shaping = torch.where(restarted, torch.zeros_like(shaping), shaping)
             lap = torch.where(restarted, torch.zeros_like(lap), lap)
         pp = plan_price if plan_price is not None else torch.zeros_like(lap)
+        # (11-18) [m] along the track this decision (the walls-only distance left, its drop; a line crossing adds a lap):
+        # the trainer's stuck rule reads it
+        adv = self.d_prev - d + lap * L
+        if restarted is not None:
+            adv = torch.where(restarted, torch.zeros_like(adv), adv)
         out = {"lap": lap, "shaping": shaping, "contact": -self.cost, "plan_hit": -pp,
-               "reward": lap + shaping - self.cost - pp}
+               "reward": lap + shaping - self.cost - pp, "progress": adv}
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
         if restarted is not None and bool(restarted.any()):

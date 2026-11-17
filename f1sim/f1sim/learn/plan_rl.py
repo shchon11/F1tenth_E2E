@@ -459,6 +459,10 @@ def main(argv=None):
                          "(11-16: a stalled car's speed noise drawn afresh every 0.1 s moves it cm and the advantage slope on it was "
                          "0 +- 0.005 over 4838 stalled decisions; cloned stalled cars backed 1 m/s x 1.5 s were driving on 4 s later "
                          "91 %% vs 21 %% left as they were)")
+    ap.add_argument("--stuck-noise", type=float, default=0.0,
+                    help="RHO: while the car is stuck -- less than 1 m along the track over the last 2 s, whatever its speed -- the "
+                         "first step's SPEED noise is held with RHO (11-18: --noise-corr-stall's |v| < 0.3 m/s missed cars rocking "
+                         "in front of a box); 0 = off")
     ap.add_argument("--noise-corr-car", default="",
                     help="LO,HI [m]: as --noise-corr-box for the nearest other car (critic's column: LO..HI m ahead in the car's "
                          "frame, within 1.5 m of its side); with both, the noise is held when either holds (11-15: cloned cars "
@@ -829,6 +833,17 @@ def main(argv=None):
         _s, _r = (float(x) for x in args.noise_corr_stall.split(","))
         st_k, st_rho = max(int(round(_s / PS.DT)), 1), _r
     still_n = torch.zeros(Bl, dtype=torch.long, device=dev)        # --noise-corr-stall: decisions stood in a row
+    # (11-18, the user: "0.3보다 빠르게 와리가리치는장면들이 종종 보이네") --stuck-noise: stuck by progress, not by speed. A car
+    # rocking at |v| > 0.3 m/s in front of a box drew fresh speed noise every 0.1 s (+-0.2 m/s) and never tried a sustained
+    # back-out; qual26c u125 had box sessions stuck 18-84 s. Stuck = less than STUCK_M along the track over STUCK_K decisions
+    STUCK_K, STUCK_M = int(round(2.0 / PS.DT)), 1.0
+    prog_hist = torch.zeros(STUCK_K, Bl, device=dev)                # the last decisions' progress [m], a ring
+    prog_n = torch.zeros(Bl, dtype=torch.long, device=dev); prog_i = 0
+    stuck_now = torch.zeros(Bl, dtype=torch.bool, device=dev)
+    if args.stuck_noise > 0:
+        if stall_on:
+            raise SystemExit("--stuck-noise or --noise-corr-stall, not both")
+        stall_on, st_rho = True, float(args.stuck_noise)
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -1094,7 +1109,7 @@ def main(argv=None):
                         rho_t = noise_rho[None, :] * _near[:, None].float()
                         nc_near += float(_near.float().mean())
                     if stall_on:                                   # a car that has stood: its speed noise held (11-16)
-                        _st = still_n >= st_k
+                        _st = stuck_now if args.stuck_noise > 0 else (still_n >= st_k)
                         rho_t = (rho_t if rho_t.ndim == 2 else rho_t[None, :]).expand(Bl, -1).clone()
                         rho_t[:, PS.N_STEP:] = torch.where(_st[:, None], torch.full_like(rho_t[:, PS.N_STEP:], st_rho),
                                                            rho_t[:, PS.N_STEP:])
@@ -1242,6 +1257,13 @@ def main(argv=None):
                 if stall_on:
                     _ve = env.sim.state[lid, dyn.IVX].abs()
                     still_n = torch.where(out["restarted"] | (_ve >= 0.3), torch.zeros_like(still_n), still_n + 1)
+                if args.stuck_noise > 0:                          # the progress ring; a restart begins it again
+                    _rs = out["restarted"]
+                    prog_hist[:, _rs] = 0.0
+                    prog_hist[prog_i % STUCK_K] = out["progress"]
+                    prog_i += 1
+                    prog_n = torch.where(_rs, torch.zeros_like(prog_n), (prog_n + 1).clamp(max=STUCK_K))
+                    stuck_now = (prog_n >= STUCK_K) & (prog_hist.sum(0) < STUCK_M)
                 if args.noise_corr > 0 or stall_on:
                     eps_n = torch.where(out["restarted"][:, None], torch.randn_like(eps_n), eps_n)
                 cool += 1
