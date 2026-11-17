@@ -101,7 +101,7 @@
  "spawn_behind_prop": 0.0,
  "speed_pow": 1.0,
  "speed_ref": 5.0,
- "stage": "race",
+ "stage": "props",
  "stall_mode": "progress",
  "stall_price": 0.0,
  "stall_vmin": 1.0,
