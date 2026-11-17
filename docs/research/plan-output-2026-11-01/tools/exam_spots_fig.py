@@ -55,6 +55,10 @@ out, runs = sys.argv[1], sys.argv[2:]
 NMAP = 5
 if "--n" in runs:
     i = runs.index("--n"); NMAP = int(runs[i + 1]); runs = runs[:i] + runs[i + 2:]
+# (11-17, 사용자: "100부터 25단위로 쭈르륵 보고싶은데") --cols C: the maps in rows of C (one run, many checkpoints)
+NCOL = 0
+if "--cols" in runs:
+    i = runs.index("--cols"); NCOL = int(runs[i + 1]); runs = runs[:i] + runs[i + 2:]
 
 
 def chain_exams(run):
@@ -77,10 +81,12 @@ else:
     latest = [(r, max(exams(r))) for r in runs if exams(r)]
     _paths = {(r, u): exams(r)[u] for r, u in latest}
 _w = 3.3 if len(runs) == 1 else 5.0                         # one-run maps sit side by side, narrower
-fig = plt.figure(figsize=(_w * len(latest) + 7.5, 6.8))
-gs = fig.add_gridspec(1, len(latest) + 1, width_ratios=[1] * len(latest) + [2.2 if len(runs) == 1 else 1.45])
+_nc = min(NCOL, len(latest)) if (NCOL and len(runs) == 1) else len(latest)
+_nr = -(-len(latest) // max(_nc, 1))
+fig = plt.figure(figsize=(_w * _nc + 7.5, 6.8 * _nr))
+gs = fig.add_gridspec(_nr, _nc + 1, width_ratios=[1] * _nc + [2.2 if len(runs) == 1 else 1.45])
 for j, (r, u) in enumerate(latest):
-    ax = fig.add_subplot(gs[0, j])
+    ax = fig.add_subplot(gs[j // _nc, j % _nc])
     R = rec(_paths[(r, u)])
     g, ext = R.grid(0)
     ax.imshow((g <= 0).astype(float), origin="lower", extent=ext, cmap="Greys", vmin=0, vmax=1.6)
@@ -98,7 +104,7 @@ for j, (r, u) in enumerate(latest):
     ax.set_xlim(ext[0] + xs.min() * (ext[1] - ext[0]) / g.shape[1] - 0.5, ext[0] + xs.max() * (ext[1] - ext[0]) / g.shape[1] + 0.5)
     ax.set_ylim(ext[2] + ys.min() * (ext[3] - ext[2]) / g.shape[0] - 0.5, ext[2] + ys.max() * (ext[3] - ext[2]) / g.shape[0] + 0.5)
 if len(runs) == 1:
-    sub = gs[0, -1].subgridspec(2, 1, hspace=0.35)
+    sub = gs[:, -1].subgridspec(2, 1, hspace=0.35)
     ax, ax2 = fig.add_subplot(sub[0]), fig.add_subplot(sub[1])
     ch = chain_exams(runs[0])
     u_first = latest[0][1] if latest else 0
@@ -136,7 +142,7 @@ if len(runs) == 1:
     fig.savefig(out, dpi=105)
     print(out)
     sys.exit(0)
-ax = fig.add_subplot(gs[0, -1])
+ax = fig.add_subplot(gs[:, -1])
 for i, r in enumerate(runs):
     E = exams(r)
     if not E:
