@@ -3,284 +3,312 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>학습 실시간</title>
+<title>학습 차 실시간</title>
 <style>
-  :root { --bg:#111418; --panel:#1a1f26; --line:#2a313b; --ink:#e6e9ee; --muted:#8b95a3; --run:#4c9aff; --opp:#ff6b6b;
-          --copy:#c084fc; --plan:#ffa94d; --mean:#69db7c; --box:#b07a45; --scan:#9aa5b1; --hit:#ff4d4f; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:13px/1.4 system-ui, "Noto Sans KR", sans-serif; }
-  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); }
-  header h1 { font-size:16px; margin:0 8px 0 0; }
-  select, button { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:4px 8px; font:inherit; }
-  button.on { border-color:var(--run); color:var(--run); }
-  .chip { padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
-  .chip.hot { color:#111; background:#ffd43b; border-color:#ffd43b; }
-  .chip.copy { color:#111; background:var(--copy); border-color:var(--copy); }
-  main { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(0, 1fr); gap:12px; padding:12px; }
-  @media (max-width: 900px) { main { grid-template-columns:1fr; } }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
-  .card h3 { margin:0 0 6px; font-size:13px; font-weight:600; }
-  .card h3 small { color:var(--muted); font-weight:400; margin-left:6px; }
-  #map { width:100%; aspect-ratio:1/1; display:block; border-radius:8px; background:#0b0d10; }
-  .side { display:grid; gap:12px; }
-  .nums { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
-  .num { background:#141920; border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
-  .num b { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
-  .num span { color:var(--muted); font-size:11px; }
-  canvas.chart { width:100%; height:110px; display:block; }
-  canvas.mem { width:100%; height:180px; display:block; image-rendering:pixelated; border-radius:6px; }
-  .legend { display:flex; flex-wrap:wrap; gap:10px; color:var(--muted); font-size:11px; margin-top:4px; }
-  .legend i { display:inline-block; width:10px; height:3px; vertical-align:middle; margin-right:4px; }
-  #log { max-height:150px; overflow:auto; font-size:12px; color:var(--muted); }
-  #log div { padding:1px 0; border-bottom:1px solid #20262e; }
-  #log .h { color:var(--hit); }
-  .muted { color:var(--muted); }
+  /* Layout after the robotics/telemetry viewers it borrows from: one dominant top-down view whose camera follows the
+     car (Foxglove 3D panel, Rerun's follow camera), a small whole-track inset with the car on it (F1 live-timing track
+     maps), and beside it time-series strips on ONE shared time axis with the events marked across all of them
+     (Rerun timeline, Foxglove plot panel, Apollo Dreamview's PnC monitor). Colours: the dataviz reference palette's dark
+     steps (validated: tools/../ dataviz validate_palette, dark, all checks pass). */
+  :root {
+    color-scheme: dark;
+    --page: #0d0f12; --surface: #15181d; --surface-2: #1b1f25; --line: #2a2f37; --grid: #23272e;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --lane: #22272e; --wall: #0b0c0e; --scan: #6b7480;
+    --s-car: #3987e5; --s-plan: #d95926; --s-mean: #199e70; --s-box: #c98500; --s-copy: #9085e9; --s-opp: #e66767;
+    --critical: #d03b3b; --warning: #fab219;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--ink); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header .title { font-size: 15px; font-weight: 600; margin-right: 4px; }
+  select { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font: inherit; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); white-space: nowrap; }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.live .dot { background: #0ca30c; }
+  .pill.wait .dot { background: var(--warning); }
+  .pill.scene { border-color: var(--warning); color: var(--ink); }
+  .grow { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 12px; padding: 12px 16px 16px; }
+  @media (max-width: 1050px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+  .mapwrap { position: relative; padding: 0; overflow: hidden; }
+  #map { display: block; width: 100%; aspect-ratio: 4 / 3; }
+  .hud { position: absolute; left: 14px; top: 12px; pointer-events: none; }
+  .hud .v { font-size: 34px; font-weight: 600; line-height: 1; }
+  .hud .u { font-size: 13px; color: var(--ink-2); margin-left: 4px; }
+  .hud .sub { color: var(--ink-2); margin-top: 6px; }
+  .key { position: absolute; left: 14px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--ink-2); font-size: 12px; pointer-events: none; }
+  .key i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .key i.box { width: 9px; height: 9px; border-radius: 2px; }
+  #mini { position: absolute; right: 10px; top: 10px; width: 150px; height: 190px; border-radius: 8px; background: rgba(13,15,18,0.85); border: 1px solid var(--line); }
+  .viewbtn { position: absolute; right: 10px; bottom: 10px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; font: inherit; cursor: pointer; }
+  .side { display: grid; gap: 12px; align-content: start; }
+  .strip { padding: 10px 12px 8px; }
+  .strip h3 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; }
+  .strip h3 .now { margin-left: auto; font-weight: 600; font-size: 15px; }
+  .strip h3 .note { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .strip .legend { display: flex; gap: 14px; color: var(--ink-2); font-size: 12px; margin-top: 2px; }
+  .strip .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; }
+  .strip canvas { display: block; width: 100%; height: 86px; margin-top: 4px; }
+  #events { padding: 10px 12px; }
+  #events h3 { margin: 0 0 6px; font-size: 13px; }
+  #evlist { max-height: 170px; overflow: auto; font-size: 12px; }
+  #evlist div { display: flex; gap: 10px; padding: 3px 0; border-top: 1px solid var(--grid); color: var(--ink-2); }
+  #evlist .t { color: var(--muted); width: 64px; flex: none; font-variant-numeric: tabular-nums; }
+  #evlist .crit { color: var(--ink); }
+  #evlist .crit::before { content: "⚠"; color: var(--critical); margin-right: 4px; }
+  .empty { padding: 40px; color: var(--muted); text-align: center; }
 </style>
 </head>
 <body>
 <header>
-  <h1>학습 실시간</h1>
-  <select id="run"></select>
-  <span class="chip" id="age">-</span>
-  <span class="chip" id="upd">update -</span>
-  <span class="chip" id="scene">일반 경주</span>
-  <span class="chip" id="copy">상대 차 없음</span>
-  <button id="follow" class="on">차 따라가기</button>
-  <span class="muted" id="hint"></span>
+  <span class="title">학습 차 실시간</span>
+  <select id="run" aria-label="학습"></select>
+  <span class="pill" id="status"><span class="dot"></span><span id="status_t">-</span></span>
+  <span class="pill" id="upd">-</span>
+  <span class="pill" id="ep">-</span>
+  <span class="pill" id="opp">-</span>
+  <span class="grow"></span>
 </header>
 <main>
-  <section class="card">
-    <h3>학습 차 하나 <small>파랑 = 우리 차(자취) · 주황 = 실제로 몬 plan(잡음 포함) · 초록 점선 = 평균 행동의 plan · 빨강 = 상대 차(보라 = 우리 policy 복제본) · 회색 점 = LiDAR</small></h3>
-    <canvas id="map" width="900" height="900"></canvas>
-    <div class="legend"><span><i style="background:var(--run)"></i>우리 차</span><span><i style="background:var(--plan)"></i>몬 plan</span>
-      <span><i style="background:var(--mean)"></i>평균 plan</span><span><i style="background:var(--opp)"></i>상대 차</span>
-      <span><i style="background:var(--box)"></i>상자</span><span><i style="background:var(--hit)"></i>세게 닿음</span></div>
+  <section class="panel mapwrap">
+    <canvas id="map" width="1200" height="900"></canvas>
+    <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span></div>
+      <div class="sub" id="hud_sub">-</div></div>
+    <canvas id="mini" width="300" height="380"></canvas>
+    <div class="key">
+      <span><i style="background:var(--s-car)"></i>우리 차 · 자취</span>
+      <span><i style="background:var(--s-plan)"></i>실제로 몬 plan</span>
+      <span><i style="background:var(--s-mean);height:2px"></i>평균 행동의 plan (잡음 없음)</span>
+      <span><i style="background:var(--s-opp)"></i>상대 차</span>
+      <span><i style="background:var(--s-copy)"></i>상대 = 우리 복제본</span>
+      <span><i class="box" style="background:var(--s-box)"></i>상자</span>
+    </div>
+    <button class="viewbtn" id="view">전체 트랙 보기</button>
   </section>
   <section class="side">
-    <div class="card">
-      <h3>지금 <small>결정 0.1 s마다</small></h3>
-      <div class="nums">
-        <div class="num"><b id="n_v">-</b><span>실제 속도 m/s</span></div>
-        <div class="num"><b id="n_vh">-</b><span>policy가 짐작한 속도</span></div>
-        <div class="num"><b id="n_val">-</b><span>critic 값 (앞으로 받을 보상)</span></div>
-        <div class="num"><b id="n_noise">-</b><span>이번 잡음 크기 (표준편차 배)</span></div>
-        <div class="num"><b id="n_std">-</b><span>policy 표준편차</span></div>
-        <div class="num"><b id="n_rew">-</b><span>이번 보상</span></div>
-      </div>
-    </div>
-    <div class="card">
-      <h3>속도 <small>실제(파랑) · 짐작(초록) · 최근 30 s</small></h3>
-      <canvas class="chart" id="c_speed" width="600" height="110"></canvas>
-    </div>
-    <div class="card">
-      <h3>critic 값과 보상 <small>값(보라) · 보상: 진행(초록) · 접촉 벌점(빨강)</small></h3>
-      <canvas class="chart" id="c_val" width="600" height="110"></canvas>
-    </div>
-    <div class="card">
-      <h3>plan의 속도 <small>몬 plan 10점의 속도 m/s (앞 0.1 s → 1 s 뒤)</small></h3>
-      <canvas class="chart" id="c_pv" width="600" height="110"></canvas>
-    </div>
-    <div class="card">
-      <h3>기억 128개 <small>세로 = 값 하나, 가로 = 시간(오른쪽이 지금) · 파랑 음수, 빨강 양수</small></h3>
-      <canvas class="mem" id="c_mem" width="300" height="128"></canvas>
-      <div class="legend"><span id="memstat">-</span></div>
-    </div>
-    <div class="card">
-      <h3>일어난 일</h3>
-      <div id="log"></div>
-    </div>
+    <div class="panel strip"><h3>속도 <span class="note">m/s · 최근 20초</span><span class="now" id="now_v">-</span></h3>
+      <div class="legend"><span><i style="background:var(--s-car)"></i>지금 속도</span><span><i style="background:var(--s-plan)"></i>plan이 1초 뒤에 낼 속도</span></div>
+      <canvas id="c_v" width="800" height="172"></canvas></div>
+    <div class="panel strip"><h3>critic 값 <span class="note">앞으로 받을 보상의 예상</span><span class="now" id="now_val">-</span></h3>
+      <canvas id="c_val" width="800" height="172"></canvas></div>
+    <div class="panel strip"><h3>plan이 바뀐 정도 <span class="note">m · 직전 결정의 plan과 같은 시각끼리</span><span class="now" id="now_pc">-</span></h3>
+      <canvas id="c_pc" width="800" height="172"></canvas></div>
+    <div class="panel strip"><h3>기억 변화량 <span class="note">GRU 128개 평균 변화 · 결정마다</span><span class="now" id="now_mc">-</span></h3>
+      <canvas id="c_mc" width="800" height="172"></canvas></div>
+    <div class="panel" id="events"><h3>일어난 일</h3><div id="evlist"></div></div>
   </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-const qs = new URLSearchParams(location.search);
-let RUN = qs.get("run") || "", TRACK = {}, IMG = {}, last = null, follow = true;
-const H = { t: [], v: [], vh: [], val: [], lap: [], con: [], mem: [], key: [] };
-const HMAX = 300;                          // 30 s of decisions
-const css = (k) => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const tok = (k) => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const C = {};
+for (const k of ["page","surface","line","grid","ink","ink-2","muted","lane","wall","scan","s-car","s-plan","s-mean","s-box","s-copy","s-opp","critical","warning"]) C[k] = tok("--" + k);
 
-$("follow").onclick = () => { follow = !follow; $("follow").classList.toggle("on", follow); };
+const SPAN_S = 20;                                  // the strips show the last 20 s of decisions
+let RUN = new URLSearchParams(location.search).get("run") || "", TRACK = {}, lastKey = null, follow = true;
+let F0 = null, F1 = null, t1 = 0, dtF = 0.15;        // the two newest frames, for a smooth car between them
+const S = [];                                       // history: {t, v, vp, val, pc, mc}
+const EV = [];                                      // events on the time axis: {t, kind}
 
-async function runs() {
+$("view").onclick = () => { follow = !follow; $("view").textContent = follow ? "전체 트랙 보기" : "차 따라가기"; };
+
+async function loadRuns() {
   const r = await (await fetch("/api/live_runs")).json();
-  const sel = $("run"); sel.innerHTML = "";
-  for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = `${x.name} (${x.age < 5 ? "지금" : Math.round(x.age) + " s 전"})`; sel.appendChild(o); }
-  if (!r.length) { $("hint").textContent = "실시간 기록을 쓰는 학습이 없습니다 (plan_rl --live-tap)"; return; }
-  if (!RUN || !r.some((x) => x.name === RUN)) RUN = r[0].name;
-  sel.value = RUN;
-  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); for (const k in H) H[k] = []; last = null; };
+  const sel = $("run"); const cur = sel.value || RUN; sel.innerHTML = "";
+  for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = x.name; sel.appendChild(o); }
+  if (!r.length) return;
+  RUN = r.some((x) => x.name === cur) ? cur : r[0].name; sel.value = RUN;
+  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; };
 }
 
 async function track(tid) {
-  const key = RUN + ":" + tid;
-  if (TRACK[key]) return TRACK[key];
-  const t = await (await fetch(`/api/live_track?run=${encodeURIComponent(RUN)}&tid=${tid}`)).json();
-  const img = new Image(); img.src = t.png; await img.decode();
-  t.img = img; TRACK[key] = t; return t;
+  const k = RUN + ":" + tid;
+  if (!TRACK[k]) {
+    const t = await (await fetch(`/api/live_track?run=${encodeURIComponent(RUN)}&tid=${tid}`)).json();
+    // re-tint the walls/lane image to the page's colours once
+    const im = new Image(); im.src = t.png; await im.decode();
+    const cv = document.createElement("canvas"); cv.width = t.W; cv.height = t.H;
+    const g = cv.getContext("2d"); g.drawImage(im, 0, 0);
+    const d = g.getImageData(0, 0, t.W, t.H), L = hex(C.lane), Wl = hex(C.wall);
+    for (let i = 0; i < d.data.length; i += 4) { const c = d.data[i] > 128 ? L : Wl; d.data[i] = c[0]; d.data[i + 1] = c[1]; d.data[i + 2] = c[2]; d.data[i + 3] = 255; }
+    g.putImageData(d, 0, 0); t.img = cv; TRACK[k] = t;
+  }
+  return TRACK[k];
+}
+function hex(h) { const n = parseInt(h.replace("#", ""), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+
+function addEvent(text, crit) {
+  const d = document.createElement("div");
+  d.innerHTML = `<span class="t">${new Date().toLocaleTimeString("ko-KR", { hour12: false })}</span><span class="${crit ? "crit" : ""}">${text}</span>`;
+  $("evlist").prepend(d); while ($("evlist").children.length > 80) $("evlist").lastChild.remove();
 }
 
-function log(text, cls) {
-  const d = document.createElement("div"); d.textContent = new Date().toLocaleTimeString() + "  " + text; if (cls) d.className = cls;
-  $("log").prepend(d); while ($("log").childNodes.length > 60) $("log").lastChild.remove();
-}
+// ---------------------------------------------------------------- map
+const lerp = (a, b, u) => a + (b - a) * u;
+const lerpAng = (a, b, u) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * u; };
+function pose(A, B, u) { return B ? [lerp(A[0], B[0], u), lerp(A[1], B[1], u), lerpAng(A[2], B[2], u), lerp(A[3], B[3], u)] : A; }
 
-function drawMap(f, trail, T) {
-  const c = $("map"), g = c.getContext("2d"), W = c.width;
-  g.fillStyle = "#0b0d10"; g.fillRect(0, 0, W, W);
-  // view: follow the car (10 m wide) or the whole track
+function drawMap(f, carP, oppP, T, trail) {
+  const c = $("map"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
   let cx, cy, span;
-  if (follow) { cx = f.car[0]; cy = f.car[1]; span = 10; }
-  else { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W, T.H) * T.res; }
-  const s = W / span;
-  const P = (x, y) => [(x - cx) * s + W / 2, W / 2 - (y - cy) * s];
-  // track image: pixel (i, j) of the flipped image = world (x0 + i res, y0 + (H - j) res)
+  if (follow) { cx = carP[0] + 1.5 * Math.cos(carP[2]); cy = carP[1] + 1.5 * Math.sin(carP[2]); span = 9; }
+  else { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W * T.res * H / W, T.H * T.res) * 1.05 * W / H; }
+  const s = W / span, P = (x, y) => [(x - cx) * s + W / 2, H / 2 - (y - cy) * s];
   const [ix, iy] = P(T.x0, T.y0 + T.H * T.res);
-  g.imageSmoothingEnabled = false;
-  g.globalAlpha = 0.9; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s); g.globalAlpha = 1;
-  // LiDAR
-  g.fillStyle = css("--scan");
-  for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - 1.2, y - 1.2, 2.4, 2.4); }
+  g.imageSmoothingEnabled = !follow; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s);
+  // LiDAR: quiet points
+  g.fillStyle = C.scan;
+  for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - 1.5, y - 1.5, 3, 3); }
   // boxes
   for (const b of f.boxes) {
     const fp = T.fp[String(b[0])]; if (!fp) continue;
     const c0 = Math.cos(b[3]), s0 = Math.sin(b[3]);
-    g.beginPath();
-    fp.forEach((q, i) => { const [x, y] = P(b[1] + q[0] * c0 - q[1] * s0, b[2] + q[0] * s0 + q[1] * c0); i ? g.lineTo(x, y) : g.moveTo(x, y); });
-    g.closePath(); g.fillStyle = css("--box"); g.fill();
+    g.beginPath(); fp.forEach((q, i) => { const [x, y] = P(b[1] + q[0] * c0 - q[1] * s0, b[2] + q[0] * s0 + q[1] * c0); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.closePath(); g.fillStyle = C["s-box"]; g.fill();
   }
-  // trail
-  g.lineWidth = 3; g.lineCap = "round";
+  // trail, fading into the past
+  g.lineWidth = 3; g.lineCap = "round"; g.lineJoin = "round";
   for (let i = 1; i < trail.length; i++) {
-    const a = trail[i - 1], b = trail[i];
-    if (Math.hypot(a[0] - b[0], a[1] - b[1]) > 3) continue;           // a restart: no line across the map
-    const [x0, y0] = P(a[0], a[1]), [x1, y1] = P(b[0], b[1]);
-    g.strokeStyle = `rgba(76,154,255,${0.15 + 0.85 * i / trail.length})`; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+    const [x0, y0] = P(trail[i - 1][0], trail[i - 1][1]), [x1, y1] = P(trail[i][0], trail[i][1]);
+    g.globalAlpha = 0.12 + 0.6 * i / trail.length; g.strokeStyle = C["s-car"]; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
   }
-  // plans
-  const line = (pts, col, dash, w) => {
-    g.setLineDash(dash); g.strokeStyle = col; g.lineWidth = w; g.beginPath();
+  g.globalAlpha = 1;
+  // plans: the mean's thin, the driven one on top
+  const path = (pts, col, w, dash) => {
+    g.setLineDash(dash || []); g.strokeStyle = col; g.lineWidth = w; g.beginPath();
     pts.forEach((q, i) => { const [x, y] = P(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); g.setLineDash([]);
-    g.fillStyle = col; for (const q of pts) { const [x, y] = P(q[0], q[1]); g.beginPath(); g.arc(x, y, 3, 0, 7); g.fill(); }
   };
-  line(f.plan_mean, css("--mean"), [6, 5], 2);
-  line(f.plan, css("--plan"), [], 2.5);
-  // cars (0.50 x 0.30 m)
+  path(f.plan_mean, C["s-mean"], 2, [7, 6]);
+  path(f.plan, C["s-plan"], 3);
+  const end = f.plan[f.plan.length - 1], [ex, ey] = P(end[0], end[1]);
+  g.fillStyle = C["s-plan"]; g.beginPath(); g.arc(ex, ey, 5, 0, 7); g.fill(); g.strokeStyle = C.surface; g.lineWidth = 2; g.stroke();
+  // cars, 0.50 x 0.30 m
   const car = (st, col) => {
     const c0 = Math.cos(st[2]), s0 = Math.sin(st[2]), L = 0.25, Wd = 0.15;
-    const pts = [[L, Wd], [L, -Wd], [-L, -Wd], [-L, Wd]].map(([a, b]) => P(st[0] + a * c0 - b * s0, st[1] + a * s0 + b * c0));
-    g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
-    g.fillStyle = col; g.fill(); g.strokeStyle = "#000"; g.lineWidth = 1; g.stroke();
-    const [hx, hy] = P(st[0] + L * c0, st[1] + L * s0); g.fillStyle = "#fff"; g.beginPath(); g.arc(hx, hy, 2.5, 0, 7); g.fill();
+    const q = [[L, Wd * 0.8], [L, -Wd * 0.8], [-L, -Wd], [-L, Wd]].map(([a, b]) => P(st[0] + a * c0 - b * s0, st[1] + a * s0 + b * c0));
+    g.beginPath(); q.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
+    g.fillStyle = col; g.fill(); g.strokeStyle = C.surface; g.lineWidth = 2; g.stroke();
   };
-  if (f.opp) car(f.opp, f.copy ? css("--copy") : css("--opp"));
-  car(f.car, css("--run"));
+  if (oppP) car(oppP, f.copy ? C["s-copy"] : C["s-opp"]);
+  car(carP, C["s-car"]);
   if (f.hit.some((x) => x > 0)) {
-    const [x, y] = P(f.car[0], f.car[1]); g.strokeStyle = css("--hit"); g.lineWidth = 4; g.beginPath(); g.arc(x, y, 0.6 * s, 0, 7); g.stroke();
+    const [x, y] = P(carP[0], carP[1]); g.strokeStyle = C.critical; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 0.55 * s, 0, 7); g.stroke();
   }
 }
 
-function chart(id, series, opts = {}) {
-  const c = $(id), g = c.getContext("2d"), W = c.width, Hh = c.height;
-  g.clearRect(0, 0, W, Hh);
-  const all = series.flatMap((s) => s.data).filter((v) => Number.isFinite(v));
-  if (!all.length) return;
-  let lo = opts.lo ?? Math.min(...all), hi = opts.hi ?? Math.max(...all);
-  if (hi - lo < 1e-6) { hi += 0.5; lo -= 0.5; }
-  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
-  const Y = (v) => Hh - 4 - (v - lo) / (hi - lo) * (Hh - 8);
-  g.strokeStyle = css("--line"); g.lineWidth = 1;
-  if (lo < 0 && hi > 0) { g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.stroke(); }
-  g.fillStyle = css("--muted"); g.font = "11px system-ui"; g.fillText(hi.toFixed(2), 4, 12); g.fillText(lo.toFixed(2), 4, Hh - 6);
+function drawMini(T, carP, oppP) {
+  const c = $("mini"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  const sw = T.W * T.res, sh = T.H * T.res, s = Math.min((W - 16) / sw, (H - 16) / sh);
+  const ox = (W - sw * s) / 2, oy = (H - sh * s) / 2;
+  g.drawImage(T.img, ox, oy, sw * s, sh * s);
+  const P = (x, y) => [ox + (x - T.x0) * s, oy + sh * s - (y - T.y0) * s];
+  const dot = (p, col) => { const [x, y] = P(p[0], p[1]); g.fillStyle = col; g.beginPath(); g.arc(x, y, 6, 0, 7); g.fill(); g.strokeStyle = C.surface; g.lineWidth = 2; g.stroke(); };
+  if (oppP) dot(oppP, C["s-opp"]);
+  dot(carP, C["s-car"]);
+}
+
+// ---------------------------------------------------------------- strips (one time axis: now at the right edge)
+function strip(id, series, opt) {
+  const c = $(id), g = c.getContext("2d"), W = c.width, H = c.height, padL = 60, padR = 10, padT = 10, padB = 30;
+  g.clearRect(0, 0, W, H);
+  const now = S.length ? S[S.length - 1].t : 0, t0 = now - SPAN_S;
+  const vis = S.filter((r) => r.t >= t0);
+  let vals = [];
+  for (const s of series) for (const r of vis) { const v = r[s.key]; if (v != null && isFinite(v)) vals.push(v); }
+  if (!vals.length) return;
+  let lo = opt.lo != null ? Math.min(opt.lo, ...vals) : Math.min(...vals), hi = Math.max(...vals);
+  if (hi - lo < (opt.minSpan || 1e-3)) { const m = (hi + lo) / 2; lo = m - (opt.minSpan || 1e-3) / 2; hi = m + (opt.minSpan || 1e-3) / 2; }
+  const step = nice((hi - lo) / 3); lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+  if (opt.lo != null) lo = Math.max(lo, opt.lo);
+  const X = (t) => padL + (t - t0) / SPAN_S * (W - padL - padR), Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
+  // grid + ticks
+  g.font = "20px system-ui"; g.fillStyle = C.muted; g.strokeStyle = C.grid; g.lineWidth = 1;
+  g.textAlign = "right";
+  for (let v = lo; v <= hi + 1e-9; v += step) { const y = Math.round(Y(v)) + 0.5; g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(fmt(v, step), padL - 8, y + 7); }
+  g.textAlign = "center";
+  for (let k = 0; k <= SPAN_S; k += 5) { const x = X(t0 + k); g.fillText(k === SPAN_S ? "지금" : `${k - SPAN_S}초`, Math.max(padL + 18, Math.min(x, W - 26)), H - 4); }
+  g.textAlign = "left";
+  // events across the strip: hard contacts (critical), new episodes (dashed)
+  for (const e of EV) {
+    if (e.t < t0) continue; const x = Math.round(X(e.t)) + 0.5;
+    g.strokeStyle = e.kind === "hit" ? C.critical : C.muted; g.lineWidth = e.kind === "hit" ? 2 : 1; g.setLineDash(e.kind === "hit" ? [] : [4, 4]);
+    g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.setLineDash([]);
+  }
   for (const s of series) {
-    const n = s.data.length; if (!n) continue;
-    const X = (i) => W - (n - 1 - i) * (W / (HMAX - 1));
-    if (s.bars) {
-      g.fillStyle = s.col;
-      s.data.forEach((v, i) => { if (!v) return; const y0 = Y(0), y1 = Y(v); g.fillRect(X(i) - 1, Math.min(y0, y1), 2, Math.abs(y1 - y0)); });
-      continue;
+    g.strokeStyle = s.col; g.lineWidth = 3; g.lineJoin = "round"; g.lineCap = "round"; g.beginPath();
+    let on = false, prevT = null;
+    for (const r of vis) {
+      const v = r[s.key];
+      if (v == null || !isFinite(v) || (prevT != null && r.t - prevT > 1.0)) { on = false; prevT = r.t; if (v == null) continue; }
+      const x = X(r.t), y = Y(v); on ? g.lineTo(x, y) : g.moveTo(x, y); on = true; prevT = r.t;
     }
-    g.strokeStyle = s.col; g.lineWidth = s.w || 2; g.beginPath();
-    s.data.forEach((v, i) => { const x = X(i), y = Y(v); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
+    g.stroke();
   }
 }
+function nice(x) { const p = Math.pow(10, Math.floor(Math.log10(x || 1))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x) return m * p; return 10 * p; }
+function fmt(v, step) { return step >= 1 ? v.toFixed(0) : step >= 0.1 ? v.toFixed(1) : step >= 0.01 ? v.toFixed(2) : v.toFixed(3); }
 
-function bars(id, vals) {
-  const c = $(id), g = c.getContext("2d"), W = c.width, Hh = c.height;
-  g.clearRect(0, 0, W, Hh);
-  const hi = Math.max(9, ...vals), bw = W / vals.length;
-  vals.forEach((v, i) => {
-    const h = (Math.max(0, v) / hi) * (Hh - 18);
-    g.fillStyle = css("--plan"); g.fillRect(i * bw + 4, Hh - 14 - h, bw - 8, h);
-    g.fillStyle = css("--muted"); g.font = "11px system-ui"; g.fillText(v.toFixed(1), i * bw + 6, Hh - 2);
-  });
-}
-
-function drawMem() {
-  const c = $("c_mem"), g = c.getContext("2d"), cols = c.width, rows = c.height;
-  const img = g.createImageData(cols, rows), M = H.mem, n = M.length;
-  for (let j = 0; j < cols; j++) {
-    const m = M[n - cols + j];
-    for (let i = 0; i < rows; i++) {
-      const v = m ? Math.max(-1, Math.min(1, m[i] || 0)) : 0, k = 4 * (i * cols + j);
-      if (!m) { img.data[k + 3] = 255; continue; }
-      const a = Math.abs(v);
-      img.data[k] = v > 0 ? 40 + 215 * a : 40; img.data[k + 1] = 40 + 30 * (1 - a); img.data[k + 2] = v < 0 ? 40 + 215 * a : 40; img.data[k + 3] = 255;
-    }
-  }
-  g.putImageData(img, 0, 0);
-  if (n >= 2) {
-    const a = M[n - 1], b = M[n - 2];
-    let d = 0, held = 0;
-    for (let i = 0; i < a.length; i++) { const e = Math.abs(a[i] - b[i]); d += e; if (e < 0.01) held++; }
-    $("memstat").textContent = `지난 결정 대비 평균 변화 ${(d / a.length).toFixed(3)} · 거의 그대로(0.01 미만)인 값 ${held}/${a.length}개`;
-  }
-}
-
-async function tick() {
+// ---------------------------------------------------------------- data
+let tick0 = performance.now();
+async function poll() {
   if (!RUN) return;
-  let d;
-  try {
-    const r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}`, { cache: "no-store" });
-    if (!r.ok) { $("hint").textContent = (await r.json()).error || "기록 없음"; return; }
-    const age = parseFloat(r.headers.get("X-Age") || "0");
-    // the car moves only while the training collects its decisions; between rollouts it computes the update (PPO)
-    $("age").textContent = age < 2 ? "실시간" : age < 300 ? `update 계산 중 · ${age.toFixed(0)} s 전 결정` : `멈춤 · ${(age / 60).toFixed(0)}분 전 기록`;
-    $("age").classList.toggle("hot", age >= 2);
-    d = await r.json();
-  } catch (e) { return; }
-  const f = d.now, key = f.upd * 100000 + f.k;
-  if (last === key) return;
-  const prev = H.key.length ? H.key[H.key.length - 1] : null;
-  last = key;
-  const T = await track(f.tid);
-  // history
-  H.v.push(f.car[3]); H.vh.push(f.vhat); H.val.push(f.value); H.lap.push(f.lap + f.shaping); H.con.push(f.contact); H.mem.push(f.mem); H.key.push(key);
-  for (const k in H) if (H[k].length > HMAX) H[k].shift();
-  // header
+  let r;
+  try { r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}`, { cache: "no-store" }); } catch (e) { return; }
+  if (!r.ok) return;
+  const age = parseFloat(r.headers.get("X-Age") || "0");
+  const live = age < 2;
+  $("status").className = "pill " + (live ? "live" : "wait");
+  $("status_t").textContent = live ? "실시간" : age < 300 ? `update 계산 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`;
+  const d = await r.json(), f = d.now, key = f.upd * 100000 + f.k;
+  if (key === lastKey) return;
+  lastKey = key;
+  const t = f.t;
+  if (F1 && t - F1.t < 3) dtF = Math.max(0.05, Math.min(0.5, 0.7 * dtF + 0.3 * (t - F1.t)));
+  F0 = F1; F1 = f; t1 = performance.now();
+  if (f.new_ep) { EV.push({ t, kind: "ep" }); addEvent(f.replay ? "새 에피소드: 장면 재생 (예전에 세게 닿은 장면)" : "새 에피소드: 일반 경주", false); }
+  const kinds = ["벽", "상자", "상대 차"];
+  f.hit.forEach((h, i) => { if (h > 0) { EV.push({ t, kind: "hit" }); addEvent(`${kinds[i]}에 세게 닿음 · ${f.car[3].toFixed(1)} m/s`, true); } });
+  S.push({ t, v: f.car[3], vp: f.plan_v[9], val: f.value, pc: f.plan_change, mc: f.mem_change });
+  while (S.length && S[0].t < t - SPAN_S - 2) S.shift();
+  while (EV.length && EV[0].t < t - SPAN_S - 2) EV.shift();
   $("upd").textContent = `update ${f.upd} · 결정 ${f.k}`;
-  $("scene").textContent = f.replay ? "장면 재생 중 (예전에 박은 장면)" : "일반 경주";
-  $("scene").classList.toggle("hot", f.replay);
-  $("copy").textContent = f.opp ? (f.copy ? "상대 = 우리 policy 복제본" : "상대 = 기존 상대 차") : "상대 차 없음";
-  $("copy").classList.toggle("copy", !!(f.opp && f.copy));
-  // numbers
-  $("n_v").textContent = f.car[3].toFixed(2); $("n_vh").textContent = f.vhat.toFixed(2); $("n_val").textContent = f.value.toFixed(3);
-  $("n_noise").textContent = f.noise.toFixed(2); $("n_std").textContent = f.std.toFixed(3); $("n_rew").textContent = f.reward.toFixed(4);
-  // events
-  const kinds = ["벽", "상자", "차"];
-  f.hit.forEach((h, i) => { if (h > 0) log(`세게 닿음: ${kinds[i]} (${f.car[3].toFixed(1)} m/s)`, "h"); });
-  if (prev !== null && f.k < (prev % 100000) && false) log("update 끝");
-  drawMap(f, d.trail, T);
-  chart("c_speed", [{ data: H.v, col: css("--run") }, { data: H.vh, col: css("--mean"), w: 1.5 }], { lo: 0 });
-  chart("c_val", [{ data: H.lap, col: css("--mean"), bars: true }, { data: H.con, col: css("--hit"), bars: true }, { data: H.val, col: "#b197fc" }]);
-  bars("c_pv", f.plan_v);
-  drawMem();
+  $("ep").textContent = f.replay ? "장면 재생 중" : "일반 경주"; $("ep").className = "pill" + (f.replay ? " scene" : "");
+  $("opp").textContent = f.opp ? (f.copy ? "상대: 우리 policy 복제본" : "상대: 기존 상대 차") : "상대 차 없음";
+  $("now_v").textContent = f.car[3].toFixed(2); $("now_val").textContent = f.value.toFixed(2);
+  $("now_pc").textContent = f.plan_change == null ? "-" : f.plan_change.toFixed(2);
+  $("now_mc").textContent = f.mem_change == null ? "-" : f.mem_change.toFixed(3);
+  $("hud_sub").textContent = `plan 목표 ${f.plan_v[0].toFixed(1)} · 1초 뒤 ${f.plan_v[9].toFixed(1)} m/s`;
+  F1.trail = d.trail;
+  strip("c_v", [{ key: "v", col: C["s-car"] }, { key: "vp", col: C["s-plan"] }], { lo: 0, minSpan: 2 });
+  strip("c_val", [{ key: "val", col: C["s-car"] }], { minSpan: 0.2 });
+  strip("c_pc", [{ key: "pc", col: C["s-car"] }], { lo: 0, minSpan: 0.1 });
+  strip("c_mc", [{ key: "mc", col: C["s-car"] }], { lo: 0, minSpan: 0.01 });
 }
 
-let lastEp = null;
+async function frame() {
+  if (F1) {
+    const u = F0 ? Math.min(1, (performance.now() - t1) / (dtF * 1000)) : 1;
+    const carP = F0 && !F1.new_ep ? pose(F0.car, F1.car, u) : F1.car;
+    const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;
+    const T = TRACK[RUN + ":" + F1.tid] || await track(F1.tid);
+    drawMap(F1, carP, oppP, T, F1.trail || []);
+    drawMini(T, carP, oppP);
+    $("hud_v").textContent = carP[3].toFixed(1);
+    $("hud_v").style.color = F1.hit.some((x) => x > 0) ? C.critical : C.ink;
+  }
+  requestAnimationFrame(() => frame().catch(() => requestAnimationFrame(frame)));
+}
+
 (async () => {
-  await runs();
-  setInterval(() => tick().catch(() => {}), 100);
-  setInterval(() => runs().catch(() => {}), 15000);
+  await loadRuns();
+  if (!RUN) { document.querySelector("main").innerHTML = '<div class="empty">실시간 기록을 쓰는 학습이 없습니다 (plan_rl --live-tap)</div>'; return; }
+  setInterval(() => poll().catch(() => {}), 100);
+  setInterval(() => loadRuns().catch(() => {}), 20000);
+  frame();
 })();
 </script>
 </body>

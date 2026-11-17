@@ -55,6 +55,9 @@ class LiveTap:
         except Exception:
             self.mount_x = 0.0
         self.hard0 = sim.contact_counts[self.r, 3:6].clone()
+        self.prev_plan = None                 # the last decision's plan (world), for how much the new one changed
+        self.prev_mem = None
+        self.prev_xy = None
 
     @torch.no_grad()
     def record(self, upd: int, kd: int, pts: torch.Tensor, pts_mean: torch.Tensor, plan_v: torch.Tensor,
@@ -93,6 +96,16 @@ class LiveTap:
         ok = np.isfinite(rr) & (rr > 0.05) & (rr < 29.0)
         scan = np.stack([sx + rr * np.cos(a), sy + rr * np.sin(a)], 1)[ok]
         bx = bx.reshape(-1, 4)
+        plan_xy = plan.reshape(10, 2)
+        # a new episode: the car was put somewhere else (a reset, a scene) -- nothing to compare with
+        new_ep = self.prev_xy is None or float(np.hypot(*(car[:2] - self.prev_xy))) > 2.0
+        # the network's reaction: the new plan against the last one at the same moments (point k now = point k+1 then)
+        plan_change = None if new_ep or self.prev_plan is None else \
+            float(np.linalg.norm(plan_xy[:-1] - self.prev_plan[1:], axis=1).mean())
+        mem_change = None if new_ep or self.prev_mem is None or not len(mm) else float(np.abs(mm - self.prev_mem).mean())
+        self.prev_plan, self.prev_mem, self.prev_xy = plan_xy, (mm.copy() if len(mm) else None), car[:2].copy()
+        if new_ep:
+            self.trail.clear()
         self.trail.append(_r([car[0], car[1], car[3]], 2))
         now = {"t": round(time.time(), 3), "upd": int(upd), "k": int(kd), "tid": int(tid[0]),
                "car": _r(car), "opp": _r(opp) if pres[0] > 0.5 else None,
@@ -101,7 +114,9 @@ class LiveTap:
                "scan": _r(scan, 2), "replay": bool(replay), "copy": bool(copy_opp),
                "value": round(float(val[0]), 4), "reward": round(float(rew[0]), 5), "lap": round(float(lap_[0]), 5),
                "contact": round(float(con[0]), 5), "shaping": round(float(shp[0]), 5), "vhat": round(float(vh[0]), 3),
-               "noise": round(float(noi[0]), 3), "std": round(float(sd[0]), 4), "mem": _r(mm, 3)}
+               "noise": round(float(noi[0]), 3), "std": round(float(sd[0]), 4), "new_ep": bool(new_ep),
+               "plan_change": None if plan_change is None else round(plan_change, 4),
+               "mem_change": None if mem_change is None else round(mem_change, 5)}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))
