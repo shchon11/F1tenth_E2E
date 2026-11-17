@@ -1020,9 +1020,9 @@ def main(argv=None):
             if dist is not None:
                 dist.all_reduce(onl_w); dist.all_reduce(onl_xy)
                 onl_w /= args.dist_world; onl_xy /= args.dist_world   # every process the same line (its mean, as the sums)
-            _ok = (onl_w >= ONL_MIN).view(T_tr, ONL_NB)
-            _line = (onl_xy / onl_w.clamp_min(1e-6)[:, None]).view(T_tr, ONL_NB, 2)
-            online_share = env.procedural.set_driven_line(_line, _ok)
+            onl_ok = (onl_w >= ONL_MIN).view(T_tr, ONL_NB)
+            onl_line = (onl_xy / onl_w.clamp_min(1e-6)[:, None]).view(T_tr, ONL_NB, 2)
+            online_share = env.procedural.set_driven_line(onl_line, onl_ok)
             onl_w *= ONL_FADE; onl_xy *= ONL_FADE
         if args.horizon_auto > 1 and math.isfinite(b_noise):
             # the smallest K whose rollout (all processes) covers the noise scale; never down (the noise scale reads lower as
@@ -1300,15 +1300,16 @@ def main(argv=None):
                     prog_n = torch.where(_rs, torch.zeros_like(prog_n), (prog_n + 1).clamp(max=STUCK_K))
                     stuck_now = (prog_n >= STUCK_K) & (prog_hist.sum(0) < STUCK_M)
                 if online_on:                                     # where the box-free cars drive, per 0.25 m of lap
-                    _free = ~(env.procedural.p_sid[lid] >= 0).any(1)
+                    # (own names: `_w` and friends are read by the closures above, e.g. priv_h's box columns)
+                    onl_free = ~(env.procedural.p_sid[lid] >= 0).any(1)
                     if scene is not None:
-                        _free = _free & ~scene.in_replay[lid // env.M]
-                    _t = env.sim.tid[lid]
-                    _L = pr.goal.lap[_t]
-                    _i = _t * ONL_NB + (torch.remainder(_L - pr.d_prev, _L) / ONL_BIN).long().clamp(0, ONL_NB - 1)
-                    _w = _free.float()
-                    onl_w.index_add_(0, _i, _w)
-                    onl_xy.index_add_(0, _i, env.sim.state[lid, :2].float() * _w[:, None])
+                        onl_free = onl_free & ~scene.in_replay[lid // env.M]
+                    onl_t = env.sim.tid[lid]
+                    onl_L = pr.goal.lap[onl_t]
+                    onl_i = onl_t * ONL_NB + (torch.remainder(onl_L - pr.d_prev, onl_L) / ONL_BIN).long().clamp(0, ONL_NB - 1)
+                    onl_f = onl_free.float()
+                    onl_w.index_add_(0, onl_i, onl_f)
+                    onl_xy.index_add_(0, onl_i, env.sim.state[lid, :2].float() * onl_f[:, None])
                 if args.noise_corr > 0 or stall_on:
                     eps_n = torch.where(out["restarted"][:, None], torch.randn_like(eps_n), eps_n)
                 cool += 1
