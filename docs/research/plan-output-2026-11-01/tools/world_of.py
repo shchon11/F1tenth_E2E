@@ -8,9 +8,19 @@ EXAM_BANKS = "/home/shchon11/f1sim_runs/prop_banks_exam1"
 
 
 def world_path(ck) -> str:
+    """The checkpoint's own world json. Never another map in its place (11-17: on the lab PC the path recorded here,
+    /home/shchon11/F1tenth_E2E/f1sim/..., did not exist, and four Korea 2026 checkpoints were silently examined on
+    Korea 2025): the recorded path, else the same file in this code's configs, else an error."""
     from f1sim.learn.plan_rl import WORLD
-    w = (ck.get("args") or {}).get("world") or WORLD
-    return w if os.path.exists(w) else WORLD
+    w = (ck.get("args") or {}).get("world")
+    if not w:
+        return WORLD                                       # an old checkpoint, trained before worlds were recorded
+    if os.path.exists(w):
+        return w
+    here = os.path.join(os.path.dirname(WORLD), os.path.basename(w))
+    if os.path.exists(here):
+        return here
+    raise FileNotFoundError(f"checkpoint world {w} not found (nor {here}); refusing to substitute another map")
 
 
 def map_name(world: str) -> str:
