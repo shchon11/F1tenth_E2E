@@ -1155,7 +1155,10 @@ class SimWorker:
         map_legacy = scenario.legacy()
         session_scenario = scenario.short()
         self.stage(gen, "map", session_scenario)
-        track = self.load_track(map_legacy)
+        # walls as smooth curves, not 5 cm grid stairs (11-17, `Track.with_smooth_walls`): what the console draws is what
+        # the car hits and the LiDAR sees. Policies trained on the stairs drive it too (walls within ~4 cm).
+        from .. import maps as _maps
+        track = self.load_track(_maps.smooth_name(map_legacy))
         self._check_cancel(gen)
 
         races = max(1, int(cfg.races))

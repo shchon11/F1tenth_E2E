@@ -213,7 +213,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # The HUD, and in its place while 장애물 편집 is on, the editor's card (`layout_editor`).
         self.hud_stack = QtWidgets.QStackedWidget()
         self.hud_stack.setFixedWidth(308)
-        self.hud_stack.addWidget(self._build_hud())
+        # (11-17) scrolls rather than squeezes: in a 1:1 race the 보는 차 card pushed the panel past a 960 px window and
+        # the top tiles were pressed until their numbers overlapped their captions
+        self._hud = self._build_hud()
+        hud_scroll = QtWidgets.QScrollArea()
+        hud_scroll.setObjectName("PanelScroll")
+        hud_scroll.setWidgetResizable(True)
+        hud_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        hud_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        hud_scroll.setWidget(self._hud)
+        self.hud_stack.addWidget(hud_scroll)
+        QtCore.QTimer.singleShot(0, self._fit_hud)
         self.hud_stack.addWidget(self._build_edit_page())
         bh.addWidget(self.hud_stack)
         self.centre_stack = QtWidgets.QStackedWidget()
@@ -284,10 +294,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h.addWidget(self.badge)
         return bar
 
+    def _fit_hud(self) -> None:
+        """The panel's cards keep their natural height; the scroll area takes what the window cannot."""
+        hud = getattr(self, "_hud", None)
+        if hud is not None and hud.layout() is not None:
+            hud.setMinimumHeight(hud.layout().sizeHint().height())
+
     def _build_hud(self) -> QtWidgets.QWidget:
         hud = QtWidgets.QFrame()
         hud.setObjectName("Hud")
-        hud.setFixedWidth(308)
         v = QtWidgets.QVBoxLayout(hud)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(10)
@@ -1032,7 +1047,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.t_simt.set_value(f"{float(t_sim):.1f}" if t_sim is not None else "—")
         self.t_simt.set_sub(f"배속 {sim_rate:.2f}×" if sim_rate is not None else "")
         f, n = int(frame.get("focus", 0)), int(frame.get("n", 0))
-        self.focus_card.setVisible(n > 1)
+        if self.focus_card.isHidden() == (n > 1):
+            self.focus_card.setVisible(n > 1)
+            self._fit_hud()
         if not 0 <= f < n:
             return
         v = float(frame["vx"][f])

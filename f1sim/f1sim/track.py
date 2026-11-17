@@ -267,6 +267,73 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
+    def with_smooth_walls(self, factor: int = 4, cap_cells: float = 0.55) -> "Track":
+        """The same map with its walls as smooth curves instead of grid staircases (2026-11-17, the user:
+        "계단현상 존나 꼴보기 싫었거든 ... 다시만들자").
+
+        A map is a 5 cm grid, so a wall a few degrees off the grid axes is stored as long runs and one-cell
+        (5 cm) jogs -- on the bag-scan Korea 2026 map one every ~2 m, on the old Korea map's 6 degree walls one
+        every ~0.4 m. Everything read those steps: the car hit them, the LiDAR returned them (5 cm against a
+        measured 7 mm range noise, so the policy saw stairs the real hose does not have), and the console drew
+        them. Here every solid/floor boundary is redrawn as the smoothest curve that stays within `cap_cells`
+        of the grid's cell edges (where the true wall must lie): a staircase becomes the straight line it
+        digitises, a real corner stays where it is. The grid is then rebuilt `factor` times finer from those
+        curves -- 1.25 cm steps at the default, below the range noise -- with each solid cell keeping the class
+        (hose / wall / unseen solid) of the original cell it came from. Collisions, the LiDAR and the console's
+        hoses all read that one grid, so what is drawn is what is hit.
+        """
+        from skimage.measure import find_contours
+        from scipy.spatial import cKDTree
+        f = int(factor)
+        res, occ = float(self.resolution), np.asarray(self.occupancy, bool)
+        H, W = occ.shape
+        ox, oy = float(self.origin[0]), float(self.origin[1])
+        # the solid/floor boundaries on cell edges (an edge-padded grid: the canvas border is not a wall)
+        pad = np.pad(occ.astype(np.float32), 1, mode="edge")
+        samples, normals = [], []
+        for c in find_contours(pad, 0.5):
+            if len(c) < 8:
+                continue
+            P = np.stack([ox + (c[:, 1] - 0.5) * res, oy + (c[:, 0] - 0.5) * res], 1)    # (row, col) -> (x, y)
+            closed = float(np.linalg.norm(P[0] - P[-1])) <= 1e-6
+            Q = _taut_curve(P, res, closed, cap_cells)
+            # which side is solid: the original cells either side of the original contour, length-weighted
+            tq = np.gradient(Q, axis=0)
+            tq /= np.linalg.norm(tq, axis=1, keepdims=True) + 1e-12
+            nq = np.stack([-tq[:, 1], tq[:, 0]], 1)
+            probe = 0.75 * res
+            side = (_cell(occ, Q + probe * nq, ox, oy, res).astype(np.float64)
+                    - _cell(occ, Q - probe * nq, ox, oy, res).astype(np.float64)).sum()
+            samples.append(Q); normals.append(nq * (1.0 if side >= 0 else -1.0))
+        # the finer grid: every fine cell takes its coarse cell's value, then the cells near a boundary
+        # take the side of the smoothed curve they lie on
+        occ_f = np.repeat(np.repeat(occ, f, 0), f, 1)
+        rf = res / f
+        if samples:
+            S = np.concatenate(samples); Nn = np.concatenate(normals)
+            near = ndimage.binary_dilation(occ ^ ndimage.binary_erosion(occ, border_value=1), iterations=2)
+            near_f = np.repeat(np.repeat(near, f, 0), f, 1)
+            ii, jj = np.nonzero(near_f)
+            pts = np.stack([ox + (jj + 0.5) * rf, oy + (ii + 0.5) * rf], 1)
+            _, k = cKDTree(S).query(pts)
+            occ_f[ii, jj] = ((pts - S[k]) * Nn[k]).sum(1) > 0
+        # classes: a fine solid cell is what the nearest original solid cell was
+        idx = ndimage.distance_transform_edt(~occ, return_distances=False, return_indices=True)
+        ci, cj = np.nonzero(occ_f)
+        ri, rj = idx[0][ci // f, cj // f], idx[1][ci // f, cj // f]
+        duct_f = np.zeros_like(occ_f); tall_f = np.zeros_like(occ_f)
+        if self.duct is not None:
+            duct_f[ci, cj] = np.asarray(self.duct, bool)[ri, rj]
+        if self.tall is not None:
+            tall_f[ci, cj] = np.asarray(self.tall, bool)[ri, rj]
+        edt = ndimage.distance_transform_edt(~occ_f).astype(np.float32) * rf
+        t = Track(occ_f, rf, (ox, oy), edt, self.centerline, self.name, duct=duct_f, tall=tall_f,
+                  duct_height=self.duct_height, props=self.props)
+        # the same venue: the same name (obstacle banks, settings, logs key on it) and the original's racing line
+        # (`Raceline.build_cached`: the walls moved at most ~4 cm, inside the line's 0.40 m margin)
+        t.smooth_parent = self
+        return t
+
     def with_warp(self, seed: int = 0, scale=(0.95, 1.05), width=(-0.10, 0.10), dents=(1, 3),
                   dent_depth=(0.08, 0.22), dent_run=(1.0, 3.0), shaves=(1, 3), shave_depth=(0.06, 0.18),
                   shave_run=(1.0, 2.5), wall=0.10, min_half=0.55) -> "Track":
@@ -798,6 +865,8 @@ class Track:
             x_hi = self.origin[0] + (W - 1) * self.resolution
             t.props = tuple(StaticProp(p.style, x_lo + x_hi - p.x, p.y, math.pi - p.yaw, p.seed, p.dims)
                             for p in self.props)
+        if getattr(self, "smooth_parent", None) is not None:
+            t.smooth_parent = self.smooth_parent.mirrored()
         return t
 
     def grid_key(self):
@@ -830,18 +899,24 @@ class Track:
         """
         if not self.props:
             return self
-        return Track(self.occupancy, self.resolution, self.origin, self.edt, self.centerline,
-                     self.name + "_bare", duct=self.duct, tall=self.tall, edt_duct=self.edt_duct,
-                     edt_tall=self.edt_tall, duct_height=self.duct_height, props=())
+        t = Track(self.occupancy, self.resolution, self.origin, self.edt, self.centerline,
+                  self.name + "_bare", duct=self.duct, tall=self.tall, edt_duct=self.edt_duct,
+                  edt_tall=self.edt_tall, duct_height=self.duct_height, props=())
+        if getattr(self, "smooth_parent", None) is not None:
+            t.smooth_parent = self.smooth_parent.bare()
+        return t
 
     def reversed(self) -> "Track":
         """Same map, lap driven the other way round (centerline reversed). Grids are shared, not
         copied, so TrackTensors keeps a single GPU copy for both directions."""
         cl = None if self.centerline is None else np.ascontiguousarray(self.centerline[::-1])
         # Props stand where they stand: driving the lap the other way round does not move them.
-        return Track(self.occupancy, self.resolution, self.origin, self.edt, cl, self.name + "r",
-                     duct=self.duct, tall=self.tall, edt_duct=self.edt_duct, edt_tall=self.edt_tall,
-                     duct_height=self.duct_height, props=self.props)
+        t = Track(self.occupancy, self.resolution, self.origin, self.edt, cl, self.name + "r",
+                  duct=self.duct, tall=self.tall, edt_duct=self.edt_duct, edt_tall=self.edt_tall,
+                  duct_height=self.duct_height, props=self.props)
+        if getattr(self, "smooth_parent", None) is not None:
+            t.smooth_parent = self.smooth_parent.reversed()
+        return t
 
     @staticmethod
     def generate_random(seed: int = 0, style: str = "competition", resolution: float = 0.05, mirror="auto",
@@ -1763,3 +1838,47 @@ def _cell_union_outline(blob, pitch):
         return None
     pts = np.array(loop, dtype=float) * pitch
     return pts - pts.mean(0)
+
+
+
+def _cell(mask, xy, ox, oy, res):
+    """the grid cell under each point (out of the grid: False)"""
+    j = np.floor((xy[:, 0] - ox) / res).astype(np.int64); i = np.floor((xy[:, 1] - oy) / res).astype(np.int64)
+    ok = (i >= 0) & (i < mask.shape[0]) & (j >= 0) & (j < mask.shape[1])
+    out = np.zeros(len(xy), bool); out[ok] = mask[i[ok], j[ok]]
+    return out
+
+
+def _taut_curve(P, res, closed, cap_cells, gaussian_filter1d=None, levels=((4.0, 300), (1.0, 300), (0.25, 120))):
+    """The shortest curve that stays within `cap_cells` of every point of a cell-edge contour (the wall lies within
+    half a cell of the grid's edges): a staircase becomes the straight line it digitises, a straight edge does not
+    move, a real corner is cut by at most the cap. Projected curve-shortening -- neighbour averaging, then each
+    point back inside its disc -- run coarse to fine (4, 1, 1/4 cell spacing) so long stairs converge quickly.
+    (A plain wide smoothing is not this: it shrinks a corner over a metre, and the cap then pins the straight
+    edges next to it 2-3 cm off where they were.)"""
+    Pc = np.vstack([P, P[:1]]) if closed else np.asarray(P, np.float64)
+    seg = np.linalg.norm(np.diff(Pc, axis=0), axis=1)
+    u = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(u[-1])
+    cap = cap_cells * res
+    Q = u_prev = None
+    for spacing, iters in levels:
+        n = max(8, int(np.ceil(total / (spacing * res))))
+        uu = np.linspace(0.0, total, n, endpoint=not closed)
+        P0 = np.stack([np.interp(uu, u, Pc[:, k]) for k in range(2)], 1)
+        if Q is None:
+            Qc = P0.copy()
+        else:                                           # the coarser level's curve, at this level's samples
+            uq = np.concatenate([u_prev, [total]]) if closed else u_prev
+            Qq = np.vstack([Q, Q[:1]]) if closed else Q
+            Qc = np.stack([np.interp(uu, uq, Qq[:, k]) for k in range(2)], 1)
+        for _ in range(iters):
+            if closed:
+                avg = 0.5 * (np.roll(Qc, 1, 0) + np.roll(Qc, -1, 0))
+            else:
+                avg = Qc.copy(); avg[1:-1] = 0.5 * (Qc[:-2] + Qc[2:])
+            dv = avg - P0
+            dn = np.linalg.norm(dv, axis=1, keepdims=True)
+            Qc = P0 + dv * np.minimum(1.0, cap / np.maximum(dn, 1e-12))
+        Q, u_prev = Qc, uu
+    return Q

@@ -655,6 +655,11 @@ class Raceline:
         not change what is being looked up.
         """
         import hashlib, os
+        parent = getattr(track, "smooth_parent", None)
+        if parent is not None:
+            # `+smooth`: the venue's grid stairs straightened (`Track.with_smooth_walls`), every wall within ~4 cm of
+            # where it was -- inside the 0.40 m margin the line keeps. The line is the original's; a solve is 20-60 min.
+            return Raceline.build_cached(parent, cache_dir, cache_only=cache_only, **kw)
         track = track.for_planning()
         cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "racelines")
         os.makedirs(cache_dir, exist_ok=True)

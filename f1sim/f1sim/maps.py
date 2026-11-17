@@ -201,7 +201,7 @@ def load(name: str, **kw) -> Track:
                 mods.append(m); name = name[:-len(m)]
     ck = (name, repr(sorted(kw.items())))
     if name.startswith("scene:"):                          # edited on disk between loads: key on the files
-        ck = ck + (_scene_stamp(_split_bare(_split_obstacle_suffix(name[6:])[0])[0]),)
+        ck = ck + (_scene_stamp(_split_bare(_split_obstacle_suffix(name[6:].replace(SMOOTH, ""))[0])[0]),)
     if ck not in _BASE_CACHE:                              # one copy per process: both directions share grids
         _BASE_CACHE[ck] = _load_base(name, **kw)
     t = _BASE_CACHE[ck]
@@ -243,6 +243,23 @@ def _static_props(track: Track, seed: int, n: Optional[int] = None) -> Track:
     return track.with_static_props(seed=seed, n=n)
 
 
+#: `x+smooth`: the map's walls redrawn as smooth curves on a 4x finer grid (`Track.with_smooth_walls`). Peeled from
+#: anywhere in the name and applied after everything else (warps, scale, obstacle families) built the grid.
+SMOOTH = "+smooth"
+
+
+def smooth_name(legacy: str) -> str:
+    """`legacy` with `+smooth`, before the direction modifiers the loader strips first (`x~rev` -> `x+smooth~rev`)."""
+    if SMOOTH in legacy:
+        return legacy
+    mods = ""
+    while legacy.endswith(MODIFIERS):
+        for m in MODIFIERS:
+            if legacy.endswith(m):
+                mods = m + mods; legacy = legacy[:-len(m)]
+    return legacy + SMOOTH + mods
+
+
 def _split_bare(name: str):
     """`x+bare+hard3` -> (`x+hard3`, True). The suffix carries no digits, so it can be peeled from
     anywhere in the name without being confused for a placement family."""
@@ -273,6 +290,8 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
     """
     name, b = _split_bare(name)
     bare = bare or b
+    if SMOOTH in name:                                    # x+smooth: walls as smooth curves, not grid stairs (applied last;
+        return _load_base(name.replace(SMOOTH, ""), bare=bare, **kw).with_smooth_walls()   # same name: same venue)
     if "+scale" in name:                                   # x+scale<per cent>: the venue built that much bigger / smaller
         base, _, spec = name.rpartition("+scale")
         if not spec.isdigit():
