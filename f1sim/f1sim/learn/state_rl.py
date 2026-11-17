@@ -89,6 +89,10 @@ def build_env(a, device, extra=None):
         cfg.lidar.mount_x = _mx
     cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0)
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
+    _tilt = float(getattr(a, "lidar_tilt", 0.0) or 0.0)           # (11-17) the measured bound instead of the unmeasured +-0.02
+    if _tilt > 0:
+        cfg.rand.ranges["lidar.mount_roll"] = (-_tilt, _tilt)
+        cfg.rand.ranges["lidar.mount_pitch"] = (-_tilt, _tilt)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,
              v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0), reverse_ext=float(getattr(a, "reverse_ext", 0.0) or 0.0),
              collision_mode="soft", contact_severity_min=float(getattr(a, "severity_min", 1.5)),

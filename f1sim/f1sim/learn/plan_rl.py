@@ -603,6 +603,10 @@ def main(argv=None):
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
                          "axle + 0.297). Stored in the checkpoint; tools take it from F1SIM_LIDAR_MOUNT_X")
+    ap.add_argument("--lidar-tilt", type=float, default=0.0,
+                    help="(11-17) the LiDAR's random mount roll/pitch range, +- this many radians per car and reset; 0 = the "
+                         "config's +-0.02 (1.15 deg, never measured). The competition bags bound the real downward tilt to "
+                         "0.6-0.9 deg (tools/scan_tilt.py: no floor returns before the walls in 8836 stationary beams)")
     ap.add_argument("--align-episodes", action="store_true",
                     help="first (staggered) episode lengths in whole decisions, so every restart lands on a decision's last control step "
                          "(11-14: restarts every ~3 control steps zeroed the opponents' planner clock -> the planners ran ~45 %% more "
@@ -693,6 +697,8 @@ def main(argv=None):
         ov["compile_leaves"] = True
     if args.align_episodes:
         ov["align_episodes"] = True
+    if args.lidar_tilt > 0:
+        ov["lidar_tilt"] = float(args.lidar_tilt)
     if args.track_scales:
         ov["track_scales"] = (list(SR.TRACK_SCALES_25) if args.track_scales == "korea25"
                               else [int(x_) for x_ in args.track_scales.split(",")])

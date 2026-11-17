@@ -53,7 +53,11 @@ if [ "$G" != 1 ]; then      # (a background `[ ] || cmd &` list kept a subshell 
 fi
 # (11-16, 사용자: "평가는 그 충돌맵으로 100 iter마다 해", "각자 gpu에서 하게 하자") frozen exam만 100 update마다, 학습 GPU에서
 # (예전 25마다 core_loop.sh는 EVAL=core 로)
-if [ "${EVAL:-exam}" = core ]; then
+if [ "${EVAL:-exam}" = lab ]; then
+  # (11-17) both GPUs here train; the frozen exam runs on the lab PC every 25 updates
+  setsid nohup bash tools/lab_exam_loop.sh $N $U0 25 $U1 > out/lab_exam_loop_$N.out 2>&1 < /dev/null &
+  setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
+elif [ "${EVAL:-exam}" = core ]; then
   CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
 else
   EG=$([ "$G" = 1 ] && echo 1 || echo 0)
@@ -65,6 +69,7 @@ mkdir -p $R/watch_$N
 python3 - "$N" "$MAPN" "${INIT:-}" <<'PY'
 import json, shutil, sys, time
 n, mapn, init = sys.argv[1], sys.argv[2], sys.argv[3]
+mapn = mapn.split(",")[0].replace("+smooth", "")          # the console's map ids are the venues; it loads them smoothed itself
 p = "/home/shchon11/f1sim_runs/console_picks.json"
 shutil.copy(p, p + time.strftime(".bak_%m%d_%H%M"))
 d = json.load(open(p))
