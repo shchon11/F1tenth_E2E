@@ -414,6 +414,10 @@ def main(argv=None):
                     help="with --accum-actor-auto: the minibatches per actor step never go back down (11-14, plan26i: at u236 the "
                          "noise scale read 190k -> 56k -> 15k as the policy got worse, the rule dropped 16 -> 4 -> 1 minibatches, "
                          "4-16x the actor steps per update, KL 3-8x, contacts 3x, training reward down -- a feedback loop)")
+    ap.add_argument("--horizon-auto-mult", type=float, default=1.0,
+                    help="--horizon-auto grows K once the noise scale passes 1/MULT of a rollout (11-18, the user: '업데이트 주기가 너무 "
+                         "짧다': qual26c's noise scale went 5k -> 50k decisions by u195 while a minibatch step held 16k and the rollout "
+                         "131k, so K never grew; 1 = the 11-16 rule)")
     ap.add_argument("--horizon-auto", type=int, default=1,
                     help="KMAX: the decisions per update grow with the policy gradient's noise scale -- each update collects "
                          "K x --horizon decisions per car, K the smallest whole number whose rollout covers the measured noise scale, "
@@ -997,7 +1001,7 @@ def main(argv=None):
             # a policy gets worse -- the accumulation rule's feedback loop, --accum-ratchet). The same on every process: the
             # noise scale is computed from all-reduced sums
             per_k = args.horizon * Bl * (args.dist_world if args.dist_world > 1 else 1)
-            K_h = max(K_h, min(args.horizon_auto, max(1, math.ceil(b_noise / per_k))))
+            K_h = max(K_h, min(args.horizon_auto, max(1, math.ceil(args.horizon_auto_mult * b_noise / per_k))))
             T = args.horizon * K_h
             MB = args.minibatches * K_h
         frac = (upd - 1) / max(1, args.updates - 1)
