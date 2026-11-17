@@ -262,7 +262,7 @@ def test_console_remembers_its_settings_between_launches(qapp, tmp_path, monkeyp
     w.save_prefs()
 
     back = ConsoleWindow()
-    assert back.spin_grid.value() == 3
+    assert back.spin_grid.value() == 1      # 11-17 (the user): every launch starts as 혼자 달리기, the rest is remembered
     assert back.chk_dr.isChecked() is False
     # 11-02: the road grip is no longer a console control; a remembered value goes back to the evaluation default
     # rather than silently changing every lap time (a stale "fixed 1.2" made laps 3 % fast)
@@ -277,11 +277,11 @@ def test_a_setting_that_can_no_longer_be_restored_costs_only_itself(qapp, tmp_pa
     from f1sim.viewer.console.window import ConsoleWindow
     monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console.json"))
     ckpt = tmp_path / "run.pt"; ckpt.write_text("x")
-    w = ConsoleWindow(); w.spin_grid.setValue(3); w._on_run_selected(str(ckpt)); w.save_prefs()
+    w = ConsoleWindow(); w.chk_dr.setChecked(False); w._on_run_selected(str(ckpt)); w.save_prefs()
 
     ckpt.unlink()                                   # the checkpoint is gone; the rest is still valid
     back = ConsoleWindow()
-    assert back._selected_run is None and back.spin_grid.value() == 3
+    assert back._selected_run is None and back.chk_dr.isChecked() is False
 
     (tmp_path / "console.json").write_text("{ not json")
-    assert ConsoleWindow().spin_grid.value() == 1  # unreadable: defaults, silently
+    assert ConsoleWindow().chk_dr.isChecked() is True  # unreadable: defaults, silently

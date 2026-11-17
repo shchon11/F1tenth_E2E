@@ -3120,6 +3120,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             return
         slots = st.pop("opponent_slots", None)
         st.pop("run", None); st.pop("map", None)
+        # 11-17 (the user: "주행조건 기본값 혼자 달리는걸로 해줘"): a solo pick no longer brings its obstacles along -- 31 of
+        # the 41 picks carried "학습 장애물", so choosing a policy turned the condition away from 혼자 달리기. A race pick
+        # (2+ cars, its own opponents) is still a preset and sets its condition.
+        if int(st.get("cars_per_race", 1) or 1) <= 1:
+            for k in ("obstacle", "races", "cars_per_race"):
+                st.pop(k, None)
         self.apply_prefs(st)
         if slots is not None and hasattr(self, "opp_table"):
             try:
@@ -3486,6 +3492,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         import random as _random
         self._set_seed(_random.randint(*self.SEED_RANGE))
         self._seed_applied = self._seed()
+        # 11-17: every launch starts as 혼자 달리기, whatever condition the last session ended on
+        self.apply_prefs({"obstacle": "bare", "races": 1, "cars_per_race": 1})
         self._sync_condition()
 
     def _train_obstacles(self) -> bool:

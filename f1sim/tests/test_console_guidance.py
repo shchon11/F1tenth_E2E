@@ -164,7 +164,8 @@ def _move_every_control(w):
     w.chk_obs_limit.setChecked(True)
     w.combo_ros.setCurrentIndex(w.combo_ros.findData("publish"))
     w.combo_obstacle.setCurrentIndex(w.combo_obstacle.count() - 1)   # a family, not 없음/기본
-    w.chk_bare_first.setChecked(True)                                # reset unless a family is set
+    # reset unless a family is set; toggled, not set: a launch now starts on 없음 (혼자 달리기, 11-17), where it is on
+    w.chk_bare_first.setChecked(not w.chk_bare_first.isChecked())
     if w.combo_device.count() > 1:
         w.combo_device.setCurrentIndex(w.combo_device.count() - 1)
     w.edit_record.setText("/tmp/clips")
