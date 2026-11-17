@@ -48,8 +48,6 @@
   .key i.box { width: 9px; height: 9px; border-radius: 2px; }
   #mini { position: absolute; right: 10px; top: 10px; width: 150px; height: 190px; border-radius: 8px; background: rgba(13,15,18,0.85); border: 1px solid var(--line); cursor: pointer; }
   .viewbar { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; align-items: center; }
-  .viewbar .hint { color: var(--muted); font-size: 11px; margin-right: 4px; }
-  @media (max-width: 1700px) { .viewbar .hint { display: none; } }   /* the canvas' tooltip says the same; the key keeps its room */
   .side { min-height: 0; display: flex; flex-direction: column; gap: 8px; }
   .strip { flex: 1 1 0; min-height: 96px; display: flex; flex-direction: column; padding: 8px 10px 6px; }
   .strip h3 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; overflow: hidden; }
@@ -89,7 +87,7 @@
 </header>
 <main>
   <section class="panel mapwrap">
-    <canvas id="map" title="휠 = 확대·축소 · 끌기 = 이동 · 두 번 클릭 = 차 따라가기"></canvas>
+    <canvas id="map"></canvas>
     <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span></div>
       <div class="sub" id="hud_sub">-</div></div>
     <canvas id="mini" width="300" height="380"></canvas>
@@ -101,8 +99,7 @@
       <span class="k-opp"><i style="background:var(--s-copy)"></i>상대 = 우리 복제본</span>
       <span><i class="box" style="background:var(--s-box)"></i>상자</span>
     </div>
-    <div class="viewbar"><span class="hint">휠 확대·축소 · 끌어 이동 · 두 번 클릭 = 차 따라가기</span>
-      <button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
+    <div class="viewbar"><button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
   </section>
   <section class="side">
     <div class="panel strip"><h3>속도 <span class="note">m/s · 최근 20초</span><span class="now" id="now_v">-</span></h3>
@@ -140,10 +137,14 @@ function fit(c) {
 
 // ---------------------------------------------------------------- the map's camera: follow the car (default), or free
 // wheel = zoom about the pointer, drag = move (leaves follow), double click = back to following, 전체 트랙 = the whole track
-const VIEW = { mode: "follow", span: 9, cx: 0, cy: 0 };     // span: metres across the map's width
+const VIEW = { mode: "follow", span: 9, cx: 0, cy: 0, ox: 0, oy: 0 };   // span: metres across the map's width; ox/oy: offset while following
 let LAST = null;                                             // the last drawn camera {cx, cy, s, W, H, T}
 function setMode(m) { VIEW.mode = m; $("v_follow").className = m === "follow" ? "on" : ""; $("v_track").className = m === "track" ? "on" : ""; }
-$("v_follow").onclick = () => { VIEW.span = Math.min(VIEW.span, 14); setMode("follow"); };
+function toggleFollow() {
+  if (VIEW.mode === "follow") { if (LAST) { VIEW.cx = LAST.cx; VIEW.cy = LAST.cy; VIEW.span = LAST.W / LAST.s; } setMode("free"); }
+  else { VIEW.ox = VIEW.oy = 0; VIEW.span = Math.min(VIEW.span, 14); setMode("follow"); }
+}
+$("v_follow").onclick = toggleFollow;
 $("v_track").onclick = () => setMode("track");
 (() => {
   const c = $("map");
@@ -159,20 +160,22 @@ $("v_track").onclick = () => setMode("track");
     VIEW.cx = wx - (px - LAST.W / 2) / s1; VIEW.cy = wy + (py - LAST.H / 2) / s1; VIEW.span = span1; setMode("free");
   }, { passive: false });
   let drag = null;
-  c.addEventListener("pointerdown", (e) => { if (!LAST) return; drag = { x: e.clientX, y: e.clientY, cx: LAST.cx, cy: LAST.cy, s: LAST.s, moved: false }; c.setPointerCapture(e.pointerId); c.classList.add("drag"); });
+  c.addEventListener("pointerdown", (e) => { if (!LAST) return; drag = { x: e.clientX, y: e.clientY, cx: LAST.cx, cy: LAST.cy, ox: VIEW.ox, oy: VIEW.oy, s: LAST.s, moved: false }; c.setPointerCapture(e.pointerId); c.classList.add("drag"); });
   c.addEventListener("pointermove", (e) => {
     if (!drag) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     if (!drag.moved && Math.hypot(dx, dy) < 3) return;
-    if (!drag.moved) { drag.moved = true; VIEW.span = LAST.W / drag.s; setMode("free"); }
+    drag.moved = true;
+    if (VIEW.mode === "follow") { VIEW.ox = drag.ox - dx / drag.s; VIEW.oy = drag.oy + dy / drag.s; return; }   // still following, just offset
+    if (VIEW.mode === "track") { VIEW.span = LAST.W / drag.s; setMode("free"); }
     VIEW.cx = drag.cx - dx / drag.s; VIEW.cy = drag.cy + dy / drag.s;
   });
   const up = () => { drag = null; c.classList.remove("drag"); };
   c.addEventListener("pointerup", up); c.addEventListener("pointercancel", up);
-  c.addEventListener("dblclick", () => { VIEW.span = 9; setMode("follow"); });
+  c.addEventListener("dblclick", toggleFollow);
   // the inset: click a place to look there
   $("mini").addEventListener("click", (e) => {
-    if (!LAST || !LAST.mini) return;
+    if (!LAST || !LAST.mini || VIEW.mode === "follow") return;
     const r = $("mini").getBoundingClientRect(), m = LAST.mini;
     VIEW.cx = m.T.x0 + (e.clientX - r.left - m.ox) / m.s; VIEW.cy = m.T.y0 + (m.sh * m.s - (e.clientY - r.top - m.oy)) / m.s;
     if (VIEW.mode !== "free") VIEW.span = Math.min(VIEW.span, 9);
@@ -220,7 +223,7 @@ function drawMap(f, carP, oppP, T, trail) {
   const { g, W, H } = fit($("map"));
   g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
   let cx, cy, span;
-  if (VIEW.mode === "follow") { cx = carP[0] + 0.15 * VIEW.span * Math.cos(carP[2]); cy = carP[1] + 0.15 * VIEW.span * Math.sin(carP[2]); span = VIEW.span; }
+  if (VIEW.mode === "follow") { cx = carP[0] + 0.15 * VIEW.span * Math.cos(carP[2]) + VIEW.ox; cy = carP[1] + 0.15 * VIEW.span * Math.sin(carP[2]) + VIEW.oy; span = VIEW.span; }
   else if (VIEW.mode === "track") { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W * T.res, T.H * T.res * W / H) * 1.05; }
   else { cx = VIEW.cx; cy = VIEW.cy; span = VIEW.span; }
   const s = W / span, P = (x, y) => [(x - cx) * s + W / 2, H / 2 - (y - cy) * s];
