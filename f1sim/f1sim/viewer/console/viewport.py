@@ -1038,18 +1038,29 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if not (0 <= f < n):
             return None, None
         x, y, yaw = fr["x"][f], fr["y"][f], fr["yaw"][f]
-        phi = fr["roll"][f] + P["mount_roll"]
-        th = fr["pitch"][f] + P["mount_pitch"]
+        roll, pitch = fr["roll"][f], fr["pitch"][f]
         fov = float(self.lidar_cfg.get("fov", 4.71238898))
         r = np.asarray(fr["scan"], np.float64)
         nb = len(r)
+        sw = fr.get("scan_from")
+        if sw is not None:
+            # 11-17 (the user: "라이다 저렇게 흔들리는거 skewing 때문에 그러는거야 아니면 기타 뭐 딜레이 때문이야"): the scanner
+            # sweeps for a period, so beam i leaves `frac_i` of it before the scan's stamp (`Lidar.time_frac`), from where the
+            # car was then -- the sim traces it so, as the real sensor does. Drawn from the stamp's pose, a beam emitted 19 ms
+            # earlier at 6 m/s and 2 rad/s landed off the wall it hit: 90 % of hose points within 4.6-6.5 cm of it, now 2.8-3.4.
+            frac = (fov / (2 * math.pi)) * (1.0 - np.arange(nb) / max(nb - 1, 1))
+            dyaw = (yaw - sw[2] + math.pi) % (2 * math.pi) - math.pi
+            x, y, yaw = x - frac * (x - sw[0]), y - frac * (y - sw[1]), yaw - frac * dyaw
+            roll, pitch = roll - frac * (roll - sw[3]), pitch - frac * (pitch - sw[4])
+        phi = roll + P["mount_roll"]
+        th = pitch + P["mount_pitch"]
         a = np.linspace(-fov / 2, fov / 2, nb) + P["mount_yaw"]
         ca, sa = np.cos(a), np.sin(a)
-        cph, sph, cth, sth = math.cos(phi), math.sin(phi), math.cos(th), math.sin(th)
+        cph, sph, cth, sth = np.cos(phi), np.sin(phi), np.cos(th), np.sin(th)
         bx = ca * cth + sa * sph * sth
         by = sa * cph
         bz = -ca * sth + sa * sph * cth
-        cy, sy = math.cos(yaw), math.sin(yaw)
+        cy, sy = np.cos(yaw), np.sin(yaw)
         wx = bx * cy - by * sy
         wy = bx * sy + by * cy
         mx, my, mz = P["mount_x"], P["mount_y"], P["mount_z"]
@@ -1057,10 +1068,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         ox_b = mx * cth + t * sth
         oy_b = my * cph - mz * sph
         oz_b = -mx * sth + t * cth
-        o = np.array([x + ox_b * cy - oy_b * sy, y + ox_b * sy + oy_b * cy, oz_b])
+        o = np.stack(np.broadcast_arrays(x + ox_b * cy - oy_b * sy, y + ox_b * sy + oy_b * cy, oz_b), -1).reshape(-1, 3)
         ok = np.isfinite(r)
         r = np.where(ok, r, 0.0)
-        pts = o[None, :] + np.stack([wx, wy, bz], 1) * r[:, None]
+        pts = o + np.stack([wx, wy, bz], 1) * r[:, None]
         pts[~ok] = (0, 0, -100)
         typ = np.asarray(fr.get("scan_type", np.zeros(nb, np.int32)), np.int32)
         cols = np.zeros((nb, 4), np.float32)

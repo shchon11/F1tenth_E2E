@@ -2121,8 +2121,11 @@ class SimWorker:
         dash = torch.cat([sim.state[focus, [3, 6]], env.last_cmd[focus],
                           env.speed_cap[focus:focus + 1], sim.ay[focus:focus + 1],
                           sim.ax[focus:focus + 1], sim.P["mu"][focus:focus + 1] * 9.81])
+        # (11-17) where the scan's sweep began: the pose and roll/pitch at the start of the step (`Simulator.pose_prev` /
+        # `att_prev`, what `Lidar.scan` spreads the beams over) -- the console draws each beam from where it was emitted
+        sweep0 = torch.cat([sim.pose_prev[focus], sim.att_prev[focus]]).to(pack.dtype)
         pieces = [pack.reshape(-1), r.scan[focus], r.scan_type[focus].float(),
-                  torch.stack([sim.P[k][focus] for k in Pk]), dash]
+                  torch.stack([sim.P[k][focus] for k in Pk]), sweep0, dash]
 
         # The IMU produces a whole number of samples per control step only by coincidence: the
         # sampler is driven by imu_rate against the substep clock, so K varies step to step and is
@@ -2180,6 +2183,7 @@ class SimWorker:
         scan = flat[i:i + nb]; i += nb
         styp = flat[i:i + nb]; i += nb
         pv = flat[i:i + len(Pk)]; i += len(Pk)
+        sw0 = flat[i:i + 5]; i += 5
         dash_v = flat[i:i + 8]; i += 8
         imu_mean = None
         if k_imu > 0:
@@ -2227,6 +2231,7 @@ class SimWorker:
             "scan": _copy(scan).astype(np.float32), "scan_type": _copy(styp).astype(np.int32),
             "focus": focus, "focus_env": focus, "ids": ids,
             "P": {k: float(pv[j]) for j, k in enumerate(Pk)},
+            "scan_from": tuple(float(v) for v in sw0),     # focus car's x, y, yaw, roll, pitch when the sweep began
             "control_dt": float(sim.control_dt),
             "sim_rate": float(self._sim_rate),
             # `actor_runner` swaps to eager on a RuntimeError and carries on. Carrying on is right;
