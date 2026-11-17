@@ -48,6 +48,14 @@
   .key i.box { width: 9px; height: 9px; border-radius: 2px; }
   #mini { position: absolute; right: 10px; top: 10px; width: 150px; height: 190px; border-radius: 8px; background: rgba(13,15,18,0.85); border: 1px solid var(--line); cursor: pointer; }
   .viewbar { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; align-items: center; }
+  /* (11-17, the user: "update 반영중을 좀 지도 뿌옇게 하고 문구를 박아놔. 렉걸린줄 알잖아") between rollouts the car stands still on
+     purpose: the map goes hazy and says so */
+  #veil { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: none;
+          background: rgba(13, 15, 18, 0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+  #veil.on { display: flex; }
+  #veil div { padding: 14px 22px; border-radius: 10px; background: rgba(21, 24, 29, 0.92); border: 1px solid var(--line);
+              font-size: 20px; font-weight: 600; color: var(--ink); text-align: center; line-height: 1.35; }
+  #veil small { display: block; font-size: 13px; font-weight: 400; color: var(--ink-2); }
   .side { min-height: 0; display: flex; flex-direction: column; gap: 8px; }
   .strip { flex: 1 1 0; min-height: 96px; display: flex; flex-direction: column; padding: 8px 10px 6px; }
   .strip h3 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; overflow: hidden; }
@@ -99,6 +107,7 @@
       <span class="k-opp"><i style="background:var(--s-copy)"></i>상대 = 우리 복제본</span>
       <span><i class="box" style="background:var(--s-box)"></i>상자</span>
     </div>
+    <div id="veil"><div><span id="veil_t">update 반영 중</span><small id="veil_s"></small></div></div>
     <div class="viewbar"><button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
   </section>
   <section class="side">
@@ -342,7 +351,10 @@ async function poll() {
   const age = parseFloat(r.headers.get("X-Age") || "0");
   const live = age < 2;
   $("status").className = "pill " + (live ? "live" : "wait");
-  $("status_t").textContent = live ? "실시간" : age < 300 ? `update 계산 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`;
+  $("status_t").textContent = live ? "실시간" : age < 300 ? `update 반영 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`;
+  $("veil").className = live ? "" : "on";
+  $("veil_t").textContent = age < 300 ? "update 반영 중" : "학습 멈춤";
+  $("veil_s").textContent = age < 300 ? `모은 주행으로 신경망을 고치는 중 · ${age.toFixed(0)}초째 (끝나면 다시 달림)` : `마지막 기록 ${(age / 60).toFixed(0)}분 전`;
   const d = await r.json(), f = d.now, key = f.upd * 100000 + f.k;
   if (key === lastKey) return;
   lastKey = key;
