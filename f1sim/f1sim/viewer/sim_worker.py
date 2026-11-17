@@ -912,9 +912,10 @@ class SimWorker:
         # the split gives it; one the split never placed (Korea 2026, the venue every current run trains on) is 학습.
         keep = [t for t in T.CONSOLE_TRACKS if t in entries]
         if keep:
+            keep += [t for t in entries if t.startswith("scene/")]      # what the user builds in the 환경 page stays listed
             placed = {t for ids in groups.values() for t in ids}
             groups = {g: [t for t in ids if t in keep] for g, ids in groups.items()}
-            groups[T.GROUP_TRAIN] = groups.get(T.GROUP_TRAIN, []) + [t for t in keep if t not in placed]
+            groups[T.GROUP_TRAIN] = groups.get(T.GROUP_TRAIN, []) + [t for t in keep if t not in placed and not t.startswith("scene/")]
             groups = {g: ids for g, ids in groups.items() if ids}
             entries = {t: entries[t] for t in keep}
         return {"groups": groups, "entries": entries, "splits": summaries}
