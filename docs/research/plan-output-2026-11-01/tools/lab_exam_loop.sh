@@ -17,7 +17,8 @@ for UU in $(seq $U0 $STEP $U1); do
   [ -e $D/exam/$B.npz ] && continue
   for try in 1 2 3; do
     tar -cf - -C $RUNS $RUN/args.json $RUN/plan_u$UU.pt | $SSH $H 'mkdir -p ~/f1sim_runs && tar -x -C ~/f1sim_runs' || { sleep 30; continue; }
-    $SSH $H "mkdir -p $LX && rm -f $LX/$B.* && cd ~/F1tenth/console_main/f1sim && setsid nohup bash -c 'PYTHONPATH=\$PWD WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555 CUDA_VISIBLE_DEVICES=0 timeout 5400 ~/F1tenth/.venv/bin/python3 -u -W ignore ~/F1tenth/exam_lab/tools/exam_record.py ~/f1sim_runs/$RUN/plan_u$UU.pt $LX/$B.npz ideal 256 uniform > $LX/$B.log 2>&1; echo rc \$? >> $LX/$B.log' > /dev/null 2>&1 < /dev/null &"
+    # (the lab's login shell is zsh: a glob with no match aborted this whole line -- the exam never started; plain names)
+    $SSH $H "mkdir -p $LX && rm -f $LX/$B.npz $LX/$B.log && cd ~/F1tenth/console_main/f1sim && setsid nohup bash -c 'PYTHONPATH=\$PWD WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555 CUDA_VISIBLE_DEVICES=0 timeout 5400 ~/F1tenth/.venv/bin/python3 -u -W ignore ~/F1tenth/exam_lab/tools/exam_record.py ~/f1sim_runs/$RUN/plan_u$UU.pt $LX/$B.npz ideal 256 uniform > $LX/$B.log 2>&1; echo rc \$? >> $LX/$B.log' > /dev/null 2>&1 < /dev/null &"
     for k in $(seq 1 200); do sleep 30; $SSH $H "grep -q '^rc ' $LX/$B.log" 2>/dev/null && break; done
     $SSH $H "cd $LX && tar -cf - $B.npz $B.log" | tar -x -C $D/exam 2>/dev/null
     [ -e $D/exam/$B.npz ] && break
