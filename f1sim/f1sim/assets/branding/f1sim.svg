@@ -1,21 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  f1sim application icon.
-
-  The console's own palette, so the launcher tile and the window agree: a graphite slab
-  (bg.card over bg.window), the racing line in NVIDIA green (primary.line, the colour the app
-  already spends on "running" and on the start action) and the watched car in cyan (ego), the
-  one colour the 3D scene reserves for the car you are following.
-
-  A circuit, not a car. At 16 px a car silhouette is a smudge, while a closed lane still reads as
-  a track. The green ellipse is deliberately not concentric with the lane: it sits mid track down
-  the straights and tightens onto the inside through both corners, which is a racing line and is
-  the one thing this project is actually about.
-
-  Shapes are primitives (rect, ellipse) rather than arc paths: Qt's SVG renderer is Tiny 1.2, and
-  a mis-set arc sweep flag fails as a wrong picture rather than as an error.
--->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    f1sim application icon.
+
+    This note sits inside <svg>, not before it (2026-11-17): the MIME sniffer that GdkPixbuf asks looks for "<svg"
+    in the first 256 bytes only, and with the note in front it found "<?xml" and called the file plain XML; no
+    SVG loader, so GNOME drew no icon wherever it wanted a size the PNGs do not have (the app grid's 96 px).
+
+    The console's own palette, so the launcher tile and the window agree: a graphite slab
+    (bg.card over bg.window), the racing line in NVIDIA green (primary.line, the colour the app
+    already spends on "running" and on the start action) and the watched car in cyan (ego), the
+    one colour the 3D scene reserves for the car you are following.
+
+    A circuit, not a car. At 16 px a car silhouette is a smudge, while a closed lane still reads as
+    a track. The green ellipse is deliberately not concentric with the lane: it sits mid track down
+    the straights and tightens onto the inside through both corners, which is a racing line and is
+    the one thing this project is actually about.
+
+    Shapes are primitives (rect, ellipse) rather than arc paths: Qt's SVG renderer is Tiny 1.2, and
+    a mis-set arc sweep flag fails as a wrong picture rather than as an error.
+  -->
   <defs>
     <linearGradient id="slab" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#2f2f2f"/>
