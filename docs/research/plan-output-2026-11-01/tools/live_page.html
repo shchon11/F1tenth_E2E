@@ -141,7 +141,7 @@ let RUN = new URLSearchParams(location.search).get("run") || "", TRACK = {}, las
 let F0 = null, F1 = null, t1 = 0, dtF = 0.15;        // the two newest frames, for a smooth car between them
 const S = [];                                       // history: {t, v, vp, val, pc, mc}
 const EV = [];                                      // events on the time axis: {t, kind}
-const PR = { H: 0, maxK: -1, prevK: null, epDec: null };   // rollout length, the decisions seen this episode (null: started before we looked)
+const PR = { H: 0, maxK: -1, prevK: null, epDec: null, trailLen: null };   // rollout length, this episode's decisions (null: unknown yet)
 
 // ---------------------------------------------------------------- canvas at its own pixel size (no stretched text)
 const DPR = () => window.devicePixelRatio || 1;
@@ -207,7 +207,7 @@ async function loadRuns() {
   for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = x.name; sel.appendChild(o); }
   if (!r.length) return;
   RUN = r.some((x) => x.name === cur) ? cur : r[0].name; sel.value = RUN;
-  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; };
+  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; PR.trailLen = null; };
 }
 
 async function track(tid) {
@@ -380,9 +380,13 @@ async function poll() {
   const hH = parseInt(r.headers.get("X-Horizon") || "0"), epS = parseFloat(r.headers.get("X-Episode-S") || "40"), scS = parseFloat(r.headers.get("X-Scene-S") || "13");
   if (PR.prevK != null && f.k < PR.prevK) PR.maxK = Math.max(PR.maxK, PR.prevK);
   const H = hH > 0 ? hH : (PR.maxK >= 0 ? PR.maxK + 1 : 128);
-  if (f.new_ep) PR.epDec = 0;
+  // the episode's decisions: the tap's trail restarts with every episode and grows one point a decision (up to 80), so a
+  // shorter trail than last time IS a new episode and, while it is under 80 points, its length is the exact count. The
+  // one-decision new_ep flag alone was missed whenever the training wrote faster than this page polls (53.4/40 s, 11-17)
+  const L = (d.trail || []).length;
+  if (f.new_ep || (PR.trailLen != null && L < PR.trailLen) || L < 80) PR.epDec = Math.max(0, L - 1);
   else if (PR.epDec != null && PR.prevK != null) PR.epDec += f.k >= PR.prevK ? f.k - PR.prevK : f.k + 1;
-  PR.prevK = f.k;
+  PR.prevK = f.k; PR.trailLen = L;
   const rk = Math.min(1, (f.k + 1) / H);
   $("p_upd_b").style.width = `${(100 * rk).toFixed(1)}%`; $("p_upd_t").textContent = `${f.k + 1}/${H} 결정`;
   const epLen = (f.replay ? scS : epS) * 10;
