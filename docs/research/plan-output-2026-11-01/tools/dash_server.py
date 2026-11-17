@@ -305,6 +305,27 @@ def figs():
 
 
 
+def live_meta(name):
+    """the newest progress row's `horizon` (decisions a rollout) and the run's episode lengths [s]"""
+    d = os.path.join(RUNS, os.path.basename(name))
+    out = {}
+    try:
+        with open(os.path.join(d, "progress.jsonl"), "rb") as f:
+            f.seek(max(0, os.path.getsize(f.name) - 65536))
+            last = [ln for ln in f.read().splitlines() if ln.strip()][-1]
+        out["horizon"] = int(json.loads(last).get("horizon") or 0) or None
+    except Exception:
+        pass
+    try:
+        a = json.load(open(os.path.join(d, "args.json")))
+        w, ar = a.get("world") or {}, a.get("args") or {}
+        out["episode_s"] = w.get("episode_s") or ar.get("episode_s")
+        out["scene_episode_s"] = ar.get("scene_episode_s") or w.get("scene_episode_s")
+    except Exception:
+        pass
+    return out
+
+
 def live_runs():
     """runs that write the live view, newest first"""
     out = []
@@ -428,7 +449,12 @@ class H(BaseHTTPRequestHandler):
         if not name or not os.path.isfile(p):
             return self._send(404, json.dumps({"error": "이 run에는 실시간 기록이 없습니다 (plan_rl --live-tap)"}))
         body = open(p, "rb").read()
-        return self._send(200, body, extra={"X-Age": f"{time.time() - os.path.getmtime(p):.2f}"})
+        # (11-17, the user: "update에 필요한 결정 수 비율이랑 현재 에피소드 진행 비율만 상단에") the rollout's length (the last
+        # update's `horizon`, which --horizon-auto changes) and the episode lengths (`episode_s`, a replayed scene's `scene_episode_s`)
+        meta = memo(("live_meta", name), 10, lambda: live_meta(name))
+        return self._send(200, body, extra={"X-Age": f"{time.time() - os.path.getmtime(p):.2f}",
+                                            "X-Horizon": str(meta.get("horizon") or ""), "X-Episode-S": str(meta.get("episode_s") or ""),
+                                            "X-Scene-S": str(meta.get("scene_episode_s") or "")})
 
     def _file(self, rel):
         p = os.path.realpath(os.path.join(OUT, rel))
