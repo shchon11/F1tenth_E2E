@@ -201,7 +201,20 @@ def build_track_geometry(track, raceline=None, only_props: bool = False):
     duct_c = track_contours_mask(track, track.duct, outside_occupied=False, sigma_cells=SMOOTH_SIGMA)
     tall_c = track_contours_mask(track, track.tall, outside_occupied=False, sigma_cells=SMOOTH_SIGMA,
                                  clip_canvas_edge=True)
-    ducts = duct_mesh_arrays(duct_c, track.duct_height, occupied=occupied, resolution=res)
+    # the lane: open floor. A Track keeps the full occupancy (unseen space behind a scanned hose is solid
+    # there but neither hose nor wall); a SceneDoc has only its two layers.
+    occ = getattr(track, "occupancy", None)
+    lane = ~np.asarray(occ, bool) if occ is not None else ~(np.asarray(track.duct, bool) | np.asarray(track.tall, bool))
+    # ... and only open floor a car can be on: a scanned map leaves pockets of free cells inside its hoses
+    # (62 on the bag-scan Korea map, 0.1 m² each), which are not a lane on the far side of a divider
+    from scipy import ndimage
+    lab, n_lab = ndimage.label(lane)
+    if n_lab > 1:
+        area = np.bincount(lab.ravel()) * res * res
+        area[0] = 0.0
+        lane = (area >= min(1.0, 0.5 * area.max()))[lab]
+    ducts = duct_mesh_arrays(duct_c, track.duct_height, occupied=occupied, resolution=res,
+                             free=lambda xy: occupied(xy, mask=lane))
     walls = wall_mesh_arrays(tall_c, height=wall_height, is_solid=is_solid, resolution=res)
 
     centerline = np.asarray(track.centerline, np.float32) if track.centerline is not None else None

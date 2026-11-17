@@ -87,3 +87,66 @@ def test_tangent_is_read_from_arc_length_not_from_vertex_spacing():
     assert err_arclen < err_neighbour / 5, (
         f"arc-length tangent ({err_arclen:.4f}) is not clearly better than reading neighbours "
         f"({err_neighbour:.4f}); uneven spacing is still leaking into the estimate")
+
+
+# ---------------------------------------------------------------- the lane side (2026-11-17)
+# A map built from scans marks a hose's face a few cells deep; the space behind it is solid but unseen.
+# Both sides of that thin band were contoured and each got a tube, the back one standing in the lane
+# (bag-scan Korea 2026: 43 % of the hose length more than 20 cm into the lane). Built on a grid here,
+# through `build_track_geometry`, because the lane is a property of the map, not of a contour.
+
+RES = 0.05
+
+
+class _Grid:
+    """The fields `build_track_geometry` reads off a Track."""
+
+    def __init__(self, occupancy, duct):
+        self.occupancy, self.duct = occupancy, duct
+        self.tall = np.zeros_like(duct)
+        self.shape, self.resolution, self.origin = duct.shape, RES, (0.0, 0.0)
+        self.duct_height, self.centerline, self.name, self.props = 0.33, None, "grid", []
+
+
+def _ducts(occupancy, duct):
+    from f1sim.viewer.geometry import build_track_geometry
+    g = build_track_geometry(_Grid(occupancy, duct))
+    return np.asarray(g["ducts"][0], np.float64)
+
+
+def _rings_r(pos):
+    """radius from the grid centre of every vertex, and of every ring's centre (the axis)"""
+    r_v = np.hypot(pos[:, 0] - 4.0, pos[:, 1] - 4.0)
+    c = pos.reshape(-1, RADIAL, 3).mean(1)
+    return r_v, np.hypot(c[:, 0] - 4.0, c[:, 1] - 4.0)
+
+
+def _disk(r_in, r_out):
+    """cells (8 x 8 m grid) whose centre lies between r_in and r_out of (4, 4)"""
+    yy, xx = np.mgrid[0:160, 0:160]
+    r = np.hypot((xx + 0.5) * RES - 4.0, (yy + 0.5) * RES - 4.0)
+    return (r >= r_in) & (r < r_out)
+
+
+def test_a_thin_scanned_band_draws_one_hose_and_none_in_the_lane():
+    """Lane inside r < 2 m, the scanned face a 2-cell band, unseen solid beyond: no tube vertex stands
+    in the lane, and the axis is a full radius behind the face -- one hose, not one per band side."""
+    occ = _disk(2.0, 99.0)
+    duct = _disk(2.0, 2.1)
+    pos = _ducts(occ, duct)
+    assert pos is not None
+    r_v, r_axis = _rings_r(pos)
+    assert r_v.min() > 2.0 - 0.06, r_v.min()                 # the cell edge (2.5 cm) + smoothing; the old back tube stood 23 cm in
+    # every ring a hose radius behind the face, within the circle's pixel staircase -- the old second tube's
+    # axis sat at 1.9-2.0 m, on the lane side of the face
+    assert np.abs(r_axis - (2.0 + 0.165)).max() < 0.07, (r_axis.min(), r_axis.max())
+
+
+def test_a_divider_thinner_than_the_hose_is_drawn_as_wide_as_it_is():
+    """Lane on both sides of a 3-cell ring: the hose stands in neither lane and keeps its height."""
+    duct = _disk(1.5, 1.65)
+    pos = _ducts(duct.copy(), duct)
+    assert pos is not None
+    r_v, _ = _rings_r(pos)
+    assert r_v.min() > 1.5 - 0.06 and r_v.max() < 1.65 + 0.06, (r_v.min(), r_v.max())
+    assert pos[:, 2].max() > 0.30

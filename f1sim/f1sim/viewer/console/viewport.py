@@ -1069,6 +1069,12 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         cols[typ == 3] = (0.30, 0.86, 0.96, 0.92)   # floor
         cols[typ == 4] = (1.0, 0.90, 0.28, 0.95)    # another car
         cols[typ == 0] = (0.58, 0.60, 0.66, 0.85)
+        # 11-17 (the user: "저 배경에 찍히는 라이다 포인트들은 뭐야"): a beam with no return reads 65.533 m -- the urg_node
+        # sentinel the car's driver emits (params.LidarParams.dropout_value), for a miss and for a dropped return alike (a
+        # duct seen edge-on, the glossy floor) -- so they were drawn 65 m out, on the horizon, in the colour of what they
+        # missed. Out of [0, range_max] is not a point; RViz drops those too. The policy reads them as range_max either way.
+        rmax = float(self.lidar_cfg.get("range_max", 30.0))
+        pts[np.asarray(fr["scan"], np.float64) >= rmax - 1e-3] = (0, 0, -100)
         if self.point_colors is not None and len(self.point_colors) == nb:
             cols = np.asarray(self.point_colors, np.float32)
         return pts.astype(np.float32), cols
@@ -1455,10 +1461,15 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 self.setCursor(QtCore.Qt.ClosedHandCursor if pan else QtCore.Qt.SizeAllCursor)
         super().mousePressEvent(ev)
 
-    def mouseDoubleClickEvent(self, ev):
-        if not self._editing() and self.camera in self._view:
+    def reset_view(self) -> None:
+        """The current mode's camera back to where it starts (double click, '기본 시점', key 0)."""
+        if self.camera in self._view:
             self._view[self.camera] = list(self.VIEW0)
             self.update()
+
+    def mouseDoubleClickEvent(self, ev):
+        if not self._editing() and self.camera in self._view:
+            self.reset_view()
             return
         super().mouseDoubleClickEvent(ev)
 

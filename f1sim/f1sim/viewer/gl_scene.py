@@ -1049,7 +1049,7 @@ def _tangent_arclength(pts, win):
     return t / (n + 1e-9)
 
 
-def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.05, probe=None):
+def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.05, probe=None, free=None):
     """Tube mesh along each contour.
 
     occupied(xy (n,2)) -> bool: which side of a contour is solid. The tube's axis sits R *inside*
@@ -1068,6 +1068,20 @@ def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.
 
     The vote is weighted by segment length so a dense staircase of short segments cannot outvote the
     long smooth runs, and it falls back to the winding when a contour is genuinely ambiguous.
+    
+    free(xy (n,2)) -> bool: the lane, i.e. open floor a car can reach (2026-11-17). With it, a hose is
+    drawn only where its face meets the lane, and never wider than the solid behind that face:
+    - A mapped band thinner than the hose (a map built from scans: the LiDAR marks the hose's face,
+      a few cells deep, and the unseen space behind it is solid but not hose) has a second contour on
+      its back, against that unseen space. The vote puts that contour's solid side towards the band,
+      so its tube stood R towards the lane -- on the bag-scan Korea 2026 map, 43 % of the drawn hose
+      length stood more than 20 cm into the lane (up to 32 cm) where nothing could be hit, and the
+      doubled, uneven tubes were the lumpy hoses. A back face is not a boundary anyone reaches: not
+      drawn.
+    - A band with lane on both sides (a divider) thinner than the hose: each face's tube would pass
+      through the band and stand in the other lane. The sim's hose there is the band -- that is what
+      the car hits and the LiDAR sees -- so the tube is as wide as the band (full height), its
+      surface still on the face.
     """
     R = diameter / 2
     probe = max(1.2 * resolution, 0.06) if probe is None else probe
@@ -1088,6 +1102,8 @@ def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.
         tang = _tangent_arclength(pts, R)
         seg = np.linalg.norm(np.roll(pts, -1, 0) - pts, axis=1); u = np.concatenate([[0], np.cumsum(seg)[:-1]])
         n1 = np.stack([-tang[:, 1], tang[:, 0], np.zeros(n)], 1); n2 = np.array([0, 0, 1.0])
+        half = np.full(n, R)                        # the tube's half-width across the lane edge
+        keep = np.ones(n, bool)
         if occupied is not None:
             inward = (occupied(pts + probe * n1[:, :2]).astype(np.float64)
                       - occupied(pts - probe * n1[:, :2]).astype(np.float64))
@@ -1099,39 +1115,106 @@ def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.
             else:                                   # no probe saw a difference: fall back to winding
                 area = 0.5 * np.sum(pts[:, 0] * np.roll(pts[:, 1], -1) - np.roll(pts[:, 0], -1) * pts[:, 1])
                 sign = 1.0 if area >= 0 else -1.0
+            into = sign * n1[:, :2]                 # from the face into the solid
+            if free is not None:
+                keep = _runs_cleaned(free(pts - probe * into), seg, 2 * R)
+                # how deep the solid is behind the face, up to a hose diameter: lane again within it = a divider.
+                # Measured from where the ray enters the solid, not from the vertex: the smoothed contour can
+                # sit up to half a cell on the lane side, and read from the vertex that half cell of lane
+                # was a 3 cm "divider" on 30 % of the old Korea map's outer hose.
+                ts = np.arange(0, int(np.ceil((2 * R + 2 * resolution) / (0.5 * resolution))) + 1) * 0.5 * resolution
+                lane = np.stack([free(pts + t * into) for t in ts], 1)
+                k_in = np.where((~lane).any(1), (~lane).argmax(1), len(ts) - 1)
+                out_ = lane & (np.arange(len(ts))[None, :] > k_in[:, None])
+                thick = np.where(out_.any(1) & (ts[k_in] <= 2 * resolution), ts[out_.argmax(1)] - ts[k_in], np.inf)
+                half = _arc_median(np.clip(0.5 * thick, 0.5 * resolution, R), u, seg, R)
             # Full R, deliberately: the tube's outer face has to stay on the boundary because that is
             # where the tracer puts the hose. Offsetting by less to keep the axis inside a thin band
             # would move the drawn surface R - depth into the lane while the LiDAR and the contact
             # test went on using the boundary -- the same visible-penetration gap the docstring above
-            # records, reintroduced as a cosmetic fix. Where a mapped band is thinner than 2R the map
-            # and the hose diameter genuinely disagree; that is measured and reported, not papered over.
-            pts = pts + (R * sign) * n1[:, :2]
+            # records, reintroduced as a cosmetic fix. Where a band with lane on both sides is thinner
+            # than 2R the tube narrows instead (`half`), so its surface stays on the boundary too.
+            pts = pts + half[:, None] * into
+        if not keep.any():
+            continue
         ang = np.linspace(0, 2 * math.pi, radial, endpoint=False)
-        ring_n = (np.cos(ang)[None, :, None] * n1[:, None, :] + np.sin(ang)[None, :, None] * n2[None, None, :])   # (n, radial, 3)
-        centers = np.concatenate([pts, np.full((n, 1), R)], 1)
-        vp = centers[:, None, :] + ring_n * R
+        ca, sa = np.cos(ang)[None, :, None], np.sin(ang)[None, :, None]
+        # an ellipse: `half` across, R up (the hose keeps its height where the band is thinner)
+        vp = (np.concatenate([pts, np.full((n, 1), R)], 1)[:, None, :]
+              + ca * n1[:, None, :] * half[:, None, None] + sa * n2[None, None, :] * R)
+        ring_n = ca * n1[:, None, :] / half[:, None, None] + sa * n2[None, None, :] / R
+        ring_n /= np.linalg.norm(ring_n, axis=-1, keepdims=True)
         # Grey (the user, 2026-10-18: "덕트 파이프 회색으로"), not the near-white it was: against the
         # 0.14 ground plate a mid grey still reads as the boundary.
         col = np.tile([0.50, 0.51, 0.53, 0.0], (n, radial, 1)); col[..., 3] = u[:, None]
-        P.append(vp.reshape(-1, 3)); N.append(ring_n.reshape(-1, 3)); C.append(col.reshape(-1, 4))
-        i = np.arange(n)[:, None] * radial + np.arange(radial)[None, :]
-        i_next_ring = (np.roll(np.arange(n), -1)[:, None] * radial + np.arange(radial)[None, :])
-        i_next_rad = np.arange(n)[:, None] * radial + (np.arange(radial)[None, :] + 1) % radial
-        i_next_both = np.roll(np.arange(n), -1)[:, None] * radial + (np.arange(radial)[None, :] + 1) % radial
-        # Wind the faces the way their own normals point. For a tube running along +x the ring
-        # normal at angle 0 is +y, while cross(v1-v0, v2-v0) for [i, next_ring, next_rad] comes out
-        # along x cross z = -y: every triangle was wound inward. On a plain 64-point circle -- no
-        # folds, no staircase -- all 1792 triangles disagree with their supplied normal, mean dot
-        # -0.997. `Mesh.cull` is on and the main pass culls back faces, so the surface facing the
-        # camera was the one being discarded and what showed was the inside of the far wall. The
-        # shadow pass culls *front*, so it was shadow-mapping the outward surface as well.
-        tri = np.stack([i, i_next_rad, i_next_ring,
-                        i_next_rad, i_next_both, i_next_ring], -1).reshape(-1, 3)
-        I.append(tri + base); base += n * radial
+        # the stretches to draw: the whole loop, or each run of kept points as an open tube
+        if keep.all():
+            runs = [(np.arange(n), True)]
+        else:
+            start = int(np.argmin(keep))            # a dropped point: no run wraps past it
+            order = np.roll(np.arange(n), -start)
+            k_ = keep[order]
+            edges = np.flatnonzero(np.diff(np.r_[0, k_.astype(np.int8), 0]))
+            runs = [(order[a_:b_], False) for a_, b_ in zip(edges[::2], edges[1::2]) if b_ - a_ >= 2]
+        for ix, closed in runs:
+            m = len(ix)
+            P.append(vp[ix].reshape(-1, 3)); N.append(ring_n[ix].reshape(-1, 3)); C.append(col[ix].reshape(-1, 4))
+            i = np.arange(m)[:, None] * radial + np.arange(radial)[None, :]
+            i_next_ring = (np.roll(np.arange(m), -1)[:, None] * radial + np.arange(radial)[None, :])
+            i_next_rad = np.arange(m)[:, None] * radial + (np.arange(radial)[None, :] + 1) % radial
+            i_next_both = np.roll(np.arange(m), -1)[:, None] * radial + (np.arange(radial)[None, :] + 1) % radial
+            # Wind the faces the way their own normals point. For a tube running along +x the ring
+            # normal at angle 0 is +y, while cross(v1-v0, v2-v0) for [i, next_ring, next_rad] comes out
+            # along x cross z = -y: every triangle was wound inward. On a plain 64-point circle -- no
+            # folds, no staircase -- all 1792 triangles disagree with their supplied normal, mean dot
+            # -0.997. `Mesh.cull` is on and the main pass culls back faces, so the surface facing the
+            # camera was the one being discarded and what showed was the inside of the far wall. The
+            # shadow pass culls *front*, so it was shadow-mapping the outward surface as well.
+            tri = np.stack([i, i_next_rad, i_next_ring,
+                            i_next_rad, i_next_both, i_next_ring], -1)
+            if not closed:                          # an open run: no faces from its last ring back to its first
+                tri = tri[:-1]
+            I.append(tri.reshape(-1, 3) + base); base += m * radial
     if not P:
         return None
     return (np.vstack(P).astype(np.float32), np.vstack(N).astype(np.float32),
             np.vstack(C).astype(np.float32), np.vstack(I).reshape(-1).astype(np.int32))
+
+
+def _runs_cleaned(keep, seg, length):
+    """`keep` along a closed contour with dropped stretches shorter than `length` (arc length) filled
+    in: a cell of noise on a scanned face does not cut a hose in two. Short kept runs stay -- with the
+    lane taken from the big open regions only, a kept point faces the lane, and on the bag-scan map
+    the one rule that dropped short runs removed a real 0.3 m piece of hose."""
+    keep = np.asarray(keep, bool).copy()
+    n = len(keep)
+    if keep.all() or not keep.any():
+        return keep
+    start = int(np.argmax(keep))                    # begin on a kept point, so no gap wraps
+    order = np.roll(np.arange(n), -start)
+    k_ = keep[order]
+    edges = np.flatnonzero(np.diff(np.r_[1, k_.astype(np.int8), 1]) != 0)
+    for a_, b_ in zip(edges[::2], edges[1::2]):
+        if seg[order[a_:b_]].sum() < length:
+            keep[order[a_:b_]] = True
+    return keep
+
+
+def _arc_median(x, u, seg, win):
+    """Running median of `x` along a closed contour over +-`win` of arc length. Only where some value
+    in the window differs from the largest (elsewhere the median is that value): a hose is its full
+    width on almost every contour, and a full pass is quadratic in the contour length."""
+    total = float(u[-1] + seg[-1])
+    out = x.copy()
+    top = x.max()
+    low = np.flatnonzero(x < top)
+    if not len(low):
+        return out
+    d_low = np.abs(u[:, None] - u[None, low]); d_low = np.minimum(d_low, total - d_low).min(1)
+    for j in np.flatnonzero(d_low <= win):
+        d = np.abs(u - u[j]); d = np.minimum(d, total - d)
+        out[j] = np.median(x[d <= win])
+    return out
 
 
 def wall_mesh_arrays(contours, height=1.0, is_solid=None, resolution=None):

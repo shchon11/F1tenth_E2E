@@ -336,6 +336,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 b.setMinimumWidth(0)
                 b.setFixedHeight(32)
         cam.addWidget(self.camera_buttons)
+        self.btn_view_reset = QtWidgets.QPushButton("기본 시점으로")
+        self.btn_view_reset.setObjectName("IconButton")
+        self.btn_view_reset.setFixedHeight(30)
+        self.btn_view_reset.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_view_reset.setToolTip("돌리고 옮기고 확대한 시점을 이 카메라의 처음 시점으로 되돌립니다.  (0 · 화면 두 번 클릭)")
+        self.btn_view_reset.clicked.connect(lambda: self.viewport.reset_view())
+        cam.addWidget(self.btn_view_reset)
         self._focus_lay = card("보는 차")
         self.focus_card = self._focus_lay.parentWidget()
         row = QtWidgets.QHBoxLayout()
@@ -2266,6 +2273,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         sc("Space", drive_only(lambda: self.btn_pause.click() if self.btn_pause.isEnabled() else None))
         for i, key in enumerate(CAMERA_KEYS):
             sc(str(i + 1), drive_only(lambda k=key: self._on_camera(k, from_shortcut=True)))
+        sc("0", drive_only(lambda: self.viewport.reset_view()))
         sc("[", drive_only(lambda: self._step_focus(-1)))
         sc("]", drive_only(lambda: self._step_focus(1)))
         sc("Ctrl+R", drive_only(lambda: self.btn_reset.click() if self.btn_reset.isEnabled() else None))
@@ -3666,14 +3674,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             for k, v in [
                 ("Space", "일시정지 / 재개"),
                 ("H / F1", "이 도움말"),
-                ("1 – 5", "카메라 (전체보기 · 추격 · 위에서 · 궤도 · 근접)"),
+                ("1 · 2", "카메라 (전체 · 추격)"),
+                ("0 / 두 번 클릭", "기본 시점으로 (오른쪽 패널 '기본 시점으로'와 같음)"),
                 ("[ , ]", "주시 차량 바꾸기"),
                 ("Ctrl+R", "리셋"),
                 ("Ctrl+.", "정지"),
                 ("Ctrl+F", "맵 검색으로 이동"),
                 ("S", "3D 화면 스크린샷"),
                 ("R", "녹화 시작 / 중지"),
-                ("드래그 / 휠", "궤도 카메라 회전 / 확대"),
+                ("왼쪽 드래그", "시점 회전 · 기울이기"),
+                ("오른쪽 드래그 / Shift+왼쪽", "시점 이동"),
+                ("휠", "확대 · 축소"),
+                ("수동 조작", "↑/W 가속 · ↓/S 브레이크(서 있으면 후진) · ←→/A D 조향 · Shift 빠르게 · X 핸드브레이크"),
                 ("장애물 시드", "위 두 번째 줄의 숫자 = 장애물 배치. 같은 숫자면 같은 배치, '다시 뽑기'는 새 배치 "
                              "(주행 중이면 바로 그 배치로 처음부터)"),
                 ("장애물 편집", "'✎ 장애물 편집' → 클릭 고르기 · 끌기 옮기기 · '＋ 놓기'(A) 후 클릭 놓기 · Q/E·Shift+휠 돌리기 · "
