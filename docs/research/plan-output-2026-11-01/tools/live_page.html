@@ -243,7 +243,8 @@ async function tick() {
     const r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}`, { cache: "no-store" });
     if (!r.ok) { $("hint").textContent = (await r.json()).error || "기록 없음"; return; }
     const age = parseFloat(r.headers.get("X-Age") || "0");
-    $("age").textContent = age < 2 ? "실시간" : `${age.toFixed(0)} s 전 기록`;
+    // the car moves only while the training collects its decisions; between rollouts it computes the update (PPO)
+    $("age").textContent = age < 2 ? "실시간" : age < 300 ? `update 계산 중 · ${age.toFixed(0)} s 전 결정` : `멈춤 · ${(age / 60).toFixed(0)}분 전 기록`;
     $("age").classList.toggle("hot", age >= 2);
     d = await r.json();
   } catch (e) { return; }
