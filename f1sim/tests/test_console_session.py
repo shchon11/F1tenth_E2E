@@ -190,9 +190,9 @@ def test_ui_stays_responsive_while_preparing(h):
         h.app.processEvents(QtCore.QEventLoop.AllEvents, 5)
         worst = max(worst, time.monotonic() - t0)
         # and a control the user might touch really does respond
-        h.window.camera_buttons._pick("top")
+        h.window.camera_buttons._pick("chase")
         time.sleep(0.005)
-    assert h.window.viewport.camera == "top"
+    assert h.window.viewport.camera == "chase"
     assert worst < 0.25, f"event loop blocked for {worst * 1e3:.0f} ms while preparing"
 
 

@@ -25,7 +25,7 @@ from . import contacts as CT
 from .frames import Freshness, INTERP_LAG_FRAMES
 from .opponent_table import OpponentSlotTable
 from .ego_driver import EgoDriverPanel
-from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
+from .overlays import ActivationPanel, ControlTrackPanel, DashPanel, PolicyInputPanel
 from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
 from .. import recorder as REC
@@ -98,6 +98,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     speed_scale_requested = QtCore.pyqtSignal(float)      # live plan speed scale (11-16)
     dial_requested = QtCore.pyqtSignal(float)             # grip dial for a conditional ("dial") policy
     layout_requested = QtCore.pyqtSignal(dict)            # {"seed"} or {"pieces"}, "reset": the obstacle layout
+    manual_command = QtCore.pyqtSignal(bool, int, float, float)   # (on, car, steer [rad], speed [m/s]): keyboard driving
     retry_requested = QtCore.pyqtSignal()
     close_requested = QtCore.pyqtSignal()
 
@@ -267,7 +268,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 (self.btn_start, "StartButton", "▶  시작", "고른 정책 · 맵 · 조건으로 달립니다."),
                 (self.btn_stop, "StopButton", "■  정지", "세션을 끝냅니다.  (Ctrl+.)"),
                 (self.btn_pause, "IconButton", "일시정지", "시뮬레이션을 멈춥니다.  (Space)"),
-                (self.btn_reset, "IconButton", "리셋", "같은 조건으로 처음부터 다시 달립니다.  (Ctrl+R)")):
+                (self.btn_reset, "IconButton", "리셋", "같은 조건으로 처음부터 다시 달립니다.  (Ctrl+R)"),
+                (self.btn_manual, "IconButton", "수동 조작",
+                 "보는 차를 키보드로 몹니다: ↑/W 가속 · ↓/S 브레이크(서 있으면 후진) · ←→/A D 조향 · Shift 빠르게 · "
+                 "X 핸드브레이크. 다시 누르면 policy로 돌아갑니다.")):
             btn.setObjectName(name)
             btn.setText(text)
             btn.setToolTip(tip)
@@ -287,22 +291,28 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(hud)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(10)
-        self.t_speed = Tile("속도", "m/s", big=True)
-        v.addWidget(self.t_speed)
+        # 11-17 (the user: "우측 패널에서 필요한건 현재 속도와 steer값, 최근 및 최고 랩타임 및 랩타임 수, simtime. 시점변경,
+        # 속도배율조정, 제어그래프, 시각화옵션"): exactly those, in that order. 접촉 and 시뮬 배속 left the panel (the
+        # rate is the sim-time tile's second line); their tiles still exist for the code that fills them.
+        self.t_speed = Tile("속도", "m/s")
+        self.t_steer = Tile("조향", "°")
+        self.t_steer.setToolTip("바퀴 조향각(실제). 아래 줄은 제어기가 요구한 조향각.")
         g = QtWidgets.QGridLayout()
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(10)
         self.t_last = Tile("최근 랩", "s")
         self.t_best = Tile("최고 랩", "s")
         self.t_laps = Tile("랩", "바퀴")
+        self.t_simt = Tile("시뮬 시간", "s")
         self.t_contact = Tile("접촉", "회")
         self.t_contact.setToolTip(self.CONTACT_TIP)
         self.t_rate = Tile("시뮬 배속", "×")
-        g.addWidget(self.t_last, 0, 0)
-        g.addWidget(self.t_best, 0, 1)
-        g.addWidget(self.t_laps, 1, 0)
-        g.addWidget(self.t_rate, 1, 1)
-        g.addWidget(self.t_contact, 2, 0, 1, 2)          # full width: the per-kind line has to fit
+        g.addWidget(self.t_speed, 0, 0)
+        g.addWidget(self.t_steer, 0, 1)
+        g.addWidget(self.t_last, 1, 0)
+        g.addWidget(self.t_best, 1, 1)
+        g.addWidget(self.t_laps, 2, 0)
+        g.addWidget(self.t_simt, 2, 1)
         v.addLayout(g)
 
         def card(caption: str) -> QtWidgets.QVBoxLayout:
@@ -318,7 +328,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             return lay
 
         cam = card("카메라")
-        for key, short in (("overview", "전체"), ("chase", "추격"), ("top", "위"), ("orbit", "궤도"), ("close", "근접")):
+        for key, short in (("overview", "전체"), ("chase", "추격")):
             b = self.camera_buttons.button(key)
             if b is not None:
                 b.setText(short)
@@ -340,6 +350,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         row_s.addWidget(self.sld_speed, 1)
         row_s.addWidget(self.lbl_speed)
         spd.addLayout(row_s)
+        ctl = card("제어 추종 (요구 vs 실제)")
+        self.ctrl_panel = ControlTrackPanel()                # (11-17) commanded vs actual over the last seconds
+        ctl.addWidget(self.ctrl_panel)
         show = card("표시")
         for chk, text in ((self.chk_plan, "정책 궤적"), (self.chk_trails, "주행 자취"),
                           (self.chk_lidar, "LiDAR")):
@@ -1004,10 +1017,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.t_rate.set_value(f"{sim_rate:4.2f}" if sim_rate is not None else "—",
                               None if sim_rate is None or sim_rate > 0.9 else C["warn"])
         if frame is None:
-            for t in (self.t_speed, self.t_last, self.t_best, self.t_laps, self.t_contact):
+            for t in (self.t_speed, self.t_steer, self.t_last, self.t_best, self.t_laps, self.t_simt, self.t_contact):
                 t.set_value("—")
             self.t_speed.set_sub("")
             return
+        t_sim = frame.get("t")
+        self.t_simt.set_value(f"{float(t_sim):.1f}" if t_sim is not None else "—")
+        self.t_simt.set_sub(f"배속 {sim_rate:.2f}×" if sim_rate is not None else "")
         f, n = int(frame.get("focus", 0)), int(frame.get("n", 0))
         self.focus_card.setVisible(n > 1)
         if not 0 <= f < n:
@@ -1020,6 +1036,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         st["vmax"] = max(st["vmax"], v)
         self.t_speed.set_value(f"{v:4.2f}")
         self.t_speed.set_sub(f"최고 {st['vmax']:.1f} m/s")
+        try:
+            self.t_steer.set_value(f"{math.degrees(float(frame['steer'][f])):+.1f}")
+            dash = frame.get("dash")
+            self.t_steer.set_sub(f"요구 {math.degrees(float(dash[4])):+.1f}°" if dash is not None else "")
+        except Exception:
+            self.t_steer.set_value("—")
         lap = int(frame["lap"][f])
         t = frame.get("t")
         if st["lap"] is None:
@@ -1727,6 +1749,22 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_reset.clicked.connect(self._on_reset)
         h.addWidget(self.btn_reset)
 
+        # (11-17, the user: "콘솔에 수동조작 할 수 있게좀 해줘") the focus car driven from the keyboard: arrows or WASD,
+        # Shift faster, X handbrake (Space stays 일시정지). `f1sim.teleop` turns the keys into steering and a target speed
+        # (arcade grip feel, the same model as the ROS teleop); sent 50 times a second, the car stops if they stop coming.
+        self.btn_manual = QtWidgets.QPushButton("수동 조작")
+        self.btn_manual.setCheckable(True)
+        self.btn_manual.setToolTip("보는 차를 키보드로 몹니다.\n↑/W 가속 · ↓/S 브레이크(서 있으면 후진) · ←→/A D 조향\n"
+                                   "Shift 더 빠르게 · X 핸드브레이크 · 다시 누르면 policy로 돌아감")
+        self.btn_manual.toggled.connect(self._on_manual_toggled)
+        h.addWidget(self.btn_manual)
+        self._man_keys: set = set()
+        self._man_v, self._man_focus = 0.0, 0
+        self._man_timer = QtCore.QTimer(self)
+        self._man_timer.setInterval(20)
+        self._man_timer.timeout.connect(self._man_tick)
+        self._man_ramp = self._man_model = None
+
         self.btn_stop = PendingButton("정지", role="DangerButton")
         self.btn_stop.setToolTip("세션을 끝내고 worker를 정리합니다.  (Ctrl+.)")
         self.btn_stop.clicked.connect(self._on_stop)
@@ -1816,6 +1854,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.dash_panel = DashPanel()
         self.dash_panel.setProperty("flowExpand", True)     # take the row's spare width
         self._policy_flow.addWidget(self.dash_panel)
+
         self.policy_panel_span_sync()
         self.policy_fold.add(row_host)
         self.policy_fold.toggle.toggled.connect(
@@ -2591,6 +2630,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 tile.set_unknown()
         else:
             f = int(frame.get("focus", 0))
+            self._man_focus = f
+            try:
+                self._man_v = float(frame["vx"][f])
+            except Exception:
+                pass
             self.dash_panel.set_focus(f)
             self.dash_panel.set_grip_estimate(frame.get("grip_estimate"))
             n = int(frame.get("n", 0))
@@ -2728,6 +2772,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def set_dash(self, *a):
         self.dash_panel.set_data(*a)
+        # (v, v_cmd, v_cap, steer, steer_cmd, ...): the same pairs over time
+        self.ctrl_panel.add(a[0], a[1], a[3], a[4])
 
     def set_activations(self, hidden, stem):
         self.activation_panel.set_data(hidden, stem)
@@ -3496,6 +3542,47 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._pending["reset"] = time.monotonic()
         self.viewport.notify("리셋", "info", 1.4)
         self.reset_requested.emit()
+
+    # ---------------------------------------------------------------- 수동 조작
+    _MAN_KEYS = {QtCore.Qt.Key_Up: "up", QtCore.Qt.Key_W: "up", QtCore.Qt.Key_Down: "down", QtCore.Qt.Key_S: "down",
+                 QtCore.Qt.Key_Left: "left", QtCore.Qt.Key_A: "left", QtCore.Qt.Key_Right: "right", QtCore.Qt.Key_D: "right",
+                 QtCore.Qt.Key_Shift: "boost", QtCore.Qt.Key_X: "brake2"}
+
+    def _on_manual_toggled(self, on: bool):
+        app = QtWidgets.QApplication.instance()
+        if on:
+            from ...teleop import DriveModel, KeyRamp, TeleopConfig
+            cfg = TeleopConfig()
+            self._man_ramp, self._man_model = KeyRamp(cfg), DriveModel(cfg)
+            self._man_keys.clear()
+            app.installEventFilter(self)
+            self._man_timer.start()
+            self.viewport.notify("수동 조작: ↑↓ 가속·브레이크, ←→ 조향, Shift 빠르게, X 핸드브레이크", "info", 4.0)
+        else:
+            self._man_timer.stop()
+            app.removeEventFilter(self)
+            self._man_keys.clear()
+            self.manual_command.emit(False, int(self._man_focus), 0.0, 0.0)
+            self.viewport.notify("수동 조작 끝: policy가 다시 몹니다", "info", 2.0)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if self.btn_manual.isChecked() and t in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease):
+            k = self._MAN_KEYS.get(ev.key())
+            if k is not None:
+                if not ev.isAutoRepeat():
+                    (self._man_keys.add if t == QtCore.QEvent.KeyPress else self._man_keys.discard)(k)
+                return True                                    # the driving keys drive, nothing else
+        return super().eventFilter(obj, ev)
+
+    def _man_tick(self):
+        if self._man_ramp is None:
+            return
+        k, dt = self._man_keys, 0.02
+        inp = self._man_ramp.update("left" in k, "right" in k, "up" in k, "down" in k, dt,
+                                    boost="boost" in k, handbrake="brake2" in k)
+        steer, speed = self._man_model.update(inp, self._man_v, dt)
+        self.manual_command.emit(True, int(self._man_focus), float(steer), float(speed))
 
     def _on_pause_requested(self, want_paused: bool):
         self._pending["pause"] = time.monotonic()

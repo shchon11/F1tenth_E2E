@@ -447,16 +447,21 @@ def test_wheel_does_not_change_the_camera_mode(widget, qapp):
         assert widget.camera == mode, f"the wheel changed the camera from {mode} to {widget.camera}"
 
 
-def test_drag_still_rotates_when_orbit_is_already_the_mode(widget, qapp):
+def test_drag_turns_the_view_in_both_modes(widget, qapp):
+    """11-17 (the user: "시점변경 ... 확대 축소라던지 이동 회전같은건 기본적으로"): a left drag turns the view of the mode
+    it is in, a right drag moves it, and neither changes the mode; a double click puts the mode's view back"""
+    from PyQt5 import QtCore as _C
     widget.set_geometry(oval_geometry())
-    widget.set_camera("orbit")
-    qapp.processEvents()
-    before = list(widget._orbit)
-    _click(widget, qapp, "press", pos=(120, 90))
-    _click(widget, qapp, "move", pos=(200, 140))
-    _click(widget, qapp, "release", pos=(200, 140))
-    assert list(widget._orbit) != before, "dragging in 궤도 should still rotate the view"
-    assert widget.camera == "orbit"
+    for mode in ("overview", "chase"):
+        widget.set_camera(mode)
+        qapp.processEvents()
+        before = list(widget._view[mode])
+        _click(widget, qapp, "press", pos=(120, 90))
+        _click(widget, qapp, "move", pos=(200, 140))
+        _click(widget, qapp, "release", pos=(200, 140))
+        assert widget._view[mode][3] != before[3], f"a left drag should turn the {mode} view"
+        assert widget.camera == mode
+        widget._view[mode] = list(widget.VIEW0)
 
 
 def test_drag_outside_orbit_does_not_rotate(widget, qapp):

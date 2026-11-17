@@ -235,11 +235,12 @@ def test_a_v1_payload_frames_exactly_as_it_used_to(widget):
     assert (target[0], target[1]) == pytest.approx((cx, cy))
 
 
-def test_chase_and_top_are_untouched_by_the_presentation(widget):
-    """The user's camera meanings do not change: 추격 follows the car, 위에서 stays car-relative."""
+def test_chase_is_untouched_by_the_presentation(widget):
+    """The user's camera meanings do not change: 추격 follows the car (11-17: 위에서/궤도/근접 removed, the user uses
+    전체보기 and 추격 only)."""
     fr = a_frame()
     fr["x"][0], fr["y"][0], fr["yaw"][0] = 3.0, 4.0, 0.6
-    for mode in ("chase", "top"):
+    for mode in ("chase",):
         widget.geometry_data = TrackGeometry(name="old", bounds=(-9, -9, 9, 9), duct_height=0.2)
         widget.set_camera(mode)
         widget._cam_wall = widget._chase_heading = widget._chase_ref = None

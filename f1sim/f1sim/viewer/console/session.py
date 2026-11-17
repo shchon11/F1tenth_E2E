@@ -344,6 +344,7 @@ class SessionController(QtCore.QObject):
         w.overlay_requested.connect(self.set_overlay)
         w.mu_requested.connect(self.set_mu)
         w.speed_scale_requested.connect(self.set_speed_scale)
+        w.manual_command.connect(self.send_manual)
         w.dial_requested.connect(self.set_dial)
         w.layout_requested.connect(self.set_layout)
         w.describe_requested.connect(self.describe)
@@ -640,6 +641,15 @@ class SessionController(QtCore.QObject):
         if self._active_gen < 0:
             return
         self.send(P.CMD_SET_SPEED_SCALE, for_gen=self._active_gen, scale=float(scale))
+
+    def send_manual(self, on: bool, car: int, steer: float, speed: float):
+        """Keyboard driving (`CMD_MANUAL`): fire and forget -- no pending entry, no ack; the newest wins."""
+        if self._active_gen < 0 or self._ctl is None:
+            return
+        try:
+            self._ctl.send(P.message(P.CMD_MANUAL, on=bool(on), car=int(car), steer=float(steer), speed=float(speed)))
+        except (BrokenPipeError, OSError):
+            pass
 
     def set_dial(self, mu: float):
         if self._active_gen < 0:

@@ -758,6 +758,8 @@ class SimWorker:
         self._min_send_dt = 1.0 / MAX_FRAME_HZ
         self._overlay = {"saliency": False, "internals": False, "plan": True}
         self._sal_cache: Optional[np.ndarray] = None
+        #: (car, steer, speed, received) from the console's keyboard driving (`CMD_MANUAL`), None when off
+        self._manual: Optional[Tuple[int, float, float, float]] = None
         self._sal_time = 0.0
         self._focus = 0
         self._say_lock = threading.Lock()
@@ -1950,6 +1952,7 @@ class SimWorker:
             # Car `link.car` drives what `/drive` said; silence past the timeout is speed 0.
             steer, speed, _fresh = link.command()
             env.set_external_command(link.car, steer, speed)
+        self._manual_step(session, env)
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
         if bool(getattr(getattr(env, "ecfg", None), "opponent_speed_limit", False)):
             # how often the speed limit for a car ahead held the command, said every ~20 s of simulation
@@ -1984,6 +1987,32 @@ class SimWorker:
                 if not session.get("ros_failed"):
                     session["ros_failed"] = True
                     self.say(P.MSG_LOG, gen=self.gen, text=f"ROS2 발행 실패(이후 반복 생략): {exc}")
+
+    def _manual_step(self, session, env) -> None:
+        """The console's keyboard driving (`CMD_MANUAL`): the car takes the keys' (steer, speed) in place of its driver's
+        command, the way `/drive` does; silence for 0.5 s is speed 0; switched off, the car goes back to its driver."""
+        man, held = self._manual, session.get("manual_car")
+        if man is not None:
+            car, steer, speed, t_ = man
+            if not 0 <= car < env.B:
+                return
+            if time.monotonic() - t_ > 0.5:
+                speed = 0.0
+            if held is not None and held != car:
+                self._manual_release(session, env)
+            if session.get("manual_car") is None:
+                session["manual_car"] = car
+                session["manual_was_ext"] = int(car) in getattr(env, "_ext_ids", set())
+            env.set_external_command(car, steer, speed)
+        elif held is not None:
+            self._manual_release(session, env)
+
+    @staticmethod
+    def _manual_release(session, env) -> None:
+        car = session.pop("manual_car", None)
+        if car is not None and not session.pop("manual_was_ext", False):
+            env.ext_mask[car] = False
+            env._ext_ids.discard(int(car))
 
     def _reload_if_changed(self, session) -> None:
         """Pick up a newer checkpoint of the same run without restarting the session.
@@ -2543,6 +2572,11 @@ class SimWorker:
                          info=self.describe_checkpoint(run))
             except Exception as exc:
                 self.say(P.MSG_DESCRIBED, seq=seq, ok=False, run=run, error=str(exc) or type(exc).__name__)
+
+        elif kind == P.CMD_MANUAL:
+            # no ack (50 a second); the sim thread reads the newest in `_manual_step`
+            self._manual = ((int(msg.get("car", 0)), float(msg.get("steer", 0.0)), float(msg.get("speed", 0.0)),
+                             time.monotonic()) if msg.get("on") else None)
 
         elif kind == P.CMD_CANCEL:
             gen = int(msg.get("gen", -1))

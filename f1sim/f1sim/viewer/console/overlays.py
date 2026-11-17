@@ -680,6 +680,90 @@ class DashPanel(QtWidgets.QWidget):
                    C["text.2"])
 
 
+class ControlTrackPanel(QtWidgets.QWidget):
+    """Commanded against actual, over the last seconds (11-17, the user: "제어정확도 어느정도 볼 수 있게 요구하는출력대
+    실제 현재 출력 시계열 그래프"): speed (the speed the controller commanded vs the car's) and steering (commanded vs the
+    wheel's angle), one strip each on one time axis, with the RMS gap over the window. The DashPanel's needles show the
+    same two pairs at one instant; this is how they went."""
+
+    SPAN_S = 12.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(176)
+        self.setMinimumWidth(160)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)     # the card's width, whatever it is
+        self._h: List[Tuple[float, float, float, float, float]] = []      # (t, v, v_cmd, steer, steer_cmd)
+        self.setToolTip("최근 12초. 파랑 = 실제(차의 속도·바퀴 조향각), 주황 = 제어기가 요구한 값.\n"
+                        "오른쪽 숫자는 그 사이의 RMS 오차.")
+
+    def add(self, v, v_cmd, steer, steer_cmd):
+        import time as _t
+        now = _t.monotonic()
+        if self._h and now - self._h[-1][0] > 3.0:                  # a pause or a new session: a fresh window
+            self._h.clear()
+        self._h.append((now, float(v), float(v_cmd), float(steer), float(steer_cmd)))
+        while self._h and self._h[0][0] < now - self.SPAN_S:
+            self._h.pop(0)
+        self.update()
+
+    def clear(self):
+        self._h.clear()
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(self.rect(), QtGui.QColor(C["bg.card"]))
+        f = p.font(); f.setPixelSize(theme.SIZE.get("label", 12)); p.setFont(f)
+        if len(self._h) < 2:
+            p.setPen(QtGui.QColor(C["text.2"]))
+            p.drawText(self.rect(), QtCore.Qt.AlignCenter, "제어 추종: 달리기 시작하면 보입니다")
+            return
+        a = np.asarray(self._h)
+        t = a[:, 0] - a[-1, 0]
+        rows = (("속도 m/s", a[:, 1], a[:, 2], 1.0, "m/s"), ("조향 °", np.degrees(a[:, 3]), np.degrees(a[:, 4]), 1.0, "°"))
+        top, gap = 2, 10
+        hh = (H - top - gap - 18) / 2
+        for k, (name, act, cmd, _s, unit) in enumerate(rows):
+            y0 = top + k * (hh + gap)
+            rms = float(np.sqrt(np.mean((act - cmd) ** 2)))
+            lo, hi = float(min(act.min(), cmd.min())), float(max(act.max(), cmd.max()))
+            if hi - lo < (1.0 if unit == "m/s" else 4.0):
+                m_ = 0.5 * (hi + lo); d_ = 0.5 if unit == "m/s" else 2.0
+                lo, hi = m_ - d_, m_ + d_
+            pad = 0.08 * (hi - lo); lo -= pad; hi += pad
+            x0, x1 = 34.0, W - 6.0
+            X = lambda tt: x0 + (tt + self.SPAN_S) / self.SPAN_S * (x1 - x0)
+            Y = lambda vv: y0 + 16 + (1 - (vv - lo) / (hi - lo)) * (hh - 18)
+            p.setPen(QtGui.QColor(C["text.1"]))
+            p.drawText(QtCore.QRectF(6, y0, W - 12, 14), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, name)
+            p.setPen(QtGui.QColor(C["text.0"]))
+            p.drawText(QtCore.QRectF(6, y0, W - 12, 14), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                       f"RMS {rms:.2f}")
+            p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
+            for vv in (lo + pad, hi - pad):
+                p.drawLine(QtCore.QPointF(x0, Y(vv)), QtCore.QPointF(x1, Y(vv)))
+            p.setPen(QtGui.QColor(C["text.2"]))
+            for vv in (lo + pad, hi - pad):
+                p.drawText(QtCore.QRectF(0, Y(vv) - 7, x0 - 6, 14), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{vv:.1f}")
+            for series, col, w in ((cmd, C["warn"], 1.6), (act, C["accent"], 2.0)):
+                path = QtGui.QPainterPath(QtCore.QPointF(X(t[0]), Y(series[0])))
+                for tt, vv in zip(t[1:], series[1:]):
+                    path.lineTo(QtCore.QPointF(X(tt), Y(vv)))
+                p.setPen(QtGui.QPen(QtGui.QColor(col), w)); p.setBrush(QtCore.Qt.NoBrush); p.drawPath(path)
+        p.setPen(QtGui.QColor(C["text.2"]))
+        p.drawText(QtCore.QRectF(34, H - 16, W - 40, 14), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, f"-{self.SPAN_S:.0f} s")
+        p.drawText(QtCore.QRectF(34, H - 16, W - 40, 14), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, "지금")
+        # the key: what each colour is
+        x_k = W / 2 - 36
+        p.setPen(QtGui.QPen(QtGui.QColor(C["accent"]), 2)); p.drawLine(QtCore.QPointF(x_k, H - 9), QtCore.QPointF(x_k + 14, H - 9))
+        p.setPen(QtGui.QColor(C["text.1"])); p.drawText(QtCore.QPointF(x_k + 18, H - 4), "실제")
+        p.setPen(QtGui.QPen(QtGui.QColor(C["warn"]), 2)); p.drawLine(QtCore.QPointF(x_k + 56, H - 9), QtCore.QPointF(x_k + 70, H - 9))
+        p.setPen(QtGui.QColor(C["text.1"])); p.drawText(QtCore.QPointF(x_k + 74, H - 4), "요구")
+
+
 class ActivationPanel(QtWidgets.QWidget):
     """Raw hidden-layer and conv-feature activations, when they are asked for.
 

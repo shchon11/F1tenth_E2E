@@ -39,12 +39,12 @@ from .theme import C
 
 #: Clickable camera modes. Every one of them is a button in the UI; the digit is a shortcut, not
 #: the only way to reach it.
+# 11-17 (the user: "카메라 시점 위 궤도 근접 빼줘. 전체랑 추격밖에 안써. 시점변경같은거좀 자유롭게 ... 확대 축소라던지 이동
+# 회전같은건 기본적으로"): two modes, and in both the mouse moves the view the way 3D tools do (Foxglove/RViz): left drag
+# turns it, right drag (or Shift + left) moves it, the wheel zooms, a double click puts the mode's own view back.
 CAMERA_MODES: List[Tuple[str, str, str]] = [
-    ("overview", "전체보기", "맵 전체를 화면에 맞춰 위에서 본다  (단축키 1)"),
-    ("chase", "추격", "주시 차량 뒤에서 따라간다  (단축키 2)"),
-    ("top", "위에서", "주시 차량 바로 위, 차량 방향 기준  (단축키 3)"),
-    ("orbit", "궤도", "주시 차량 주위를 돈다. 드래그로 회전, 휠로 확대  (단축키 4)"),
-    ("closeup", "근접", "주시 차량을 가까이서 천천히 돈다  (단축키 5)"),
+    ("overview", "전체보기", "맵 전체를 위에서 본다. 왼쪽 드래그 회전·기울이기, 오른쪽 드래그 이동, 휠 확대/축소, 두 번 클릭 원래대로  (단축키 1)"),
+    ("chase", "추격", "주시 차량 뒤에서 따라간다. 왼쪽 드래그 차 주위로 돌기, 오른쪽 드래그 이동, 휠 확대/축소, 두 번 클릭 원래대로  (단축키 2)"),
 ]
 CAMERA_KEYS = [k for k, _, _ in CAMERA_MODES]
 
@@ -296,6 +296,11 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self.vehicle_cfg: Dict[str, float] = {"lr": 0.15, "cog_z": 0.06, "wheel_r": 0.056}
 
         self._orbit = [math.radians(-35), math.radians(30), 4.0]
+        #: (11-17) the user's own view on top of each mode's: [zoom, pan x, pan y, yaw, tilt] -- overview: pan in world
+        #: metres, yaw turns the map, tilt leans the camera; chase: pan forward/left of the car, yaw goes round it,
+        #: tilt raises it. A double click sets the mode's back to VIEW0.
+        self._view = {"overview": list(self.VIEW0), "chase": list(self.VIEW0)}
+        self._last_up = np.array([0.0, 1.0, 0.0])
         self._drag: Optional[Tuple[float, float]] = None
         #: 장애물 편집 (2026-11-03, `layout_editor`): the editor while the mode is on, the top-down camera it uses
         #: ([centre x, centre y, height, up x, up y]), the camera to go back to, and the drag in progress.
@@ -429,7 +434,8 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                            "assets", "f1tenth_car.glb")
         t0 = time.perf_counter()
         self.scene.load_car(glb, MAX_RENDER_CARS)
-        self.scene.alloc_trails(MAX_RENDER_CARS, 600)
+        # 11-17 (the user: "주행 자취 좀 오래 남기게"): 1800 points, one every second frame -- about two minutes
+        self.scene.alloc_trails(MAX_RENDER_CARS, 1800)
         self._car_loaded = True
         self.upload_timed.emit("car mesh", (time.perf_counter() - t0) * 1e3)
 
@@ -649,6 +655,8 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                     pass
         self.scene.alloc_points(n_beams)
         self._n_beams = n_beams
+
+    VIEW0 = (1.0, 0.0, 0.0, 0.0, 0.0)
 
     def set_camera(self, mode: str):
         if self.layout_editor is not None:
@@ -932,7 +940,9 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         seq = int(fr.get("seq", -1))
         if self.show_trails and seq != self._trail_seq:
             self._trail_seq = seq
-            sc.push_trail_points(fr["x"], fr["y"])
+            self._trail_n = getattr(self, "_trail_n", 0) + 1
+            if self._trail_n % 2 == 0:
+                sc.push_trail_points(fr["x"], fr["y"])
 
         fx = fr["x"][f] if 0 <= f < n else 0.0
         fy = fr["y"][f] if 0 <= f < n else 0.0
@@ -1178,8 +1188,15 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             # the chase anchor says it sits, and what is smoothed is the direction the camera looks
             # from, which is the part that should ease rather than snap.
             yaw_c = self._chase_yaw(yaw, fr, x, y)
-            eye = np.array([x - 1.7 * math.cos(yaw_c), y - 1.7 * math.sin(yaw_c), 0.75])
-            target = np.array([x + 1.2 * math.cos(yaw_c), y + 1.2 * math.sin(yaw_c), 0.1])
+            # the view the user turned/moved/zoomed (`_view["chase"]`); at VIEW0 exactly the old chase: eye 1.7 m behind
+            # and 0.75 m up, looking at 1.2 m ahead
+            zoom, pf, pl, yaw_v, tilt = self._view["chase"]
+            cf, sf = math.cos(yaw_c), math.sin(yaw_c)
+            target = np.array([x + 1.2 * cf + pf * cf - pl * sf, y + 1.2 * sf + pf * sf + pl * cf, 0.1])
+            el = float(np.clip(math.atan2(0.65, 2.9) + tilt, math.radians(2), math.radians(85)))
+            dist = math.hypot(2.9, 0.65) * zoom
+            ya = yaw_c + yaw_v
+            eye = target + dist * np.array([-math.cos(el) * math.cos(ya), -math.cos(el) * math.sin(ya), math.sin(el)])
         elif m == "top":
             eye = np.array([x, y, 14.0])
             target = np.array([x, y, 0.0])
@@ -1226,8 +1243,16 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 up = np.array([1.0, 0, 0]) if turn else np.array([0, 1.0, 0])
                 vert, horiz = (bw, bh) if turn else (bh, bw)
                 d = max(0.5 * vert / t, 0.5 * horiz / (t * aspect)) * 1.08
-            eye = np.array([cx, cy, d])
-            target = np.array([cx, cy, 0.0])
+            if m == "overview":
+                zoom, px, py, yaw_v, tilt = self._view["overview"]
+                cx, cy, d = cx + px, cy + py, d * zoom
+                c_, s_ = math.cos(yaw_v), math.sin(yaw_v)
+                up = np.array([up[0] * c_ - up[1] * s_, up[0] * s_ + up[1] * c_, 0.0])
+                target = np.array([cx, cy, 0.0])
+                eye = target + d * np.array([-math.sin(tilt) * up[0], -math.sin(tilt) * up[1], math.cos(tilt)])
+            else:
+                eye = np.array([cx, cy, d])
+                target = np.array([cx, cy, 0.0])
         elif m == "closeup":
             ang = time.perf_counter() * 0.4
             eye = np.array([x + 1.1 * math.cos(ang), y + 1.1 * math.sin(ang), 0.45])
@@ -1241,6 +1266,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         # world space; its easing lives in `_chase_yaw` instead, where it cannot become a lag on
         # where the car appears.
         self._cam_eye, self._cam_tgt = eye, target
+        self._last_up = np.asarray(up, dtype=float)
         return self._cam_eye, self._cam_tgt, up
 
     # ---------------------------------------------------------------- 장애물 편집
@@ -1421,9 +1447,20 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         mode is chosen by its button or its shortcut, and by nothing else; dragging rotates only
         when 궤도 is already the mode.
         """
-        if ev.button() == QtCore.Qt.LeftButton and self.camera == "orbit":
-            self._drag = (ev.x(), ev.y())
+        if self.camera in self._view:
+            pan = ev.button() in (QtCore.Qt.RightButton, QtCore.Qt.MiddleButton) or \
+                (ev.button() == QtCore.Qt.LeftButton and ev.modifiers() & QtCore.Qt.ShiftModifier)
+            if pan or ev.button() == QtCore.Qt.LeftButton:
+                self._drag = ("pan" if pan else "turn", ev.x(), ev.y())
+                self.setCursor(QtCore.Qt.ClosedHandCursor if pan else QtCore.Qt.SizeAllCursor)
         super().mousePressEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if not self._editing() and self.camera in self._view:
+            self._view[self.camera] = list(self.VIEW0)
+            self.update()
+            return
+        super().mouseDoubleClickEvent(ev)
 
     def parent_camera_sync(self):
         """Keep the window's camera buttons in step with `self.camera`."""
@@ -1437,20 +1474,39 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 self.setCursor(QtCore.Qt.OpenHandCursor)
             self._edit_drag = self._edit_pan = None
             return
-        if ev.button() == QtCore.Qt.LeftButton:
-            self._drag = None
+        self._drag = None
+        self.unsetCursor()
         super().mouseReleaseEvent(ev)
 
     def mouseMoveEvent(self, ev):
         if self._editing():
             self._edit_move(ev)
             return
-        if self._drag is None or self.camera != "orbit":
+        if self._drag is None or self.camera not in self._view:
             return
-        dx, dy = ev.x() - self._drag[0], ev.y() - self._drag[1]
-        self._drag = (ev.x(), ev.y())
-        self._orbit[0] -= dx * 0.005
-        self._orbit[1] = float(np.clip(self._orbit[1] + dy * 0.005, math.radians(2), math.radians(89)))
+        kind, x0, y0 = self._drag
+        dx, dy = ev.x() - x0, ev.y() - y0
+        self._drag = (kind, ev.x(), ev.y())
+        v = self._view[self.camera]
+        if kind == "turn":
+            v[3] -= dx * 0.006
+            lo, hi = (0.0, math.radians(75)) if self.camera == "overview" else (math.radians(-12), math.radians(70))
+            v[4] = float(np.clip(v[4] + dy * 0.005, lo, hi))
+        elif self._cam_eye is not None and self._cam_tgt is not None:
+            # metres per pixel where the camera looks, so the ground follows the cursor
+            d = float(np.linalg.norm(np.asarray(self._cam_eye) - np.asarray(self._cam_tgt)))
+            mpp = 2.0 * d * math.tan(math.radians(55.0) / 2) / max(1, self.height())
+            if self.camera == "overview":
+                eye, tgt = np.asarray(self._cam_eye), np.asarray(self._cam_tgt)
+                fwd = tgt - eye; fwd[2] = 0.0
+                # looking straight down the screen's up is the camera's `up`; leaning, it is where the camera faces
+                up_s = self._last_up if np.linalg.norm(fwd) < 1e-6 else fwd / np.linalg.norm(fwd)
+                right = np.array([up_s[1], -up_s[0], 0.0])
+                step = (-dx * right + dy * up_s) * mpp
+                v[1] += float(step[0]); v[2] += float(step[1])
+            else:
+                v[1] += dy * mpp
+                v[2] += dx * mpp
         self.update()
 
     def wheelEvent(self, ev):
@@ -1464,7 +1520,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             return
         steps = ev.angleDelta().y() / 120.0
         self._orbit[2] = float(np.clip(self._orbit[2] * (0.9 ** steps), 0.5, 80.0))
-        if self.camera == "orbit":
+        if self.camera in self._view:
+            lo, hi = (0.04, 3.0) if self.camera == "overview" else (0.3, 8.0)
+            v = self._view[self.camera]
+            v[0] = float(np.clip(v[0] * (0.88 ** steps), lo, hi))
             self.update()
 
     # ---------------------------------------------------------------- chrome placement

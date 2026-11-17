@@ -46,6 +46,10 @@ CMD_SET_SPEED_SCALE = "set_speed_scale"   # {"scale": float} live plan speed sca
 #: (`viewer.prop_layout.LayoutHold`): a new seed's draw, or a layout made by hand, written into the running
 #: generator's slots; with "reset" the episode starts again on it. Acked with the layout as held.
 CMD_SET_LAYOUT = "set_layout"
+#: (11-17, the user: "콘솔에 수동조작 할 수 있게좀 해줘") {"on": bool, "car": int, "steer": rad, "speed": m/s}: car `car` is driven
+#: by the keyboard (`f1sim.teleop` turns the keys into steering and a target speed on the console side). Sent ~50 times a
+#: second and never acked: the newest one wins, and the worker stops the car if none arrives for 0.5 s.
+CMD_MANUAL = "manual"
 CMD_CANCEL = "cancel"              # abandon an in-flight start (by generation)
 CMD_SHUTDOWN = "shutdown"
 
