@@ -148,6 +148,7 @@ function fit(c) {
 // wheel = zoom about the pointer, drag = move (leaves follow), double click = back to following, 전체 트랙 = the whole track
 const VIEW = { mode: "follow", span: 9, cx: 0, cy: 0, ox: 0, oy: 0 };   // span: metres across the map's width; ox/oy: offset while following
 let LAST = null;                                             // the last drawn camera {cx, cy, s, W, H, T}
+const CAM = { x: 0, y: 0, t: 0 };                            // the following camera, eased toward the car
 function setMode(m) { VIEW.mode = m; $("v_follow").className = m === "follow" ? "on" : ""; $("v_track").className = m === "track" ? "on" : ""; }
 function toggleFollow() {
   if (VIEW.mode === "follow") { if (LAST) { VIEW.cx = LAST.cx; VIEW.cy = LAST.cy; VIEW.span = LAST.W / LAST.s; } setMode("free"); }
@@ -232,7 +233,15 @@ function drawMap(f, carP, oppP, T, trail) {
   const { g, W, H } = fit($("map"));
   g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
   let cx, cy, span;
-  if (VIEW.mode === "follow") { cx = carP[0] + 0.15 * VIEW.span * Math.cos(carP[2]) + VIEW.ox; cy = carP[1] + 0.15 * VIEW.span * Math.sin(carP[2]) + VIEW.oy; span = VIEW.span; }
+  if (VIEW.mode === "follow") {
+    // (11-17, the user: "차 따라가는거 뭐이리 어지럽냐 ... 머리아파") the car in the middle, north up, nothing else: the look-ahead
+    // point that swung round with every heading change is gone, and the camera trails the car by a quarter second so the
+    // wiggles of an early policy do not shake the whole map. A jump (a new episode) moves it at once.
+    const tx = carP[0] + VIEW.ox, ty = carP[1] + VIEW.oy, now = performance.now();
+    if (!CAM.t || Math.hypot(tx - CAM.x, ty - CAM.y) > 3) { CAM.x = tx; CAM.y = ty; }
+    else { const a = 1 - Math.exp(-(now - CAM.t) / 250); CAM.x += a * (tx - CAM.x); CAM.y += a * (ty - CAM.y); }
+    CAM.t = now; cx = CAM.x; cy = CAM.y; span = VIEW.span;
+  }
   else if (VIEW.mode === "track") { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W * T.res, T.H * T.res * W / H) * 1.05; }
   else { cx = VIEW.cx; cy = VIEW.cy; span = VIEW.span; }
   const s = W / span, P = (x, y) => [(x - cx) * s + W / 2, H / 2 - (y - cy) * s];
