@@ -304,6 +304,35 @@ def figs():
     return out[:60]
 
 
+
+def live_runs():
+    """runs that write the live view, newest first"""
+    out = []
+    for d in os.listdir(RUNS):
+        p = os.path.join(RUNS, d, "live_tap.json")
+        if os.path.isfile(p):
+            out.append({"name": d, "age": time.time() - os.path.getmtime(p)})
+    return sorted(out, key=lambda r: r["age"])
+
+
+def live_track(name, tid):
+    """one track of a live run: its walls as a PNG (data URL) and where the image sits; the box footprints by shape id"""
+    import base64, io
+    import numpy as np
+    from PIL import Image
+    z = np.load(os.path.join(RUNS, os.path.basename(name), "live_tracks.npz"))
+    off, H, W = int(z["t_off"][tid]), int(z["t_H"][tid]), int(z["t_W"][tid])
+    res = float(np.asarray(z["t_res"]).reshape(-1)[tid] if np.asarray(z["t_res"]).size > 1 else np.asarray(z["t_res"]).reshape(-1)[0])
+    org = np.asarray(z["t_origin"]).reshape(-1, 2)
+    org = org[tid] if len(org) > tid else org[0]
+    g = z["edt"][off:off + H * W].reshape(H, W)
+    img = np.where(g > 0, 246, 70).astype(np.uint8)[::-1]          # lane light, walls dark; row 0 = top (largest y)
+    buf = io.BytesIO(); Image.fromarray(img, "L").save(buf, "PNG")
+    fps = {k[3:]: np.asarray(z[k]).round(3).tolist() for k in z.files if k.startswith("fp_")}
+    return {"png": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), "x0": float(org[0]),
+            "y0": float(org[1]), "res": res, "W": W, "H": H, "fp": fps}
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -352,6 +381,8 @@ class H(BaseHTTPRequestHandler):
                 p_ = f"{OUT}/research_log.md"
                 return self._json({"text": open(p_, errors="replace").read() if os.path.exists(p_) else "",
                                    "mtime": os.path.getmtime(p_) if os.path.exists(p_) else None})
+            if u.path == "/api/live_runs":
+                return self._json(memo("live_runs", 5, live_runs))
             if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes", "/api/overview") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":
@@ -379,9 +410,25 @@ class H(BaseHTTPRequestHandler):
                 return self._json(memo("figs", 60, figs))
             if u.path == "/file":
                 return self._file(q.get("path", ""))
+            # (11-17, the user: "학습중인 차 ... 실시간으로", "네트워크 반응이나 기억값 ... 재밌게") the training's own car
+            if u.path == "/live":
+                return self._send(200, open(os.path.join(TOOLS, "live_page.html"), "rb").read(), "text/html; charset=utf-8")
+            if u.path == "/api/live":
+                return self._live(name)
+            if u.path == "/api/live_track":
+                return self._json(memo(("live_track", name, q.get("tid", "0")), 3600, lambda: live_track(name, int(q.get("tid", "0")))))
+            if u.path == "/api/live_runs":
+                return self._json(memo("live_runs", 5, live_runs))
         except Exception as exc:                       # one bad file must not take the page down
             return self._send(500, json.dumps({"error": str(exc)[:300]}))
         self._send(404, "{}")
+
+    def _live(self, name):
+        p = os.path.join(RUNS, os.path.basename(name), "live_tap.json")
+        if not name or not os.path.isfile(p):
+            return self._send(404, json.dumps({"error": "이 run에는 실시간 기록이 없습니다 (plan_rl --live-tap)"}))
+        body = open(p, "rb").read()
+        return self._send(200, body, extra={"X-Age": f"{time.time() - os.path.getmtime(p):.2f}"})
 
     def _file(self, rel):
         p = os.path.realpath(os.path.join(OUT, rel))

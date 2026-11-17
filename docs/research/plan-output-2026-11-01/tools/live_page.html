@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>학습 실시간</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --line:#2a313b; --ink:#e6e9ee; --muted:#8b95a3; --run:#4c9aff; --opp:#ff6b6b;
+          --copy:#c084fc; --plan:#ffa94d; --mean:#69db7c; --box:#b07a45; --scan:#9aa5b1; --hit:#ff4d4f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:13px/1.4 system-ui, "Noto Sans KR", sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 8px 0 0; }
+  select, button { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:4px 8px; font:inherit; }
+  button.on { border-color:var(--run); color:var(--run); }
+  .chip { padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .chip.hot { color:#111; background:#ffd43b; border-color:#ffd43b; }
+  .chip.copy { color:#111; background:var(--copy); border-color:var(--copy); }
+  main { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(0, 1fr); gap:12px; padding:12px; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .card h3 { margin:0 0 6px; font-size:13px; font-weight:600; }
+  .card h3 small { color:var(--muted); font-weight:400; margin-left:6px; }
+  #map { width:100%; aspect-ratio:1/1; display:block; border-radius:8px; background:#0b0d10; }
+  .side { display:grid; gap:12px; }
+  .nums { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
+  .num { background:#141920; border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
+  .num b { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
+  .num span { color:var(--muted); font-size:11px; }
+  canvas.chart { width:100%; height:110px; display:block; }
+  canvas.mem { width:100%; height:180px; display:block; image-rendering:pixelated; border-radius:6px; }
+  .legend { display:flex; flex-wrap:wrap; gap:10px; color:var(--muted); font-size:11px; margin-top:4px; }
+  .legend i { display:inline-block; width:10px; height:3px; vertical-align:middle; margin-right:4px; }
+  #log { max-height:150px; overflow:auto; font-size:12px; color:var(--muted); }
+  #log div { padding:1px 0; border-bottom:1px solid #20262e; }
+  #log .h { color:var(--hit); }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>학습 실시간</h1>
+  <select id="run"></select>
+  <span class="chip" id="age">-</span>
+  <span class="chip" id="upd">update -</span>
+  <span class="chip" id="scene">일반 경주</span>
+  <span class="chip" id="copy">상대 차 없음</span>
+  <button id="follow" class="on">차 따라가기</button>
+  <span class="muted" id="hint"></span>
+</header>
+<main>
+  <section class="card">
+    <h3>학습 차 하나 <small>파랑 = 우리 차(자취) · 주황 = 실제로 몬 plan(잡음 포함) · 초록 점선 = 평균 행동의 plan · 빨강 = 상대 차(보라 = 우리 policy 복제본) · 회색 점 = LiDAR</small></h3>
+    <canvas id="map" width="900" height="900"></canvas>
+    <div class="legend"><span><i style="background:var(--run)"></i>우리 차</span><span><i style="background:var(--plan)"></i>몬 plan</span>
+      <span><i style="background:var(--mean)"></i>평균 plan</span><span><i style="background:var(--opp)"></i>상대 차</span>
+      <span><i style="background:var(--box)"></i>상자</span><span><i style="background:var(--hit)"></i>세게 닿음</span></div>
+  </section>
+  <section class="side">
+    <div class="card">
+      <h3>지금 <small>결정 0.1 s마다</small></h3>
+      <div class="nums">
+        <div class="num"><b id="n_v">-</b><span>실제 속도 m/s</span></div>
+        <div class="num"><b id="n_vh">-</b><span>policy가 짐작한 속도</span></div>
+        <div class="num"><b id="n_val">-</b><span>critic 값 (앞으로 받을 보상)</span></div>
+        <div class="num"><b id="n_noise">-</b><span>이번 잡음 크기 (표준편차 배)</span></div>
+        <div class="num"><b id="n_std">-</b><span>policy 표준편차</span></div>
+        <div class="num"><b id="n_rew">-</b><span>이번 보상</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>속도 <small>실제(파랑) · 짐작(초록) · 최근 30 s</small></h3>
+      <canvas class="chart" id="c_speed" width="600" height="110"></canvas>
+    </div>
+    <div class="card">
+      <h3>critic 값과 보상 <small>값(보라) · 보상: 진행(초록) · 접촉 벌점(빨강)</small></h3>
+      <canvas class="chart" id="c_val" width="600" height="110"></canvas>
+    </div>
+    <div class="card">
+      <h3>plan의 속도 <small>몬 plan 10점의 속도 m/s (앞 0.1 s → 1 s 뒤)</small></h3>
+      <canvas class="chart" id="c_pv" width="600" height="110"></canvas>
+    </div>
+    <div class="card">
+      <h3>기억 128개 <small>세로 = 값 하나, 가로 = 시간(오른쪽이 지금) · 파랑 음수, 빨강 양수</small></h3>
+      <canvas class="mem" id="c_mem" width="300" height="128"></canvas>
+      <div class="legend"><span id="memstat">-</span></div>
+    </div>
+    <div class="card">
+      <h3>일어난 일</h3>
+      <div id="log"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+let RUN = qs.get("run") || "", TRACK = {}, IMG = {}, last = null, follow = true;
+const H = { t: [], v: [], vh: [], val: [], lap: [], con: [], mem: [], key: [] };
+const HMAX = 300;                          // 30 s of decisions
+const css = (k) => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+
+$("follow").onclick = () => { follow = !follow; $("follow").classList.toggle("on", follow); };
+
+async function runs() {
+  const r = await (await fetch("/api/live_runs")).json();
+  const sel = $("run"); sel.innerHTML = "";
+  for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = `${x.name} (${x.age < 5 ? "지금" : Math.round(x.age) + " s 전"})`; sel.appendChild(o); }
+  if (!r.length) { $("hint").textContent = "실시간 기록을 쓰는 학습이 없습니다 (plan_rl --live-tap)"; return; }
+  if (!RUN || !r.some((x) => x.name === RUN)) RUN = r[0].name;
+  sel.value = RUN;
+  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); for (const k in H) H[k] = []; last = null; };
+}
+
+async function track(tid) {
+  const key = RUN + ":" + tid;
+  if (TRACK[key]) return TRACK[key];
+  const t = await (await fetch(`/api/live_track?run=${encodeURIComponent(RUN)}&tid=${tid}`)).json();
+  const img = new Image(); img.src = t.png; await img.decode();
+  t.img = img; TRACK[key] = t; return t;
+}
+
+function log(text, cls) {
+  const d = document.createElement("div"); d.textContent = new Date().toLocaleTimeString() + "  " + text; if (cls) d.className = cls;
+  $("log").prepend(d); while ($("log").childNodes.length > 60) $("log").lastChild.remove();
+}
+
+function drawMap(f, trail, T) {
+  const c = $("map"), g = c.getContext("2d"), W = c.width;
+  g.fillStyle = "#0b0d10"; g.fillRect(0, 0, W, W);
+  // view: follow the car (10 m wide) or the whole track
+  let cx, cy, span;
+  if (follow) { cx = f.car[0]; cy = f.car[1]; span = 10; }
+  else { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W, T.H) * T.res; }
+  const s = W / span;
+  const P = (x, y) => [(x - cx) * s + W / 2, W / 2 - (y - cy) * s];
+  // track image: pixel (i, j) of the flipped image = world (x0 + i res, y0 + (H - j) res)
+  const [ix, iy] = P(T.x0, T.y0 + T.H * T.res);
+  g.imageSmoothingEnabled = false;
+  g.globalAlpha = 0.9; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s); g.globalAlpha = 1;
+  // LiDAR
+  g.fillStyle = css("--scan");
+  for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - 1.2, y - 1.2, 2.4, 2.4); }
+  // boxes
+  for (const b of f.boxes) {
+    const fp = T.fp[String(b[0])]; if (!fp) continue;
+    const c0 = Math.cos(b[3]), s0 = Math.sin(b[3]);
+    g.beginPath();
+    fp.forEach((q, i) => { const [x, y] = P(b[1] + q[0] * c0 - q[1] * s0, b[2] + q[0] * s0 + q[1] * c0); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.closePath(); g.fillStyle = css("--box"); g.fill();
+  }
+  // trail
+  g.lineWidth = 3; g.lineCap = "round";
+  for (let i = 1; i < trail.length; i++) {
+    const a = trail[i - 1], b = trail[i];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) > 3) continue;           // a restart: no line across the map
+    const [x0, y0] = P(a[0], a[1]), [x1, y1] = P(b[0], b[1]);
+    g.strokeStyle = `rgba(76,154,255,${0.15 + 0.85 * i / trail.length})`; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  }
+  // plans
+  const line = (pts, col, dash, w) => {
+    g.setLineDash(dash); g.strokeStyle = col; g.lineWidth = w; g.beginPath();
+    pts.forEach((q, i) => { const [x, y] = P(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); g.setLineDash([]);
+    g.fillStyle = col; for (const q of pts) { const [x, y] = P(q[0], q[1]); g.beginPath(); g.arc(x, y, 3, 0, 7); g.fill(); }
+  };
+  line(f.plan_mean, css("--mean"), [6, 5], 2);
+  line(f.plan, css("--plan"), [], 2.5);
+  // cars (0.50 x 0.30 m)
+  const car = (st, col) => {
+    const c0 = Math.cos(st[2]), s0 = Math.sin(st[2]), L = 0.25, Wd = 0.15;
+    const pts = [[L, Wd], [L, -Wd], [-L, -Wd], [-L, Wd]].map(([a, b]) => P(st[0] + a * c0 - b * s0, st[1] + a * s0 + b * c0));
+    g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
+    g.fillStyle = col; g.fill(); g.strokeStyle = "#000"; g.lineWidth = 1; g.stroke();
+    const [hx, hy] = P(st[0] + L * c0, st[1] + L * s0); g.fillStyle = "#fff"; g.beginPath(); g.arc(hx, hy, 2.5, 0, 7); g.fill();
+  };
+  if (f.opp) car(f.opp, f.copy ? css("--copy") : css("--opp"));
+  car(f.car, css("--run"));
+  if (f.hit.some((x) => x > 0)) {
+    const [x, y] = P(f.car[0], f.car[1]); g.strokeStyle = css("--hit"); g.lineWidth = 4; g.beginPath(); g.arc(x, y, 0.6 * s, 0, 7); g.stroke();
+  }
+}
+
+function chart(id, series, opts = {}) {
+  const c = $(id), g = c.getContext("2d"), W = c.width, Hh = c.height;
+  g.clearRect(0, 0, W, Hh);
+  const all = series.flatMap((s) => s.data).filter((v) => Number.isFinite(v));
+  if (!all.length) return;
+  let lo = opts.lo ?? Math.min(...all), hi = opts.hi ?? Math.max(...all);
+  if (hi - lo < 1e-6) { hi += 0.5; lo -= 0.5; }
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const Y = (v) => Hh - 4 - (v - lo) / (hi - lo) * (Hh - 8);
+  g.strokeStyle = css("--line"); g.lineWidth = 1;
+  if (lo < 0 && hi > 0) { g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.stroke(); }
+  g.fillStyle = css("--muted"); g.font = "11px system-ui"; g.fillText(hi.toFixed(2), 4, 12); g.fillText(lo.toFixed(2), 4, Hh - 6);
+  for (const s of series) {
+    const n = s.data.length; if (!n) continue;
+    const X = (i) => W - (n - 1 - i) * (W / (HMAX - 1));
+    if (s.bars) {
+      g.fillStyle = s.col;
+      s.data.forEach((v, i) => { if (!v) return; const y0 = Y(0), y1 = Y(v); g.fillRect(X(i) - 1, Math.min(y0, y1), 2, Math.abs(y1 - y0)); });
+      continue;
+    }
+    g.strokeStyle = s.col; g.lineWidth = s.w || 2; g.beginPath();
+    s.data.forEach((v, i) => { const x = X(i), y = Y(v); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
+  }
+}
+
+function bars(id, vals) {
+  const c = $(id), g = c.getContext("2d"), W = c.width, Hh = c.height;
+  g.clearRect(0, 0, W, Hh);
+  const hi = Math.max(9, ...vals), bw = W / vals.length;
+  vals.forEach((v, i) => {
+    const h = (Math.max(0, v) / hi) * (Hh - 18);
+    g.fillStyle = css("--plan"); g.fillRect(i * bw + 4, Hh - 14 - h, bw - 8, h);
+    g.fillStyle = css("--muted"); g.font = "11px system-ui"; g.fillText(v.toFixed(1), i * bw + 6, Hh - 2);
+  });
+}
+
+function drawMem() {
+  const c = $("c_mem"), g = c.getContext("2d"), cols = c.width, rows = c.height;
+  const img = g.createImageData(cols, rows), M = H.mem, n = M.length;
+  for (let j = 0; j < cols; j++) {
+    const m = M[n - cols + j];
+    for (let i = 0; i < rows; i++) {
+      const v = m ? Math.max(-1, Math.min(1, m[i] || 0)) : 0, k = 4 * (i * cols + j);
+      if (!m) { img.data[k + 3] = 255; continue; }
+      const a = Math.abs(v);
+      img.data[k] = v > 0 ? 40 + 215 * a : 40; img.data[k + 1] = 40 + 30 * (1 - a); img.data[k + 2] = v < 0 ? 40 + 215 * a : 40; img.data[k + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  if (n >= 2) {
+    const a = M[n - 1], b = M[n - 2];
+    let d = 0, held = 0;
+    for (let i = 0; i < a.length; i++) { const e = Math.abs(a[i] - b[i]); d += e; if (e < 0.01) held++; }
+    $("memstat").textContent = `지난 결정 대비 평균 변화 ${(d / a.length).toFixed(3)} · 거의 그대로(0.01 미만)인 값 ${held}/${a.length}개`;
+  }
+}
+
+async function tick() {
+  if (!RUN) return;
+  let d;
+  try {
+    const r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}`, { cache: "no-store" });
+    if (!r.ok) { $("hint").textContent = (await r.json()).error || "기록 없음"; return; }
+    const age = parseFloat(r.headers.get("X-Age") || "0");
+    $("age").textContent = age < 2 ? "실시간" : `${age.toFixed(0)} s 전 기록`;
+    $("age").classList.toggle("hot", age >= 2);
+    d = await r.json();
+  } catch (e) { return; }
+  const f = d.now, key = f.upd * 100000 + f.k;
+  if (last === key) return;
+  const prev = H.key.length ? H.key[H.key.length - 1] : null;
+  last = key;
+  const T = await track(f.tid);
+  // history
+  H.v.push(f.car[3]); H.vh.push(f.vhat); H.val.push(f.value); H.lap.push(f.lap + f.shaping); H.con.push(f.contact); H.mem.push(f.mem); H.key.push(key);
+  for (const k in H) if (H[k].length > HMAX) H[k].shift();
+  // header
+  $("upd").textContent = `update ${f.upd} · 결정 ${f.k}`;
+  $("scene").textContent = f.replay ? "장면 재생 중 (예전에 박은 장면)" : "일반 경주";
+  $("scene").classList.toggle("hot", f.replay);
+  $("copy").textContent = f.opp ? (f.copy ? "상대 = 우리 policy 복제본" : "상대 = 기존 상대 차") : "상대 차 없음";
+  $("copy").classList.toggle("copy", !!(f.opp && f.copy));
+  // numbers
+  $("n_v").textContent = f.car[3].toFixed(2); $("n_vh").textContent = f.vhat.toFixed(2); $("n_val").textContent = f.value.toFixed(3);
+  $("n_noise").textContent = f.noise.toFixed(2); $("n_std").textContent = f.std.toFixed(3); $("n_rew").textContent = f.reward.toFixed(4);
+  // events
+  const kinds = ["벽", "상자", "차"];
+  f.hit.forEach((h, i) => { if (h > 0) log(`세게 닿음: ${kinds[i]} (${f.car[3].toFixed(1)} m/s)`, "h"); });
+  if (prev !== null && f.k < (prev % 100000) && false) log("update 끝");
+  drawMap(f, d.trail, T);
+  chart("c_speed", [{ data: H.v, col: css("--run") }, { data: H.vh, col: css("--mean"), w: 1.5 }], { lo: 0 });
+  chart("c_val", [{ data: H.lap, col: css("--mean"), bars: true }, { data: H.con, col: css("--hit"), bars: true }, { data: H.val, col: "#b197fc" }]);
+  bars("c_pv", f.plan_v);
+  drawMem();
+}
+
+let lastEp = null;
+(async () => {
+  await runs();
+  setInterval(() => tick().catch(() => {}), 100);
+  setInterval(() => runs().catch(() => {}), 15000);
+})();
+</script>
+</body>
+</html>

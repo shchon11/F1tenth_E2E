@@ -625,6 +625,9 @@ def main(argv=None):
     ap.add_argument("--scene-lag", type=int, default=20,
                     help="a scene is the state this many decisions before the contact, drawn per scene from 0.5x to 1.5x of it")
     ap.add_argument("--scene-size", type=int, default=1024, help="scenes kept (the oldest make room)")
+    ap.add_argument("--live-tap", type=int, default=-1, metavar="ROW",
+                    help="write learner ROW's car every decision to <run>/live_tap.json for the live view (11-17, the user: "
+                         "\"콘솔에서 막 학습중인거 실시간으로 뭐 차 하나만 볼 수 없나\"); -1 = off")
     ap.add_argument("--scene-keep-unsolved", action="store_true",
                     help="a slot is given up by the scene driven clean the most times in a row, not by the oldest: a scene the "
                          "policy keeps failing stays until it is driven clean (11-17: the FIFO store dropped every scene after "
@@ -945,6 +948,11 @@ def main(argv=None):
     if args.horizon_auto > 1 and not args.accum_actor_auto:
         raise SystemExit("--horizon-auto needs --accum-actor-auto (it reads the noise scale that measures)")
     log = open(os.path.join(run, "progress.jsonl"), "a")
+    tap = None
+    if args.live_tap >= 0:
+        from .live_tap import LiveTap
+        tap = LiveTap(env, run, row=args.live_tap)
+    tap_pm = torch.zeros(10, 2, device=dev)
     t0 = time.time()
     trk = None
     ns_ema, b_noise = None, float("nan")       # --accum-actor-auto: smoothed |G|^2 and tr(Sigma) of the policy gradient
@@ -1115,6 +1123,12 @@ def main(argv=None):
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
+                    if tap is not None:                            # the plan the mean action makes, for the live view
+                        _q = tap.row
+                        _pm = PS.roll(torch.tanh(mean[_q:_q + 1]), v_hat[_q:_q + 1].clamp(-PS.V_REV, PS.V_FWD),
+                                      obs.cmd_d[_q:_q + 1], lim)
+                        _xm, _ym, _ = plan_world(_pm, env.sim.state[lid[_q:_q + 1]])
+                        tap_pm = torch.stack([_xm[0, PT_IDX.to(dev)], _ym[0, PT_IDX.to(dev)]], -1)
                     vest_err.append((v_hat - v_true).abs())
                     if tailc:
                         V0.append(v_hat.clamp(-PS.V_REV, PS.V_FWD).clone()); D0.append(obs.cmd_d.clone())
@@ -1134,6 +1148,15 @@ def main(argv=None):
                 if levels is not None:
                     hard0 = env.sim.contact_counts[lid, 3:6].clone()
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if tap is not None:
+                    _ii, _q = PT_IDX.to(dev), tap.row
+                    _ls = log_std.expand_as(mean)
+                    tap.record(upd, t, torch.stack([xw_[_q, _ii], yw_[_q, _ii]], -1), tap_pm, p["pv"][_q], v[_q],
+                               out["reward"][_q], out["lap"][_q], out["contact"][_q], out["shaping"][_q], v_hat[_q],
+                               ((u - mean)[_q] / _ls[_q].exp()).pow(2).mean().sqrt(), _ls[_q].exp().mean(),
+                               mem=getattr(obs, "mem_h", None)[_q] if getattr(obs, "mem_h", None) is not None else None,
+                               replay=bool(scene.in_replay[_q]) if scene is not None else False,
+                               copy_opp=bool(drv.opp.on[opp_index[others[_q, 0]]]) if drv.opp is not None else False)
                 if args.dump_rollout:
                     DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
                     for k in ("contact", "lap", "shaping"):
