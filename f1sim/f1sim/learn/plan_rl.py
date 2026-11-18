@@ -389,6 +389,20 @@ class Driver:
         return out, p, (x, y, psi)
 
 
+def horizon_k(k: int, k_low: int, b_noise: float, per_k: float, kmax: int, kmin: int, mult: float, down: bool,
+              patience: int):
+    """--horizon-auto: (K, updates running that asked for less) for the next rollout of K x --horizon decisions per car.
+    The smallest K in [kmin, kmax] whose rollout over all cars (`per_k` decisions a unit) covers `mult` x the noise scale; a
+    larger K is taken at once, a smaller one (with `down`) only one step after `patience` updates in a row asked for it"""
+    need = min(kmax, max(kmin, math.ceil(mult * b_noise / per_k)))
+    if need > k:
+        return need, 0
+    if down and need < k:
+        k_low += 1
+        return (k - 1, 0) if k_low >= patience else (k, k_low)
+    return k, 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
@@ -424,6 +438,16 @@ def main(argv=None):
                          "1 <= K <= KMAX, never going back down (as --accum-ratchet); the minibatches scale with K so one minibatch "
                          "keeps its size (11-16, the user: 'update당 결정 수를 유동적으로 늘릴 수 있게': kr26e stalled with a noise scale "
                          "of ~58k decisions against a 32.8k rollout, the actor capped at one step per rollout). Needs --accum-actor-auto")
+    ap.add_argument("--horizon-auto-min", type=int, default=1,
+                    help="--horizon-auto: K never below this (11-18, the user: '잡음 크기에 따라서 update당 주행 rollout수를 유동적으로 "
+                         "하라는거지. 무작정 2배 하지 말고' -- a short --horizon unit with this floor moves the rollout in small steps: "
+                         "--horizon 64 --horizon-auto 4 --horizon-auto-min 2 = 12.8-25.6 s in 6.4 s steps)")
+    ap.add_argument("--horizon-auto-down", action="store_true",
+                    help="--horizon-auto: K also comes back down when the noise scale falls, one step at a time after it has asked for "
+                         "less over two noise measurements running (without it K only grows: the 11-16 rule)")
+    ap.add_argument("--mem-chunk-rollout", action="store_true",
+                    help="the memory's update replays each car's whole rollout as one sequence (--mem-chunk = the rollout, whatever "
+                         "--horizon-auto makes it): the memory learns over everything an update collected (11-18)")
     ap.add_argument("--noise-probe-every", type=int, default=1,
                     help="with --accum-actor-auto: measure the noise scale every N updates (it is smoothed over updates and moves "
                          "slowly; the measurement is one more forward/backward over the whole rollout, ~1/5 of an update)")
@@ -990,9 +1014,10 @@ def main(argv=None):
               open(os.path.join(run, "args.json"), "w"), indent=1, default=str)
     print(f"[plan_rl] {args.name}: 환경 {env.B} (학습 차 {Bl}), 결정 0.1 s, 롤아웃 {args.horizon}결정, LiDAR {obs.beams}빔 x {3}장, "
           f"critic 추가 입력 {priv_dim}", flush=True)
-    T = args.horizon
-    K_h = 1                                        # --horizon-auto: rollouts' worth of decisions per update (K x --horizon)
-    MB = args.minibatches                          # minibatches per epoch (scales with K_h: a minibatch keeps its size)
+    K_h = max(1, args.horizon_auto_min) if args.horizon_auto > 1 else 1   # --horizon-auto: K x --horizon decisions per update
+    k_low = 0                                      # --horizon-auto-down: updates running whose noise scale asked for a smaller K
+    T = args.horizon * K_h
+    MB = args.minibatches * K_h                    # minibatches per epoch (scales with K_h: a minibatch keeps its size)
     if args.horizon_auto > 1 and not args.accum_actor_auto:
         raise SystemExit("--horizon-auto needs --accum-actor-auto (it reads the noise scale that measures)")
     log = open(os.path.join(run, "progress.jsonl"), "a")
@@ -1032,7 +1057,8 @@ def main(argv=None):
             # cars the two disagreed on K the first time it moved (qual26e u52: rank 1 went to 256, rank 0 stayed at 128 ->
             # gloo "Received data size doesn't match expected size")
             per_k = args.horizon * Bl_all
-            K_h = max(K_h, min(args.horizon_auto, max(1, math.ceil(args.horizon_auto_mult * b_noise / per_k))))
+            K_h, k_low = horizon_k(K_h, k_low, b_noise, per_k, args.horizon_auto, args.horizon_auto_min, args.horizon_auto_mult,
+                                   args.horizon_auto_down, 2 * max(1, args.noise_probe_every))
             T = args.horizon * K_h
             MB = args.minibatches * K_h
         frac = (upd - 1) / max(1, args.updates - 1)
@@ -1367,7 +1393,7 @@ def main(argv=None):
         if args.memory:
             # whole sequences of `mem_chunk` decisions per car, replayed from the state each began with; a restart inside
             # one clears the state for the decisions after it
-            Lc = args.mem_chunk; nC = T // Lc
+            Lc = T if args.mem_chunk_rollout else args.mem_chunk; nC = T // Lc
             bHM, bD = torch.cat(HM), D_.reshape(-1)
             bAX = torch.cat(AX) if aux_on else None
             tt = torch.arange(nC * Lc, device=dev).view(nC, Lc)
