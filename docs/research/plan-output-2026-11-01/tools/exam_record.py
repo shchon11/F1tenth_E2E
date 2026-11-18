@@ -105,6 +105,15 @@ from f1sim import props as _props
 from world_of import world_path, exam_bank, map_name
 WORLD = world_path(ck)                                     # the world the checkpoint was trained in (11-14)
 BANK = exam_bank(WORLD)
+# (11-18, the user: "시험에서는 막 쭈르륵 장애물 깔지 말고, 빈 트랙에서 가는 길에 장애물을 그 근처에서 뽑히게", "맵당 한 대략 3개 씩?",
+# "좀 더 균일하고 라인쪽에 밀집되게", then "ㄱㅊ네" to the preview) count "line3" = exam2: the exam2 bank (exam_line_bank.py: 3 boxes a
+# layout on the line three good checkpoints drive on the empty track, the layouts together covering the lap evenly), and every box
+# race its own layout, in order -- drawn at random, 56 races from 56 layouts would repeat some and miss others
+LINE3 = count == "line3"
+if LINE3:
+    EXAM = "exam2"
+    BANK = BANK.replace("prop_banks_exam1", "prop_banks_exam2")
+    assert os.path.isdir(BANK), BANK
 a = argparse.Namespace(**json.load(open(WORLD)))
 if getattr(a, "stage", "race") != "race":
     # (11-17) a single-seat world (the qualifier, stage "props"): this record reads every car's opponent seat, so the exam runs
@@ -113,7 +122,7 @@ if getattr(a, "stage", "race") != "race":
 a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
-a.prop_bank, a.prop_count = BANK, count
+a.prop_bank, a.prop_count = BANK, ("fixed" if LINE3 else count)
 if OPP_SLOT:
     a.opp_slot = OPP_SLOT                                   # merged over the training world's slot (`state_rl.build_env`)
 if mode == "map":
@@ -193,6 +202,25 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
 
 obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
 po = env.procedural
+if LINE3:
+    # the races the reset gave boxes are exam1's (the draw takes the same random numbers whatever the bank holds); each gets bank
+    # layout 0, 1, 2, ... in learner order, written into every car of its race
+    box_l = lid[(po.p_sid[lid] >= 0).any(1)]
+    n_lay = int(po.b_n[0])
+    if box_l.numel() > n_lay:
+        print(f"[exam2] 상자 경주 {box_l.numel()}개 > 은행 배치 {n_lay}개: 배치를 되풀이해 씀", flush=True)
+    k_l = torch.arange(box_l.numel(), device=dev) % n_lay
+    t_l = env.sim.tid[box_l]
+    sid_l, pose_l = po.b_sid[t_l, k_l], po.b_pose[t_l, k_l]
+    mates = env.sim.other_idx[box_l]
+    rows_ = torch.cat([box_l[:, None], mates], 1)
+    src_ = torch.arange(box_l.numel(), device=dev)[:, None].expand_as(rows_)
+    ok_ = rows_ >= 0
+    dst_, src_ = rows_[ok_], src_[ok_]
+    po.last_live.index_copy_(0, dst_, torch.zeros(box_l.numel(), po.P, dtype=torch.bool, device=dev)[src_])
+    po._write(dst_, src_, pose_l[..., :2], pose_l[..., 2], sid_l.clamp_min(0), sid_l >= 0, P=po.C, Q=1)
+    _nk = (po.p_sid[box_l] >= 0).sum(1)
+    print(f"[exam2] 상자 경주 {box_l.numel()}개에 은행 배치 0..{box_l.numel() - 1}을 차례로: 경주마다 상자 {int(_nk.min())}-{int(_nk.max())}개", flush=True)
 remover = SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if po is not None else None
 restarter = SR.OppRestart(env, OPP_RESTART_S, PS.DT) if env.M > 1 else None
 others = env.sim.other_idx[lid][:, 0]

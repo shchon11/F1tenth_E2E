@@ -27,11 +27,15 @@ COLS = {0: ("#e03131", "벽"), 1: ("#e8890c", "상자"), 2: ("#1971c2", "차")}
 LINE = ["#868e96", "#2a7de1", "#e8590c", "#2f9e44", "#ae3ec9", "#f59f00"]
 
 
+# (11-18) EXAM_SERIES=exam2: the exam with 3 boxes a race on the empty-track line (exam_record.py count "line3")
+EXN, CNT = ("exam2", "line3") if os.environ.get("EXAM_SERIES") == "exam2" else ("exam1", "uniform")
+
+
 def exams(run):
     """{update: npz path} of a run's frozen exams"""
     out = {}
-    for p in glob.glob(os.path.join(EX, f"exam1_{run}_u*_ideal_uniform_n256.npz")):
-        m = re.search(rf"exam1_{run}_u(\d+)_ideal", p)
+    for p in glob.glob(os.path.join(EX, f"{EXN}_{run}_u*_ideal_{CNT}_n256.npz")):
+        m = re.search(rf"{EXN}_{run}_u(\d+)_ideal", p)
         if m:
             out[int(m.group(1))] = p
     return out
@@ -137,7 +141,7 @@ if len(runs) == 1:
             prev = r_
     ax.set_title(f"{runs[0]} 줄기: checkpoint별 (같은 128세션)", fontsize=11)
     ax2.set_xlabel("checkpoint (update)")
-    fig.suptitle(f"{runs[0]} frozen exam: checkpoint별 충돌 지도 (최근 {len(latest)}개)", fontsize=13)
+    fig.suptitle(f"{runs[0]} frozen exam{' 2 (경주마다 상자 3개, 빈 트랙 길 위)' if EXN == 'exam2' else ''}: checkpoint별 충돌 지도 (최근 {len(latest)}개)", fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=105)
     print(out)
