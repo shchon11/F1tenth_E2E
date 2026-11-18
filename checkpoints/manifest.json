@@ -174,5 +174,15 @@
   ],
   "source_mb": 9.3,
   "note": "korea26_v2_ppo_s2421_u512_nearcar with only actor.near_car.* retrained again, now with near-stopped cars (head_train.py from the nearcar head: entry race cells seeds 85-86 + a raceline car at x0.05 and x0.2 seeds 85-88, validation seed 81 mixed, weights 10/5/5, pre-contact x6, early-stopped); drives identically. For the speed limit for a car ahead with its latched lane check (10-25)"
+ },
+ {
+  "file": "korea26_qual26q_u300.pt",
+  "run": "qual26q",
+  "update": 300,
+  "sha256": "007a043c73af332f3df6a40a248a1f97a5b815acfe9e84c397a62322f555c0ba",
+  "size_mb": 5.1,
+  "dropped": [],
+  "source_mb": 5.1,
+  "note": "Korea 2026 qualifier candidate (solo, boxes): frozen exam2 (3 boxes a box race on the empty-track line, removed at 50 s, 128 sessions, ideal execution) empty track 491 m / 90 s, lap 7.7 s (fastest so far), 3 hard contacts (1 wall, 2 box), 0 of the 138 boxes within 0.4 m of its own line hit hard. Neighbouring checkpoints u250 / u275 had 52 / 54: checkpoints swing a lot. File as saved (no optimizer state)."
  }
 ]

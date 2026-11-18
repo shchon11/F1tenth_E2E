@@ -436,3 +436,14 @@ still says how they were trained), plus an `archive_note`. Weights and meta unch
 drives them with `MAPPlanTracker` (ICCAS solo 5.75 m/s, ICRA 4.26 m/s over 30 s, 0 contact steps), and the controller node
 starts with `plan follower map` and each map's numbers. They were trained on drawn dials and record none, so on the car the
 dial is graph.yaml's (or `dial:=`).
+
+## Korea 2026 qualifier candidate: `korea26_qual26q_u300` (2026-11-19)
+
+Solo run `qual26q` (from scratch, two GPUs): boxes in half the episodes, 3 random pieces of a judged layout a map, in a third
+of the draws the pieces on the policy's own line kept first, never removed (`plan_world_korea26_qual_own3.json`
++ `--online-boxes 0.33`, no `--line3-boxes`); adaptive rollout 12.8-25.6 s, memory over the whole rollout, scene replay.
+Frozen exam2 (3 boxes a box race on the good checkpoints' empty-track line, removed at 50 s; 128 sessions, ideal
+execution): empty track 491 m / 90 s, lap 7.7 s (qual26b u375: 481 m, 7.9 s), 3 hard contacts (qual26b u375: 21), none of
+the 138 boxes within 0.4 m of its own line hit hard (qual26b u375: 9 of 179). Caveat: one checkpoint -- u250 and u275 of
+the same run had 52 and 54 hard contacts (mostly the same box hit again on the next pass); drive it in the console
+(`pick_qual26q_u300`) before trusting it.
