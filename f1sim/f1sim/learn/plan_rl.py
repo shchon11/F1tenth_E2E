@@ -492,6 +492,11 @@ def main(argv=None):
                          "(the line: where the learner cars drive with no box on the track, per 0.25 m of lap, fading 0.8 an update); "
                          "the layout, its count and the empty-track share as always (11-18, the user: '나머지 절반의 상자 에피소드에는 "
                          "내 길 위 만드는거 굿. 너무 자주하진 말자'); 0 = off")
+    ap.add_argument("--line3-boxes", action="store_true",
+                    help="every box draw = three pieces of the whole bank on the policy's own empty-track line (the --online-boxes "
+                         "measure), one from each third of the lap, within 0.4 m, weighted to the line (procedural `line3`; 11-18, the "
+                         "user: '이런 특정 라인에 장애물이 몰려있으니 그 라인을 피해버리네' -- boxes on a fixed line made qual26o leave it); "
+                         "a track whose line is not measured yet draws as the world says (use count max3)")
     ap.add_argument("--stuck-noise", type=float, default=0.0,
                     help="RHO: while the car is stuck -- less than 1 m along the track over the last 2 s, whatever its speed -- the "
                          "first step's SPEED noise is held with RHO (11-18: --noise-corr-stall's |v| < 0.3 m/s missed cars rocking "
@@ -878,11 +883,12 @@ def main(argv=None):
             raise SystemExit("--stuck-noise or --noise-corr-stall, not both")
         stall_on, st_rho = True, float(args.stuck_noise)
     # (11-18) --online-boxes: the policy's own line per track, sums of where the box-free learner cars are per lap bin
-    online_on = args.online_boxes > 0
+    online_on = args.online_boxes > 0 or args.line3_boxes
     online_share = None
     if online_on:
         if env.procedural is None or env.procedural.place != "bank":
-            raise SystemExit("--online-boxes needs a box bank (the world's prop_bank)")
+            raise SystemExit("--online-boxes / --line3-boxes need a box bank (the world's prop_bank)")
+        env.procedural.line3 = bool(args.line3_boxes)
         ONL_BIN, ONL_FADE, ONL_MIN = 0.25, 0.8, 20.0
         T_tr = int(pr.goal.lap.numel())
         ONL_NB = int(math.ceil(float(pr.goal.lap.max()) / ONL_BIN)) + 1
@@ -1047,7 +1053,7 @@ def main(argv=None):
                 onl_w /= args.dist_world; onl_xy /= args.dist_world   # every process the same line (its mean, as the sums)
             onl_ok = (onl_w >= ONL_MIN).view(T_tr, ONL_NB)
             onl_line = (onl_xy / onl_w.clamp_min(1e-6)[:, None]).view(T_tr, ONL_NB, 2)
-            online_share = env.procedural.set_driven_line(onl_line, onl_ok)
+            online_share = env.procedural.set_driven_line(onl_line, onl_ok, bin_m=ONL_BIN)
             onl_w *= ONL_FADE; onl_xy *= ONL_FADE
         if args.horizon_auto > 1 and math.isfinite(b_noise):
             # the smallest K whose rollout (all processes) covers the noise scale; never down (the noise scale reads lower as
@@ -1761,6 +1767,7 @@ def main(argv=None):
                "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
                "noise_stall_share": nc_stall / max(T, 1) if stall_on else None,
                "online_piece_share": online_share,
+               "line3_ready": (int((env.procedural.l3_nw > 0).sum()) if (online_on and env.procedural.l3_nw is not None) else None),
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
                "laps_per_min": float(stats["lap"][ordm].sum()) / mins, "speed": float(speed_sum[ordm].mean()) / T,

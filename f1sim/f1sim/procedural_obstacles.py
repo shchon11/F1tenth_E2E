@@ -516,6 +516,16 @@ class ProceduralObstacles:
         #: hard box hits were boxes within 0.40 m of the line the policy drives on an empty track, 0 of 857 passes beyond it
         self.online_p = 0.0
         self.b_online = None
+        #: (11-18, the user: "이런 특정 라인에 장애물이 몰려있으니 그 라인을 피해버리네") `line3`: every bank draw is three pieces from the
+        #: whole bank on the policy's OWN driven line (`set_driven_line`), one from each third of the lap (a random start), each drawn
+        #: among the pieces within `near` of the line in its 0.5 m stretch, weighted exp(-d^2 / (2 line3_sig^2)). qual26o's boxes sat
+        #: on a fixed line (qual26b's): it left that line (40 % of its empty-track time > 0.4 m off it) instead of passing boxes.
+        #: A track whose line is not measured over 80 % of a lap yet draws as before (count/keep)
+        self.line3 = False
+        self.line3_sig = 0.15
+        self.l3_idx = None                                   # (T, W, M) candidate pieces (k * C + c) of each 0.5 m stretch, -1 none
+        self.l3_w = None                                     # (T, W, M) their weights, 0 = none
+        self.l3_nw = None                                    # (T,) stretches of a track's line, 0 = not ready
 
     def _load_bank(self, path: str):
         """`bank` (11-03 night, user: "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): layouts drawn by
@@ -561,7 +571,7 @@ class ProceduralObstacles:
         self.place = "bank"
         print(f"[procedural] bank {path}: {int(self.b_n.min())}-{int(self.b_n.max())} layouts per track, {T} tracks", flush=True)
 
-    def set_driven_line(self, line: torch.Tensor, ok: torch.Tensor, near: float = 0.40) -> float:
+    def set_driven_line(self, line: torch.Tensor, ok: torch.Tensor, near: float = 0.40, bin_m: float = 0.25) -> float:
         """(11-18) the policy's own line per track, `line` (T, n, 2) points along the lap and `ok` (T, n) the ones measured:
         every bank piece whose centre is within `near` of a measured point is marked on the line (`b_online`). Returns the
         share of the bank's pieces marked."""
@@ -577,8 +587,71 @@ class ProceduralObstacles:
             d = torch.cdist(xy, pts).amin(1)
             out[ti] = (d <= near).reshape(K, C) & (self.b_sid[ti] >= 0)
         self.b_online = out
+        if self.line3:
+            self._line3_tables(line, ok, near, bin_m)
         real = self.b_sid >= 0
         return float(out.sum()) / max(1, int(real.sum()))
+
+    def _line3_tables(self, line: torch.Tensor, ok: torch.Tensor, near: float, bin_m: float, M: int = 64) -> None:
+        """`line3`'s candidates: for each track and 0.5 m stretch of its measured line, up to M bank pieces (a random subset when
+        there are more) whose centre is within `near` of a measured point, with their weights"""
+        T, K, C = self.b_sid.shape
+        dev = self.device
+        W = (line.shape[1] + 1) // 2
+        idx = torch.full((T, W, M), -1, dtype=torch.long, device=dev)
+        wts = torch.zeros(T, W, M, device=dev)
+        nw = torch.zeros(T, dtype=torch.long, device=dev)
+        for ti in range(T):
+            okp = ok[ti].to(dev)
+            n_lap = int(math.ceil(float(self.tr.length[ti]) / bin_m))
+            if int(okp.sum()) < 0.8 * n_lap:
+                continue
+            bins = torch.nonzero(okp)[:, 0]
+            pts = line[ti].float().to(dev)[bins]
+            xy = self.b_pose[ti, :, :, :2].reshape(-1, 2)
+            dmin, jj = torch.cdist(xy, pts).min(1)
+            cand = torch.nonzero(((self.b_sid[ti] >= 0).reshape(-1)) & (dmin <= near))[:, 0]
+            if cand.numel() == 0:
+                continue
+            cand = cand[torch.argsort(self._rand((cand.numel(),)))]          # a random order: who stays when a stretch overflows
+            st = bins[jj[cand]] // 2
+            order = torch.argsort(st, stable=True)
+            cand, st = cand[order], st[order]
+            pos = torch.arange(st.numel(), device=dev)
+            first = torch.ones_like(st, dtype=torch.bool)
+            first[1:] = st[1:] != st[:-1]
+            rank = pos - torch.cummax(torch.where(first, pos, torch.zeros_like(pos)), 0).values
+            keep = rank < M
+            idx[ti, st[keep], rank[keep]] = cand[keep]
+            wts[ti, st[keep], rank[keep]] = torch.exp(-dmin[cand[keep]] ** 2 / (2.0 * self.line3_sig ** 2))
+            nw[ti] = int(bins.max()) // 2 + 1
+        self.l3_idx, self.l3_w, self.l3_nw = idx, wts, nw
+
+    def _line3_draw(self, t: torch.Tensor):
+        """(rows of the draw whose track is ready, their (R, C) sid and (R, C, 3) pose): three pieces, one in each third"""
+        dev, C = self.device, self.C
+        ready = torch.nonzero(self.l3_nw[t] > 0)[:, 0]
+        R = int(ready.numel())
+        if R == 0:
+            return ready, None, None
+        tt = t[ready]
+        Wt = self.l3_nw[tt].float()
+        third = torch.arange(3, device=dev, dtype=torch.float32)[None, :]
+        pos = torch.remainder(self._rand((R, 1)) / 3.0 + (third + 0.2 + 0.6 * self._rand((R, 3))) / 3.0, 1.0)   # (R, 3) laps
+        w_i = torch.minimum((pos * Wt[:, None]).long(), (Wt - 1).long()[:, None])
+        cw = self.l3_w[tt[:, None], w_i]                                          # (R, 3, M)
+        ci = self.l3_idx[tt[:, None], w_i]
+        tot = cw.sum(-1, keepdim=True)
+        u = self._rand((R, 3, 1)) * tot
+        pick = (cw.cumsum(-1) < u).sum(-1).clamp_max(cw.shape[-1] - 1)
+        flat = torch.gather(ci, 2, pick[..., None])[..., 0]
+        got = (tot[..., 0] > 0) & (flat >= 0)
+        k_, c_ = flat.clamp_min(0) // C, flat.clamp_min(0) % C
+        sid = torch.full((R, C), -1, dtype=torch.long, device=dev)
+        pose = torch.zeros(R, C, 3, device=dev)
+        sid[:, :3] = torch.where(got, self.b_sid[tt[:, None], k_, c_], torch.full_like(k_, -1))
+        pose[:, :3] = self.b_pose[tt[:, None], k_, c_]
+        return ready, sid, pose
 
     def _redraw_bank(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor, opp: Optional[torch.Tensor] = None):
         """`bank`: one stored layout of the env's own track, 1 .. all of its pieces (count "uniform") or all ("fixed")."""
@@ -586,6 +659,15 @@ class ProceduralObstacles:
         k_idx = (self._rand((D,)) * self.b_n[t]).long().clamp_max(self.b_n[t] - 1)
         sid = self.b_sid[t, k_idx]                                               # (D, C)
         pose = self.b_pose[t, k_idx]
+        if self.line3 and self.l3_nw is not None:
+            # the draws on a track whose line is measured: three pieces of the whole bank on that line (`_line3_draw`), kept whole
+            # below (count fixed / keep 3); pieces of other layouts carry no corridor values, so no corridor rule may run with this
+            if self.has_raceline or (opp is not None and self.opp_corridor):
+                raise ValueError("line3 draws mix layouts: no raceline / opponent corridor with it")
+            rows3, sid3, pose3 = self._line3_draw(t)
+            if rows3.numel():
+                sid, pose = sid.clone(), pose.clone()
+                sid[rows3], pose[rows3] = sid3, pose3
         live = sid >= 0
         if opp is not None and self.opp_corridor:
             # (11-16) a race with an opponent: only the pieces clear of the opponents' racing-line corridor, before the count

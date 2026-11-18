@@ -20,6 +20,7 @@ def _po(online_p=0.0):
     po.count, po.keep, po.fraction = "uniform", 1, 1.0       # one piece kept per draw
     po.opp_corridor, po.opp_keep, po.has_raceline = False, 0, False
     po.online_p, po.b_online = online_p, None
+    po.line3, po.l3_nw = False, None
     po.last_live = torch.zeros(po.B, po.P, dtype=torch.bool)
     po.kept = []
     po._write = lambda dst, src, xy, yaw, sid, live, P, Q: po.kept.append((xy, live))
