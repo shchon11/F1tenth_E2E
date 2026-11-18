@@ -403,6 +403,20 @@ def horizon_k(k: int, k_low: int, b_noise: float, per_k: float, kmax: int, kmin:
     return k, 0
 
 
+def mem_prefix(gru, pF: torch.Tensor, pHM: torch.Tensor, pD: torch.Tensor, cars: torch.Tensor,
+               h_now: torch.Tensor) -> torch.Tensor:
+    """--mem-prev: the state each car began this rollout with, replayed through the previous rollout's last K decisions --
+    `pF` (K, B, F) their features, `pHM` (K, B, memory) the state each was driven from, `pD` (K, B) a restart after it --
+    so the loss on this rollout reaches what the memory stored then. A restart inside sets the state to the one the next
+    decision was driven from; one after the last decision leaves `h_now` (zero, or a scene's memory)"""
+    h = pHM[0][cars]
+    for i in range(pF.shape[0]):
+        if i > 0:
+            h = torch.where(pD[i - 1][cars][:, None] > 0, pHM[i][cars], h)
+        h = gru(pF[i][cars].to(h.dtype), h)
+    return torch.where(pD[-1][cars][:, None] > 0, h_now, h)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
@@ -448,6 +462,12 @@ def main(argv=None):
     ap.add_argument("--mem-chunk-rollout", action="store_true",
                     help="the memory's update replays each car's whole rollout as one sequence (--mem-chunk = the rollout, whatever "
                          "--horizon-auto makes it): the memory learns over everything an update collected (11-18)")
+    ap.add_argument("--mem-prev", type=int, default=0,
+                    help="(11-19) with --mem-chunk-rollout: the memory's update first replays the previous rollout's last N decisions "
+                         "(their features stored after the previous update, no gradient into the encoder), so the loss on this "
+                         "rollout reaches what the memory stored then. Why: qual26q hit the same box again on the next pass in about "
+                         "half of its exam hits; at 12.8 s rollouts and 7.8 s laps a hit and the next approach to it share one "
+                         "learning window ~40 %% of the time. 80 = 8 s covers a lap. 0 = off")
     ap.add_argument("--noise-probe-every", type=int, default=1,
                     help="with --accum-actor-auto: measure the noise scale every N updates (it is smoothed over updates and moves "
                          "slowly; the measurement is one more forward/backward over the whole rollout, ~1/5 of an update)")
@@ -916,6 +936,10 @@ def main(argv=None):
         raise SystemExit("--mem-value / --mem-keep-s need --memory")
     if args.mem_keep_s > 0 and args.init:
         raise SystemExit("--mem-keep-s is a starting value: it has no meaning with --init (the checkpoint's GRU is loaded)")
+    if args.mem_prev > 0 and not (args.memory and args.mem_chunk_rollout):
+        raise SystemExit("--mem-prev needs --memory and --mem-chunk-rollout (it extends the one sequence per car)")
+    prev_mem = None                                                 # --mem-prev: (features, start states, restarts) of the
+                                                                    # previous rollout's last decisions
     AUXK = PRIV_V2_PROP_SLOTS
     AUXB = AUXK * len(PRIV_V2_PROP_KEYS)                            # the boxes' part of the read-out; the car's 5 follow
     aux_opp = aux_on and args.aux_opp > 0
@@ -1425,7 +1449,7 @@ def main(argv=None):
                 return heads_on(actor.features(bX[sel], bS[sel]), sel)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
-            h = bHM[sel[0]]
+            h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.gru, *prev_mem, sel[0] % Bl, bHM[sel[0]])
             hs_ = []
             for i in range(sel.shape[0]):
                 if i > 0:
@@ -1439,7 +1463,7 @@ def main(argv=None):
             fc = (actor.trunk(torch.cat([fflat_, hcat_], 1)) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
             if aux_on or memv_on:
                 # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
-                hs = actor.memory_alone(f, bHM[sel[0]], bD[sel], bHM[sel])
+                hs = actor.memory_alone(f, h0, bD[sel], bHM[sel])
                 if aux_on:
                     aux_box["pred"] = actor.aux(hs)
                 if memv_on:
@@ -1729,6 +1753,14 @@ def main(argv=None):
                     cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
+        if args.mem_prev > 0:
+            # --mem-prev: this rollout's last decisions for the next update's replay -- features with the weights just learnt
+            # (fp16, no gradient), the state each decision began with, the restarts
+            K_ = min(args.mem_prev, T)
+            idx_ = torch.arange((T - K_) * Bl, T * Bl, device=dev)
+            with torch.no_grad():
+                pF_ = torch.cat([actor.features(bX[c_], bS[c_]).half() for c_ in idx_.split(8192)]).view(K_, Bl, -1)
+            prev_mem = (pF_, bHM[idx_].view(K_, Bl, -1).clone(), D_[T - K_:].clone())
         if args.tail_trunk and args.tail_trunk_ratio > 0 and tr_ratio:
             # measured with the present share: move the share toward the target ratio (damped; the next update uses it)
             r_ = sum(tr_ratio) / len(tr_ratio)
