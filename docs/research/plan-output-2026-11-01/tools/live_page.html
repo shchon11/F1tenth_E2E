@@ -481,8 +481,13 @@ function strips() {
 }
 window.addEventListener("resize", () => { try { strips(); } catch (e) {} });
 
+// (11-18) the map at most ~15 times a second: redrawn on every animation frame, this page's Chrome GPU process took 72 % of
+// the 5060 -- the display GPU, which also trains (its rollout ran at half speed while the page was on screen)
+let lastDraw = 0;
 async function frame() {
-  if (F1) {
+  const now = performance.now();
+  if (F1 && now - lastDraw >= 66) {
+    lastDraw = now;
     const u = F0 ? Math.min(1, (performance.now() - t1) / (dtF * 1000)) : 1;
     const carP = F0 && !F1.new_ep ? pose(F0.car, F1.car, u) : F1.car;
     const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;

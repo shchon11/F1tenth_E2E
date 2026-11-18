@@ -39,12 +39,14 @@ source /home/shchon11/F1tenth_E2E/.venv/bin/activate
 export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555
 F=/home/shchon11/F1tenth_E2E/f1sim
+# (11-18) LAUNCH_ENVS0 / LAUNCH_ENVS1 = 4070 / 5060 차 수 (기본 608 / 416): rollout 256에 장면 재생까지 올리면 5060(화면 출력도 맡음)이
+# 메모리 한계(7.6/8.2 GB)에 붙어 주행이 4070의 두 배 걸렸음(qual26l) -> 672 / 352
 # LAUNCH_GPU=both (기본: 4070 608대 + 5060 416대) | 0 (4070 혼자) | 1 (5060 혼자); 혼자일 때 차 수 LAUNCH_ENVS (기본 512)
 # -- 두 run을 나란히 비교할 때(11-15 Korea 2026 이어 받기 vs 처음부터) 한 GPU씩, 같은 차 수로
 G=${LAUNCH_GPU:-both}
 if [ "$G" = both ]; then
-  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=1 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 416 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 1 > $D/${N}_rank1.log 2>&1" > /dev/null 2>&1 &
-  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=0 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs 608 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 0 > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
+  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=1 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs ${LAUNCH_ENVS1:-416} --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 1 > $D/${N}_rank1.log 2>&1" > /dev/null 2>&1 &
+  setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=0 python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs ${LAUNCH_ENVS0:-608} --dist-world 2 --dist-init tcp://127.0.0.1:$PORT --dist-rank 0 > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
 else
   setsid nohup bash -c "cd $F && CUDA_VISIBLE_DEVICES=$G python3 -u -m f1sim.learn.plan_rl --name $N $ARGS --envs ${LAUNCH_ENVS:-512} > $D/$N.log 2>&1; echo done > $D/one_$N.done" > /dev/null 2>&1 &
 fi
