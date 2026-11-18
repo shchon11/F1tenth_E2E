@@ -184,5 +184,15 @@
   "dropped": [],
   "source_mb": 5.1,
   "note": "Korea 2026 qualifier candidate (solo, boxes): frozen exam2 (3 boxes a box race on the empty-track line, removed at 50 s, 128 sessions, ideal execution) empty track 491 m / 90 s, lap 7.7 s (fastest so far), 3 hard contacts (1 wall, 2 box), 0 of the 138 boxes within 0.4 m of its own line hit hard. Neighbouring checkpoints u250 / u275 had 52 / 54: checkpoints swing a lot. File as saved (no optimizer state)."
+ },
+ {
+  "file": "korea26_avg26q_u450.pt",
+  "run": "qual26q (average)",
+  "update": 450,
+  "sha256": "7435b0cc282f27fe3f457089d6baafaf50a966da3607154569cbdf1569537556",
+  "size_mb": 5.1,
+  "dropped": [],
+  "source_mb": 5.1,
+  "note": "Korea 2026 qualifier candidate: weight average of qual26q u375, u400, u425, u450 (every float tensor of actor and critic, norm.count included). Frozen exam2 (128 sessions, ideal execution): empty track 503 m / 90 s, lap 7.5 s, 11 hard contacts (2 wall, 9 box), 4 of the 138 boxes within 0.4 m of its own line hit hard (2.9 %), re-hit on the next pass 2/8. The four checkpoints it averages had 14 / 14 / 14 / 11; the next one, u475, collapsed (473)."
  }
 ]

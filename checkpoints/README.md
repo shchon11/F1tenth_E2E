@@ -447,3 +447,8 @@ execution): empty track 491 m / 90 s, lap 7.7 s (qual26b u375: 481 m, 7.9 s), 3 
 the 138 boxes within 0.4 m of its own line hit hard (qual26b u375: 9 of 179). Caveat: one checkpoint -- u250 and u275 of
 the same run had 52 and 54 hard contacts (mostly the same box hit again on the next pass); drive it in the console
 (`pick_qual26q_u300`) before trusting it.
+
+`korea26_avg26q_u450` (2026-11-19 05:47): the weight average of qual26q u375 / u400 / u425 / u450 (the run's stable stretch,
+11-14 hard contacts each). exam2: 503 m / 90 s, lap 7.5 s, 11 hard contacts, 2.9 % of the boxes on its own line hit hard,
+re-hit 2/8 -- as good as the best of the four, and less exposed to the checkpoint swing (u475, the next checkpoint,
+collapsed to 473 hard contacts at the bottom hairpin). Console pick `pick_avg26q_u450`.
