@@ -7,7 +7,9 @@
  B. 짝 맞춘 비교: 둘째 바퀴 이후, 보이기 0.5-1.5 s 전(양성) 대 다른 세션의 같은 자리(±0.3 m)·'방금 지난 상자로부터 걸린 시간' ±0.5 s·
     앞 10 m 안 상자 없음(음성) -- 상자 간격 규칙(바퀴 3분의 1마다 하나) 같은 단서를 지움. 기억 없는 신경망은 여기서 0.5 근처여야 함.
 모델: GRU 128(정책과 같은 크기·같은 오래 들고 있기 시작값) + 선형, 세션 통째 BPTT / 기억 없는 MLP.
-인자: 기록npz:행npy [기록npz:행npy ...]"""
+인자: 기록npz:행npy [기록npz:행npy ...]
+(11-19) STEPS=100,300,... 이면 그 걸음 수마다 채점(학습 걸음 수에 따른 곡선), LR=학습률(기본 1e-3), 변형 gru128p = policy checkpoint
+(POLICY_CK)의 GRU 가중치에서 시작하고 policy와 같은 날 특징(표준화 안 함)을 읽음 -- 강화학습 중 기억 보조 문제가 받는 조건에 가깝게."""
 import sys, math, time
 import numpy as np
 import torch
@@ -81,7 +83,12 @@ test = (lay % 4) == 0
 print(f"배치 {len(lay_ids)}가지, 시험 배치 {int(len({l for l in lay[test]}))}가지(학습 세션과 겹치지 않음)", flush=True)
 print(f"상자 세션 {N} (학습 {int((~test).sum())}, 시험 {int(test.sum())}) | 정답 1인 결정 {Y[W > 0].mean() * 100:.1f} %", flush=True)
 mu = feat[~test].reshape(-1, F).mean(0); sd = feat[~test].reshape(-1, F).std(0) + 1e-4
-X = torch.tensor((feat - mu) / sd, device=dev); Yt = torch.tensor(Y, device=dev); Wt = torch.tensor(W, device=dev)
+import os
+_want_raw = any(k.endswith("p") for k in os.environ.get("MEMV", "mlp,gru128").split(","))
+_want_std = any(not k.endswith("p") for k in os.environ.get("MEMV", "mlp,gru128").split(","))
+X = torch.tensor((feat - mu) / sd, device=dev) if _want_std else None
+Xraw = torch.tensor(feat, device=dev) if _want_raw else None
+Yt = torch.tensor(Y, device=dev); Wt = torch.tensor(W, device=dev)
 pw = float((1 - Y[~test][W[~test] > 0]).sum() / max(Y[~test][W[~test] > 0].sum(), 1))
 
 
@@ -99,6 +106,16 @@ class Mem(nn.Module):
 
     def forward(self, x):
         return self.out(self.rnn(self.drop(x))[0])[..., 0]
+
+
+class MemP(Mem):
+    """the policy's own GRU (checkpoint POLICY_CK) and a fresh read-out"""
+    def __init__(self):
+        super().__init__(128)
+        sd_ = torch.load(os.environ["POLICY_CK"], map_location="cpu", weights_only=False)["actor"]
+        with torch.no_grad():
+            for a in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+                getattr(self.rnn, a + "_l0").copy_(sd_["gru." + a])
 
 
 class NoMem(nn.Module):
@@ -139,18 +156,15 @@ import os
 VAR = {"mlp": ("기억 없는 MLP", lambda: NoMem(), 0.0), "gru128": ("GRU 128", lambda: Mem(128), 0.0),
        "gru128r": ("GRU 128 + 입력 dropout 0.3 + 가중치 감쇠", lambda: Mem(128, drop=0.3), 1e-4),
        "gru256": ("GRU 256", lambda: Mem(256), 0.0), "gru256r": ("GRU 256 + dropout + 감쇠", lambda: Mem(256, drop=0.3), 1e-4),
-       "lstm128": ("LSTM 128", lambda: Mem(128, kind="lstm"), 0.0)}
-for key in os.environ.get("MEMV", "mlp,gru128").split(","):
-    name, mk, wd = VAR[key]; net = mk()
-    net = net.to(dev); opt = torch.optim.Adam(net.parameters(), 1e-3, weight_decay=wd)
-    t0 = time.time(); best = None
-    for ep in range(200):
-        for idx in tr[torch.randperm(len(tr), device=dev)].split(32):
-            lg = net(X[idx])
-            l = (nn.functional.binary_cross_entropy_with_logits(lg, Yt[idx], pos_weight=torch.tensor(pw, device=dev), reduction="none") * Wt[idx]).sum() / Wt[idx].sum()
-            opt.zero_grad(); l.backward(); nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step()
+       "lstm128": ("LSTM 128", lambda: Mem(128, kind="lstm"), 0.0),
+       "gru128p": ("policy의 GRU에서 시작", lambda: MemP(), 0.0)}
+STEPS = sorted(int(x) for x in os.environ.get("STEPS", "").split(",") if x)
+LR = float(os.environ.get("LR", "1e-3"))
+
+
+def evaluate(net, Xin, name, tag, t0):
     with torch.no_grad():
-        P = np.concatenate([net(X[c]).cpu().numpy() for c in torch.arange(N, device=dev).split(64)])   # (N, T), in chunks
+        P = np.concatenate([net(Xin[c]).cpu().numpy() for c in torch.arange(N, device=dev).split(64)])   # (N, T), in chunks
     ww = (W[test] > 0)
     a_all = auc(P[test][ww], Y[test][ww]); a_tr = auc(P[~test][W[~test] > 0], Y[~test][W[~test] > 0])
     kk = (KDx[test] > 0) & ww                      # the same boxes 3-10 m ahead, hidden: seen before (1) vs first pass (2)
@@ -159,5 +173,25 @@ for key in os.environ.get("MEMV", "mlp,gru128").split(","):
     a_time = auc(P[test][nb], (LP[test][nb] >= 1).astype(float))
     sc = np.r_[P[posB[:, 0], posB[:, 1]], P[negB[:, 0], negB[:, 1]]] if len(negB) else np.array([])
     a_B = auc(sc, np.r_[np.ones(len(posB)), np.zeros(len(negB))]) if len(negB) else float("nan")
-    print(f"[{name}] 전체 AUC 시험 {a_all:.2f} (학습 {a_tr:.2f}) | A 같은 상자 이후 대 첫 통과 {a_pass:.2f} (시간 효과 대조 {a_time:.2f}) | "
+    print(f"[{name}]{tag} 전체 AUC 시험 {a_all:.2f} (학습 {a_tr:.2f}) | A 같은 상자 이후 대 첫 통과 {a_pass:.2f} (시간 효과 대조 {a_time:.2f}) | "
           f"B 짝 맞춤 {a_B:.2f} | {time.time() - t0:.0f} s", flush=True)
+
+for key in os.environ.get("MEMV", "mlp,gru128").split(","):
+    name, mk, wd = VAR[key]; net = mk()
+    Xin = Xraw if key.endswith("p") else X
+    net = net.to(dev); opt = torch.optim.Adam(net.parameters(), LR, weight_decay=wd)
+    t0 = time.time(); step = 0; last = STEPS[-1] if STEPS else None
+    for ep in range(200 if not STEPS else 10 ** 6):
+        for idx in tr[torch.randperm(len(tr), device=dev)].split(32):
+            lg = net(Xin[idx])
+            l = (nn.functional.binary_cross_entropy_with_logits(lg, Yt[idx], pos_weight=torch.tensor(pw, device=dev), reduction="none") * Wt[idx]).sum() / Wt[idx].sum()
+            opt.zero_grad(); l.backward(); nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step()
+            step += 1
+            if step in STEPS:
+                evaluate(net, Xin, name, f" 걸음 {step} (lr {LR:g})", t0)
+            if last is not None and step >= last:
+                break
+        if last is not None and step >= last:
+            break
+    if not STEPS:
+        evaluate(net, Xin, name, "", t0)

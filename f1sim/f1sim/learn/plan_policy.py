@@ -410,13 +410,21 @@ class Actor2(nn.Module):
     every other output is each plan's own. The speed estimate and the noise are shared. Driving takes the plan with the
     larger logit; training samples the choice (plan_rl --branches). The state gets one more input, the plan chosen last
     (`PlanObs2.prev_branch`: +1 plan 0, -1 plan 1, 0 at a start), so a side once taken can be kept. `heads` returns the
-    chosen plan in the one-plan shape and leaves `branch_out`, `logits_out`, `means_out` for those who want both."""
+    chosen plan in the one-plan shape and leaves `branch_out`, `logits_out`, `means_out` for those who want both.
+    `box_memory` > 0 (11-19, with `mem_front`; the user: "맵에 대한 정보가 신경망 속에 은연중에 외우고 있을건데, 그걸 활용할 수
+    없나?" -> "함 해봐"): a second GRU of this size beside the first, reading the same inputs; the trunk reads both states
+    (the state passed around is the two side by side, `memory` = their total, `memory_main` = the first's). The side task
+    (`aux`, plan_rl --mem-aux-seen --mem-aux-lr) reads and teaches only the second. Why apart: the first GRU carries where the
+    car is (decoder 0.32 m); taught the side task in the policy's step it learnt nothing in 60 updates, taught by an
+    optimizer of its own it learnt (AUC 0.37 -> 0.68 in 5 updates) and the car lost its way -- walls 0.05 -> 8.4 a minute,
+    and 9.8-11.8 at the same update on both GPUs even at a tenth of the step, while the side task left in the policy's
+    loss stayed at 0.07-0.29. From a checkpoint without it the trunk's columns for it start at zero: same driving."""
 
     GAP0 = 0.5                # the gap between the two plans' first-step turn at the start (the action before its tanh)
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
-                 mem_keep_log: bool = False, branches: int = 1):
+                 mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0):
         super().__init__()
         self.branches = int(branches)
         if self.branches not in (1, 2):
@@ -425,7 +433,10 @@ class Actor2(nn.Module):
         self.mem_front = bool(mem_front) and int(memory) > 0
         self.enc = ScanEncoder(beams)
         self.norm = RunningNorm(sd)
-        self.trunk = nn.Sequential(nn.Linear(256 + sd + (int(memory) if self.mem_front else 0), hidden), nn.Tanh(),
+        self.box_memory = int(box_memory) if self.mem_front else 0
+        if int(box_memory) and not self.mem_front:
+            raise ValueError("box_memory needs mem_front")
+        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
         self.pi = nn.Linear(hidden, self.branches * PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
@@ -437,16 +448,20 @@ class Actor2(nn.Module):
         self.branch_out = self.logits_out = self.means_out = None
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
-        self.memory = int(memory)
+        self.memory_main = int(memory)
+        self.memory = self.memory_main + self.box_memory          # the state passed between decisions: both GRUs' side by side
         if self.memory:
-            self.gru = nn.GRUCell(256 + sd if self.mem_front else hidden, self.memory)
+            self.gru = nn.GRUCell(256 + sd if self.mem_front else hidden, self.memory_main)
             if not self.mem_front:
                 self.mem_out = nn.Linear(self.memory, hidden)
                 nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
+            if self.box_memory:
+                self.gru_box = nn.GRUCell(256 + sd, self.box_memory)
+                self.keep_init(30.0, True, self.gru_box)          # keep times 0.1 .. 30 s, as many per octave
             if aux_dim:
-                self.aux = nn.Linear(self.memory, int(aux_dim))
+                self.aux = nn.Linear(self.box_memory or self.memory, int(aux_dim))
             if mem_value:
-                self.v_mem = nn.Linear(self.memory, 1)
+                self.v_mem = nn.Linear(self.memory_main, 1)
             if mem_keep_s > 0:
                 self.keep_init(float(mem_keep_s), bool(mem_keep_log))
         self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
@@ -476,14 +491,30 @@ class Actor2(nn.Module):
         log_std = torch.maximum(self.log_std, self.log_std_floor)
         return means, self.choice(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
 
-    def keep_init(self, keep_s: float, log: bool = False) -> None:
+    def keep_init(self, keep_s: float, log: bool = False, cell: Optional[nn.GRUCell] = None) -> None:
         """the update gate's bias so that value k of the memory, left alone, keeps 1 - 1/T_k of itself per decision"""
-        n, t_max = self.memory, keep_s / PS.DT
+        cell = self.gru if cell is None else cell
+        n, t_max = cell.hidden_size, keep_s / PS.DT
         with torch.no_grad():
             t = (torch.exp(torch.empty(n).uniform_(0.0, math.log(t_max))).clamp_min(1.0 + 1e-3) if log
                  else torch.empty(n).uniform_(2.0, t_max))
-            self.gru.bias_ih[n: 2 * n] = torch.log(t - 1.0).to(self.gru.bias_ih)
-            self.gru.bias_hh[n: 2 * n] = 0.0
+            cell.bias_ih[n: 2 * n] = torch.log(t - 1.0).to(cell.bias_ih)
+            cell.bias_hh[n: 2 * n] = 0.0
+
+    def mem_cell(self, f: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """one decision of the whole memory: (n, F), (n, memory) -> (n, memory)"""
+        if not self.box_memory:
+            return self.gru(f, h)
+        m = self.memory_main
+        return torch.cat([self.gru(f, h[:, :m]), self.gru_box(f, h[:, m:])], 1)
+
+    def aux_read(self, hs: torch.Tensor) -> torch.Tensor:
+        """the side task's read-out: of the box memory's part when there is one"""
+        return self.aux(hs[:, self.memory_main:] if self.box_memory else hs)
+
+    def vmem_read(self, hs: torch.Tensor) -> torch.Tensor:
+        """the value read-out: of the first GRU's part"""
+        return self.v_mem(hs[:, :self.memory_main])
 
     def memory_alone(self, f_seq: torch.Tensor, h: torch.Tensor, done: torch.Tensor,
                      h_start: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -497,14 +528,14 @@ class Actor2(nn.Module):
             if i > 0:
                 h = (h * (1.0 - done[i - 1])[:, None] if h_start is None
                      else torch.where(done[i - 1][:, None] > 0, h_start[i], h))
-            h = self.gru(f_seq[i].detach(), h)
+            h = self.mem_cell(f_seq[i].detach(), h)
             hs.append(h)
         return torch.cat(hs, 0)
 
     def remember(self, f: torch.Tensor, h: Optional[torch.Tensor]):
         """one decision of the memory: (features with the memory added, the new state)"""
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
-        h1 = self.gru(f, h0)
+        h1 = self.mem_cell(f, h0)
         if self.mem_front:
             return self.trunk(torch.cat([f, h1], 1)), h1
         return f + self.mem_out(h1), h1
@@ -591,7 +622,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
                    memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,
                    mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"],
-                   branches=int(ck["args"].get("branches", 1) or 1)).to(device)
+                   branches=int(ck["args"].get("branches", 1) or 1),
+                   box_memory=int(ck["args"].get("box_memory", 0) or 0)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

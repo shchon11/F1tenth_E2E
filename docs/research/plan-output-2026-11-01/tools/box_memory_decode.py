@@ -3,7 +3,9 @@
 상자를 치우기 전, 출발 10 s 뒤, 그 세션에는 앞 10 m 안에 상자가 없는 결정. 둘 다 '이 세션엔 상자가 있다'는 같고 다른 것은 '이 자리 앞에
 지금 상자가 있나'뿐 -> 기억(mem)에서 가를 수 있으면 자리에 묶인 상자 정보를 들고 있는 것. 그 순간 스캔 값(feat)은 상자를 못 보므로 비교 기준.
 decoder = 로지스틱 회귀(입력 표준화, L2), 세션으로 나눠(4번째마다 시험) AUC.
-인자: 기록npz(+_mem.npz) 행npy [보이기 몇 결정 전, 3 = 0.3 s] [둘레 m 안에 (다른) 상자 없을 때만, 0 = 끔]"""
+인자: 기록npz(+_mem.npz) 행npy [보이기 몇 결정 전, 3 = 0.3 s] [둘레 m 안에 (다른) 상자 없을 때만, 0 = 끔] [checkpoint]
+(11-19) checkpoint에 기억 보조 출력(aux, --mem-aux-seen)이 있으면 그 출력 자체(학습 중 배운 그대로, 시험 상자 배치는 학습에 없음)의
+가장 가까운 상자 '있음' 값으로도 같은 양성·음성을 가름 -- 새로 배우는 것이 없으니 모든 세션으로 셈"""
 import sys
 import numpy as np
 import torch
@@ -113,3 +115,17 @@ for name, X in (("feat (그 순간 스캔 값)", feat[idx[:, 0], idx[:, 1]]), ("
         if best is None or a_te > best[1]:
             best = (lam, a_te, a_tr)
     print(f"[{name}] 시험 세션 AUC {best[1]:.2f} (학습 {best[2]:.2f}, L2 {best[0]:g}) | 양성 {int(y[test].sum())} · 음성 {int((1 - y[test]).sum())}", flush=True)
+
+
+if len(sys.argv) > 5:
+    ck = torch.load(sys.argv[5], map_location="cpu", weights_only=False)
+    W_, b_ = ck["actor"].get("aux.weight"), ck["actor"].get("aux.bias")
+    if W_ is None:
+        print("[policy 자신의 보조 출력] 이 checkpoint에는 없음", flush=True)
+    else:
+        m0 = int(ck["args"].get("memory", 0) or 0) if int(ck["args"].get("box_memory", 0) or 0) else 0
+        Hm = torch.tensor(mem[idx[:, 0], idx[:, 1]]).float()[:, m0:]           # the box memory's part when there is one
+        lg = (Hm @ W_.float().t() + b_.float())[:, 0].numpy()        # the nearest listed box: present (logit)
+        print(f"[policy 자신의 보조 출력, 가장 가까운 상자 있음] 모든 세션 AUC {auc(lg, y):.2f} (시험 세션만 {auc(lg[test], y[test]):.2f}) | "
+              f"양성 {int(y.sum())} · 음성 {int((1 - y).sum())} | 있다고 본 비율 양성 {(lg[y > 0] > 0).mean() * 100:.0f} % · "
+              f"음성 {(lg[y == 0] > 0).mean() * 100:.0f} %", flush=True)

@@ -656,6 +656,17 @@ def main(argv=None):
                          "the target at once, before the car can see their places empty; a stored scene keeps its own). Why: the policy's memory knows where the car is (decoder: 0.32 m) but "
                          "not that a box passed a lap ago is ahead (AUC 0.57 one second before it shows); a GRU of the same size "
                          "taught exactly this on the policy's own features gets it on unseen layouts (AUC 0.96, `tools/gru_bind_test2.py`)")
+    ap.add_argument("--box-memory", type=int, default=0,
+                    help="> 0, with --memory --mem-front: a second GRU of this size for the side task (`Actor2.box_memory`): the "
+                         "trunk reads it (from a checkpoint without it: its columns start at zero), --mem-aux reads and teaches only it, "
+                         "the first GRU stays the policy's own. 0 = one memory")
+    ap.add_argument("--mem-aux-lr", type=float, default=0.0,
+                    help="> 0, with --mem-aux: the side task trains the memory (GRU) and its read-out with an Adam of its own at this "
+                         "learning rate, a step every minibatch, outside the policy's loss (the policy's accumulated step and its Adam "
+                         "state still move the GRU too). 11-19: inside the policy's step (4-8 minibatches a step, one Adam state shared "
+                         "with the PPO gradient) the side task taught nothing in 60 updates of qual26s -- its read-out on exam memory "
+                         "states AUC 0.50 -- while the same task alone teaches the policy's own GRU in 100 steps at 3e-4 "
+                         "(tools/gru_bind_test2.py gru128p: A 0.89, B 0.82). 0 = in the policy's loss, as before")
     ap.add_argument("--mem-value", type=float, default=0.0,
                     help="with --memory: the weight of a value read-out of the memory's state (`Actor2.mem_value`; 11-12, the user:"
                          " \"ㅇㅋ\") -- taught this update's returns, each update's scaled to mean 0 and spread 1, so the logged loss is"
@@ -986,7 +997,7 @@ def main(argv=None):
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
-                    mem_keep_log=args.mem_keep_log, branches=args.branches) if v2
+                    mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -996,8 +1007,10 @@ def main(argv=None):
     rl_idx = torch.nonzero(rl_mask)[:, 0]
     if args.speed_std_floor > 0:
         actor.log_std_floor[PS.N_STEP] = math.log(args.speed_std_floor)        # the first step's speed: the one driven
+    if args.box_memory and not (args.memory and args.mem_front and v2):
+        raise SystemExit("--box-memory needs --memory --mem-front (v2)")
     if args.memory:
-        obs.mem_h = torch.zeros(Bl, args.memory, device=dev)
+        obs.mem_h = torch.zeros(Bl, actor.memory, device=dev)          # both GRUs' states with --box-memory
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     if args.init:
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
@@ -1037,6 +1050,12 @@ def main(argv=None):
         opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
         opt_c = None
     dist_w = 1.0                                    # this process's share of the update's decisions (--dist-world)
+    opt_aux = aux_params = None                     # --mem-aux-lr: the side task's own optimizer on (memory, read-out)
+    if args.mem_aux_lr > 0:
+        if not aux_on:
+            raise SystemExit("--mem-aux-lr needs --mem-aux")
+        aux_params = list((actor.gru_box if actor.box_memory else actor.gru).parameters()) + list(actor.aux.parameters())
+        opt_aux = torch.optim.Adam(aux_params, lr=args.mem_aux_lr, eps=1e-5)
 
     def dist_grads(params):
         """--dist-world: every process's gradient on `params`, weighted by its share of the decisions, summed into all"""
@@ -1049,6 +1068,18 @@ def main(argv=None):
         for p_ in ps_:
             n_ = p_.numel()
             p_.grad = flat[o_:o_ + n_].view_as(p_).clone(); o_ += n_
+
+    def aux_step(gs):
+        """--mem-aux-lr: one step of the side task's own optimizer with its gradient `gs` on (memory, read-out); the policy's
+        gradient adding up on the same weights is put back as it was"""
+        kept = [p_.grad for p_ in aux_params]
+        for p_, g_ in zip(aux_params, gs):
+            p_.grad = g_ if g_ is not None else torch.zeros_like(p_)
+        dist_grads(aux_params)
+        nn.utils.clip_grad_norm_(aux_params, args.max_grad)
+        opt_aux.step()
+        for p_, k_ in zip(aux_params, kept):
+            p_.grad = k_
 
     def dist_sum(*xs):
         """--dist-world: float sums over the processes (a tensor of them)"""
@@ -1500,13 +1531,13 @@ def main(argv=None):
                 return heads_on(actor.features(bX[sel], bS[sel]), sel)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
-            h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.gru, *prev_mem, sel[0] % Bl, bHM[sel[0]])
+            h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.mem_cell, *prev_mem, sel[0] % Bl, bHM[sel[0]])
             hs_ = []
             for i in range(sel.shape[0]):
                 if i > 0:
                     # after a restart: the state the next decision was driven from -- zero, or a scene's memory
                     h = torch.where(bD[sel[i - 1]][:, None] > 0, bHM[sel[i]], h)
-                h = actor.gru(f[i], h)
+                h = actor.mem_cell(f[i], h)
                 hs_.append(h)
             # (11-14) what `remember` does after the GRU, once over the whole sequence instead of per step: the same
             # numbers, ~10 fewer kernel launches per step forward and backward in the update's 128-step loop
@@ -1516,15 +1547,15 @@ def main(argv=None):
                 # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
                 hs = actor.memory_alone(f, h0, bD[sel], bHM[sel])
                 if aux_on:
-                    aux_box["pred"] = actor.aux(hs)
+                    aux_box["pred"] = actor.aux_read(hs)
                 if memv_on:
-                    aux_box["v"] = actor.v_mem(hs)[:, 0]
+                    aux_box["v"] = actor.vmem_read(hs)[:, 0]
             return heads_on(fc, mb_)
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
         ce10, tr_ratio = [], []
-        als, aac, aac_far, alo, sms, mvs, akn = [], [], [], [], [], [], []
+        als, aac, aac_far, alo, sms, mvs, akn, aauc = [], [], [], [], [], [], [], []
         aux_box = {}
         g_split = {"policy": [], "speed": [], "value": []}
         if dist is not None:
@@ -1646,6 +1677,7 @@ def main(argv=None):
             T_terms = {}
         for ep in range(args.epochs):
             for sel in batches():
+                aux_g = None
                 if v2:
                     mean, log_std, v_hat, mb, f_heads = actor_on(sel)
                     el = (v_hat - bVT[mb]).pow(2).mean()
@@ -1732,9 +1764,17 @@ def main(argv=None):
                         la = la + lo
                         with torch.no_grad():
                             alo.append(float(lo))
-                    loss = loss + args.mem_aux * la
+                    if opt_aux is None:
+                        loss = loss + args.mem_aux * la
+                    else:                                       # stepped right after the policy's backward below
+                        aux_g = torch.autograd.grad(args.mem_aux * la, aux_params, retain_graph=True, allow_unused=True)
                     with torch.no_grad():
                         als.append(float(la)); aac.append(float(((pa[..., 0] > 0).float() == m_p).float().mean()))
+                        y0_ = m_p[:, 0] > 0.5                   # does the nearest-box 'present' output separate (AUC), not only its rate
+                        n1_ = int(y0_.sum()); n0_ = y0_.numel() - n1_
+                        if n1_ > 0 and n0_ > 0:
+                            rk_ = pa[:, 0, 0].float().argsort().argsort().float()
+                            aauc.append(float((rk_[y0_].sum() - n1_ * (n1_ - 1) / 2) / (n1_ * n0_)))
                         akn.append(float(m_p[:, 0].mean()))
                         far = m_p[:, 0] > 0.5
                         far = far & (ta[:, 0, 3] * 5.0 > 4.0)          # the nearest box 4-12 m away: mostly not yet seen up close
@@ -1768,6 +1808,8 @@ def main(argv=None):
                         opt.zero_grad(set_to_none=True)
                     opt_c.zero_grad(set_to_none=True)
                     loss.backward(); acc_i += 1
+                    if aux_g is not None:
+                        aux_step(aux_g)
                     dist_grads(critic.parameters())
                     nn.utils.clip_grad_norm_(list(critic.parameters()), args.max_grad)
                     opt_c.step()
@@ -1781,6 +1823,8 @@ def main(argv=None):
                     if acc_i % args.accum == 0:
                         opt.zero_grad(set_to_none=True)
                     (loss / args.accum if args.accum > 1 else loss).backward(); acc_i += 1
+                    if aux_g is not None:
+                        aux_step(aux_g)
                     if acc_i % args.accum:
                         with torch.no_grad():
                             kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
@@ -1868,6 +1912,7 @@ def main(argv=None):
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
                "aux_present": (sum(akn) / len(akn)) if akn else None,   # share of decisions with a box in the target
+               "aux_auc": (sum(aauc) / len(aauc)) if aauc else None,     # nearest box present: separation, per minibatch
                "aux_opp_loss": (sum(alo) / len(alo)) if alo else None,
                "smooth_loss": (sum(sms) / len(sms)) if sms else None,
                "mem_value_loss": (sum(mvs) / len(mvs)) if mvs else None}
@@ -1927,7 +1972,8 @@ def main(argv=None):
               + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
                  f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
-                 f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
+                 f"{(row['aux_far_recall'] or 0) * 100:.0f} %, 있음/없음 가르기 AUC {(row.get('aux_auc') or float('nan')):.2f} | "
+                 if row.get("aux_loss") is not None else "")
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
               + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
