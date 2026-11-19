@@ -22,7 +22,8 @@ CACHE = OUT + "/dash_cache"
 os.makedirs(CACHE, exist_ok=True)
 FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts_wall_per_min", "contacts_prop_per_min",
           "contacts_car_per_min", "reward", "contact_cost", "kl", "clipfrac", "vloss", "accum_actor", "stopped", "noise_rho_steer",
-          "plan_hit_share", "tail_next_05", "tail_driven_10", "vest_mae")      # (11-16, the user: "plan관련 지표는 못보여주나?")
+          "plan_hit_share", "tail_next_05", "tail_driven_10", "vest_mae",      # (11-16, the user: "plan관련 지표는 못보여주나?")
+          "noise_scale", "aux_auc")       # (11-19, the user: "잡음 크기는 사이트에 plot 안되나?"; + the box memory's side task)
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()

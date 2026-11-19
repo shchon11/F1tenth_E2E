@@ -203,6 +203,8 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     <div class="card"><h3>조향 탐색 잡음 <span class="sub">실선 이어지는 정도 · 점선 조향 std (run만)</span></h3><div class="cbox"><canvas id="c_noise"></canvas></div></div>
     <div class="card"><h3>update 시간 <span class="sub">s</span></h3><div class="cbox"><canvas id="c_time"></canvas></div></div>
     <div class="card"><h3>한 걸음에 합친 minibatch 수</h3><div class="cbox"><canvas id="c_acc"></canvas></div></div>
+    <div class="card"><h3>policy gradient 잡음 크기 <span class="sub">결정 수 · 로그 축 · 이만큼 모아야 gradient가 잡음보다 커짐</span></h3><div class="cbox"><canvas id="c_bnoise"></canvas></div></div>
+    <div class="card"><h3>상자 기억 가르기 AUC <span class="sub">지나친 상자가 앞에 있음/없음 · 학습 중 minibatch (보조 문제가 있는 run만)</span></h3><div class="cbox"><canvas id="c_aux"></canvas></div></div>
   </div>
 
   <div class="sec"><h2>checkpoint별 평가</h2><span class="sub">frozen exam: 같은 세계 128 세션 × 90 s · 최근 것부터</span></div>
@@ -328,7 +330,7 @@ function setXR(r, from, mode = "user") {
   for (const c of Object.values(charts)) { if (c === from) fitY(c); else applyX(c); c.update("none"); }
 }
 function syncFrom({chart: c}) { setXR({min: c.scales.x.min, max: c.scales.x.max}, c); }
-function chart(id, sets, zero = true) {
+function chart(id, sets, zero = true, log = false) {
   const grid = css("--grid"), ink = css("--muted");
   sets.forEach((d) => { d.hidden = HIDDEN.has(d.runName); });
   if (charts[id]) { charts[id].data.datasets = sets; applyX(charts[id]); charts[id].update("none"); return; }
@@ -341,7 +343,7 @@ function chart(id, sets, zero = true) {
                pan: {enabled: true, mode: "x", modifierKey: "shift", onPanComplete: syncFrom}},
         tooltip: {callbacks: {title: (it) => (OFF.run || OFF.ref ? "이 지도에서 update " : "update ") + it[0].parsed.x, label: (it) => ` ${it.dataset.label}: ${(+it.parsed.y).toPrecision(3)}`}}},
       scales: {x: {type: "linear", bounds: "data", grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 6}},
-               y: {beginAtZero: zero, grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 5}}},
+               y: {type: log ? "logarithmic" : "linear", beginAtZero: zero && !log, grid: {color: grid, drawTicks: false}, border: {display: false}, ticks: {color: ink, font: {size: 10}, maxTicksLimit: 5}}},
       elements: {point: {radius: 0, hitRadius: 8, hoverRadius: 4}, line: {borderWidth: 2, tension: 0.2}}}});
   applyX(charts[id]); charts[id].update("none");
   $(id).addEventListener("dblclick", () => { charts[id].resetZoom?.("none"); setXR(null, null, "all"); });
@@ -443,6 +445,8 @@ async function refresh() {
   chart("c_kl", two((r) => r.kl));
   chart("c_time", two((r) => r.t_roll == null ? null : r.t_roll + (r.t_upd || 0)));
   chart("c_acc", two((r) => r.accum_actor));
+  chart("c_bnoise", two((r) => r.noise_scale > 0 ? r.noise_scale : null), false, true);
+  chart("c_aux", two((r) => r.aux_auc), false);
   chart("c_noise", [ds(`${run} 이어지는 정도`, series(rows, (r) => r.noise_rho_steer ?? 0, OFF.run), css("--run"), false),
                     ds(`${run} 조향 std`, series(rows, (r) => r.std_steer, OFF.run), css("--run"), true)]);
   $("xnote").textContent = OFF.run || OFF.ref ? `가로축 = 이 지도에서 한 update 수 (${run}${OFF.run ? ` u${OFF.run}부터` : ""} · ${ref}${OFF.ref ? ` u${OFF.ref}부터` : " 처음부터"})` : "가로축 = update";
