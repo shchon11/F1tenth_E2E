@@ -37,6 +37,7 @@ import json
 import math
 import os
 import time
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -79,25 +80,47 @@ def build(world: str, envs: int, seed: int, device, overrides=None, fmt: str = "
     return env, lim, a
 
 
-def track_boxes(env, goal, lid: torch.Tensor, K: int, R: float) -> torch.Tensor:
+def box_along(env, goal, lid: torch.Tensor):
+    """each box slot of the learner rows: (along-track distance ahead (B_l, C) in (-L/2, L/2], live (B_l, C), xy (B_l, C, 2)),
+    measured on the reward's walls-only distance field (`plan_reward.GoalField`) like `track_boxes`"""
+    po = env.procedural
+    st = env.sim.state[lid].float()
+    tid = env.sim.tid[lid]
+    pos = po.p_poses[lid, :, :2].float()                                   # (B_l, C, 2)
+    Bl, C = pos.shape[:2]
+    r_car = goal.remaining(st[:, :2], tid)
+    r_box = goal.remaining(pos.reshape(-1, 2), tid.repeat_interleave(C)).view(Bl, C)
+    L = goal.lap[tid].float()[:, None]
+    ds = torch.remainder(r_car[:, None] - r_box + 0.5 * L, L) - 0.5 * L     # ahead along the track, in (-L/2, L/2]
+    return ds, (po.p_sid[lid] >= 0) & torch.isfinite(ds), pos
+
+
+def boxes_passed(seen, prev_ds, prev_pos, ds, live, pos):
+    """--mem-aux-seen, one decision: (seen, prev_ds, prev_pos) brought up to now from `box_along`'s (ds, live, pos). A box slot
+    counts as passed once the car went by it (0..3 m ahead at the last decision, 0..3 m behind now); a slot whose box moved (a
+    new draw, a scene) or went is cleared"""
+    moved = ((pos - prev_pos).abs().sum(-1) > 0.05) | ~live
+    seen = (seen & ~moved) | (live & ~moved & (prev_ds > 0.0) & (prev_ds <= 3.0) & (ds <= 0.0) & (ds > -3.0))
+    return seen, torch.where(live, ds, torch.full_like(ds, float("nan"))), pos
+
+
+def track_boxes(env, goal, lid: torch.Tensor, K: int, R: float, known: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(B_l, K*4) the boxes ahead ALONG THE TRACK (11-10, the user, of the straight-line block that also lists the boxes behind
     a wall on the opposite straight: \"이건 아니지\"): live boxes whose walls-only distance to go (`plan_reward.GoalField`, the
     reward's own field -- no centerline) is 0..R m less than the car's (from -1 m: beside it), nearest along the track first:
-    present, dx/5, dy/5 in the car's frame, the along-track distance/5 -- hidden ones too. The lap's wrap is taken care of."""
+    present, dx/5, dy/5 in the car's frame, the along-track distance/5 -- hidden ones too. The lap's wrap is taken care of.
+    `known` (B_l, C): only these slots count (--mem-aux-seen: the boxes the car has already passed in this race)."""
     po = env.procedural
     Bl = int(lid.numel())
     out = torch.zeros(Bl, K, 4, device=lid.device)
     if po is None or po.C == 0:
         return out.reshape(Bl, -1)
     st = env.sim.state[lid].float()
-    tid = env.sim.tid[lid]
-    pos = po.p_poses[lid, :, :2].float()                                   # (B_l, C, 2)
+    ds, live, pos = box_along(env, goal, lid)
     C = pos.shape[1]
-    r_car = goal.remaining(st[:, :2], tid)
-    r_box = goal.remaining(pos.reshape(-1, 2), tid.repeat_interleave(C)).view(Bl, C)
-    L = goal.lap[tid].float()[:, None]
-    ds = torch.remainder(r_car[:, None] - r_box + 0.5 * L, L) - 0.5 * L     # ahead along the track, in (-L/2, L/2]
-    live = (po.p_sid[lid] >= 0) & torch.isfinite(ds) & (ds > -1.0) & (ds <= R)
+    live = live & (ds > -1.0) & (ds <= R)
+    if known is not None:
+        live = live & known
     d = pos - st[:, None, :2]
     c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
     dx, dy = d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c
@@ -626,6 +649,13 @@ def main(argv=None):
                          " (the critic's privileged block: the nearest 3 live boxes not behind the car within 12 m, hidden ones too) every"
                          " decision (11-10, the user: \"기억은 필요해 ... 사각지대에 장애물이 있어서 사고나는거\"; --mem-chunk 128 alone left"
                          " the memory unused for 100 updates). The LiDAR features feed it detached; driving never reads it. 0 = off")
+    ap.add_argument("--mem-aux-seen", action="store_true",
+                    help="(11-19) with --mem-aux and --box-range: the side task lists only the boxes the car has already passed in this "
+                         "race (a box slot counts once the car's along-track distance to it went from 0..3 m ahead to 0..3 m behind; "
+                         "a restart or a moved or removed box clears it -- with --removal-p the boxes that went are missing from "
+                         "the target at once, before the car can see their places empty; a stored scene keeps its own). Why: the policy's memory knows where the car is (decoder: 0.32 m) but "
+                         "not that a box passed a lap ago is ahead (AUC 0.57 one second before it shows); a GRU of the same size "
+                         "taught exactly this on the policy's own features gets it on unseen layouts (AUC 0.96, `tools/gru_bind_test2.py`)")
     ap.add_argument("--mem-value", type=float, default=0.0,
                     help="with --memory: the weight of a value read-out of the memory's state (`Actor2.mem_value`; 11-12, the user:"
                          " \"ㅇㅋ\") -- taught this update's returns, each update's scaled to mean 0 and spread 1, so the logged loss is"
@@ -931,6 +961,16 @@ def main(argv=None):
     aux_on = args.mem_aux > 0
     if aux_on and not args.memory:
         raise SystemExit("--mem-aux needs --memory")
+    if args.mem_aux_seen and not (aux_on and args.box_range > 0):
+        raise SystemExit("--mem-aux-seen needs --mem-aux and --box-range (the along-track box list)")
+    aux_seen = aux_prev_ds = aux_prev_pos = None                    # --mem-aux-seen: per learner row and box slot, passed yet
+    if args.mem_aux_seen:
+        if env.procedural is None:
+            raise SystemExit("--mem-aux-seen: this world has no boxes")
+        C_ = env.procedural.C
+        aux_seen = torch.zeros(Bl, C_, dtype=torch.bool, device=dev)
+        aux_prev_ds = torch.full((Bl, C_), float("nan"), device=dev)
+        aux_prev_pos = torch.zeros(Bl, C_, 2, device=dev)
     memv_on = args.mem_value > 0
     if (memv_on or args.mem_keep_s > 0) and not args.memory:
         raise SystemExit("--mem-value / --mem-keep-s need --memory")
@@ -1142,6 +1182,8 @@ def main(argv=None):
                                 pol_imu=env.last_result.imu[lid].float().mean(1))
                     if args.memory:
                         snap["pol_mem"] = obs.mem_h.clone()
+                    if aux_seen is not None:
+                        snap.update(aux_seen=aux_seen.clone(), aux_prev_ds=aux_prev_ds.clone(), aux_prev_pos=aux_prev_pos.clone())
                     if two:
                         snap["pol_branch"] = obs.prev_branch.clone()
                     hist.append(snap)
@@ -1158,7 +1200,10 @@ def main(argv=None):
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from
                     if aux_on:
-                        ax_ = (track_boxes(env, pr.goal, lid, AUXK, args.box_range) if args.box_range > 0
+                        if aux_seen is not None:
+                            aux_seen, aux_prev_ds, aux_prev_pos = boxes_passed(aux_seen, aux_prev_ds, aux_prev_pos,
+                                                                               *box_along(env, pr.goal, lid))
+                        ax_ = (track_boxes(env, pr.goal, lid, AUXK, args.box_range, known=aux_seen) if args.box_range > 0
                                else env._prop_block(env.sim.state)[lid].float().clone())
                         if aux_opp:
                             ax_ = torch.cat([ax_, track_opp(env, pr.goal, lid, args.aux_opp)], 1)
@@ -1284,6 +1329,9 @@ def main(argv=None):
                                ~out["restarted"])
                 if two:
                     br_u = torch.where(out["restarted"], torch.rand(Bl, device=dev), br_u)
+                if aux_seen is not None:                         # a new race: nothing passed yet (a scene sets its own below)
+                    aux_seen &= ~out["restarted"][:, None]
+                    aux_prev_ds = torch.where(out["restarted"][:, None], torch.full_like(aux_prev_ds, float("nan")), aux_prev_ds)
                 if scene is not None:
                     # 1. races that began from a scene in this decision: the policy's inputs as they were at the scene (the
                     #    env's part is in place); before any scene is added below -- the store's places are reused
@@ -1304,6 +1352,9 @@ def main(argv=None):
                         r_.imu[lid[g_l]] = Dd["pol_imu"][i_l][:, None, :].to(r_.imu.dtype)
                         if args.memory:
                             obs.mem_h[g_l] = Dd["pol_mem"][i_l]      # what the car knew then is part of the moment
+                        if aux_seen is not None:                 # and which boxes it had passed by then
+                            aux_seen[g_l] = Dd["aux_seen"][i_l]; aux_prev_ds[g_l] = Dd["aux_prev_ds"][i_l]
+                            aux_prev_pos[g_l] = Dd["aux_prev_pos"][i_l]
                         if two:
                             obs.prev_branch[g_l] = Dd["pol_branch"][i_l]
                     # 2. hard contacts of this decision (a car's only if the reward charges for it)
@@ -1473,7 +1524,7 @@ def main(argv=None):
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
         ce10, tr_ratio = [], []
-        als, aac, aac_far, alo, sms, mvs = [], [], [], [], [], []
+        als, aac, aac_far, alo, sms, mvs, akn = [], [], [], [], [], [], []
         aux_box = {}
         g_split = {"policy": [], "speed": [], "value": []}
         if dist is not None:
@@ -1684,6 +1735,7 @@ def main(argv=None):
                     loss = loss + args.mem_aux * la
                     with torch.no_grad():
                         als.append(float(la)); aac.append(float(((pa[..., 0] > 0).float() == m_p).float().mean()))
+                        akn.append(float(m_p[:, 0].mean()))
                         far = m_p[:, 0] > 0.5
                         far = far & (ta[:, 0, 3] * 5.0 > 4.0)          # the nearest box 4-12 m away: mostly not yet seen up close
                         if bool(far.any()):
@@ -1815,6 +1867,7 @@ def main(argv=None):
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
+               "aux_present": (sum(akn) / len(akn)) if akn else None,   # share of decisions with a box in the target
                "aux_opp_loss": (sum(alo) / len(alo)) if alo else None,
                "smooth_loss": (sum(sms) / len(sms)) if sms else None,
                "mem_value_loss": (sum(mvs) / len(mvs)) if mvs else None}
