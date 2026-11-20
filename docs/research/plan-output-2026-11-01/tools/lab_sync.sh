@@ -2,7 +2,8 @@
 # (11-15 23:40, 11-16 00:05 고침) 다시 돌리면 최신 코드·checkpoint로 갱신. lab PC(tcar, WireGuard 10.100.0.2)에서 콘솔을 돌릴 수 있게:
 # 최신 코드(f1sim) + 콘솔 주요 checkpoint + 상자 배치 + 캐시 -> ~/F1tenth/console_main/run_console.sh
 # 터널 한 줄은 0.2 MB/s라 여러 줄로 보내되, 한꺼번에 12줄 넘게 열면 lab의 sshd가 연결을 끊음(MaxStartups) -> 5줄씩, 실패하면 3번까지 다시
-H=${LAB_H:-lab};   # (11-20) Tailscale; the WireGuard path (shchon11@10.100.0.2) timed out from 14:43
+H=${LAB_H:-shchon11@10.100.0.2};   # (11-20) WireGuard (lab side: interface 'home'); LAB_H=lab = Tailscale. When both were up
+# Tailscale rode over the WireGuard path and crawled at ~3 KB/s; the WireGuard address itself did 6 MB/s
  SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 RUNS=/home/shchon11/f1sim_runs; L=/home/shchon11/F1tenth_E2E
 # (11-20, the user: "랩 콘솔 내다버린거냐") the console's own list, top 12 -- a fixed list here had gone stale (11-17 picks)

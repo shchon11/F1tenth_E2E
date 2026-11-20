@@ -10,7 +10,8 @@
 # write the analysis (.txt + .done) here. The remote exam runs under setsid and is polled, so a dropped tunnel does not kill it.
 # Args: RUN U0 STEP U1
 RUN=$1; U0=$2; STEP=${3:-25}; U1=$4
-H=${LAB_H:-lab};   # (11-20) Tailscale; the WireGuard path (shchon11@10.100.0.2) timed out from 14:43
+H=${LAB_H:-shchon11@10.100.0.2};   # (11-20) WireGuard (lab side: interface 'home'); LAB_H=lab = Tailscale. When both were up
+# Tailscale rode over the WireGuard path and crawled at ~3 KB/s; the WireGuard address itself did 6 MB/s
  SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 R=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01; T=$R/tools; D=$R/out; RUNS=/home/shchon11/f1sim_runs
 LX=/home/shchon11/F1tenth/exam_lab/out/exam
