@@ -26,7 +26,9 @@ for UU in $(seq $U0 $STEP $U1); do
     # (the lab's login shell is zsh: a glob with no match aborted this whole line -- the exam never started; plain names)
     $SSH $H "mkdir -p $LX && rm -f $LX/$B.npz $LX/${B}_mem.npz $LX/$B.log && cd ~/F1tenth/console_main/f1sim && setsid nohup bash -c 'PYTHONPATH=\$PWD F1SIM_EXAM_SAVE_MEM=1 WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555 CUDA_VISIBLE_DEVICES=0 timeout 5400 ~/F1tenth/.venv/bin/python3 -u -W ignore ~/F1tenth/exam_lab/tools/exam_record.py ~/f1sim_runs/$RUN/plan_u$UU.pt $LX/$B.npz ideal 256 line3 > $LX/$B.log 2>&1; echo rc \$? >> $LX/$B.log' > /dev/null 2>&1 < /dev/null &"
     for k in $(seq 1 200); do sleep 30; $SSH $H "grep -q '^rc ' $LX/$B.log" 2>/dev/null && break; done
-    $SSH $H "cd $LX && tar -cf - $B.npz ${B}_mem.npz $B.log && rm -f ${B}_mem.npz" | tar -x -C $D/exam 2>/dev/null
+    # (11-20) the memory file (126 MB) stays on the lab (fetch it by hand when needed): over Tailscale it crawled at ~1 KB/s
+    # and held the loop 20 min after the exam was done
+    $SSH $H "cd $LX && tar -cf - $B.npz $B.log" | tar -x -C $D/exam 2>/dev/null
     [ -e $D/exam/$B.npz ] && break
     sleep 60
   done
