@@ -23,11 +23,13 @@ EX, SP = os.path.join(OUT, "exam"), os.path.join(OUT, "spots")
 LANE, WALL, PAGE = "#22272e", "#0b0c0e", "#0d0f12"
 COLS = {0: "#e66767", 1: "#fab219", 2: "#3987e5"}
 # (11-21, the user: "이 그림에 빈 트랙에서 라인이랑 속도 어떻게 가져가는지도 같이 plot좀. 한바퀴 최고시간도") the empty track's
-# fastest lap drawn under the hits, its speed in one blue ramp (slow dark -> fast light, the same scale on every checkpoint);
-# VER marks the frames drawn with it, older ones are drawn again
-VER = 3
-SPD = ["#256abf", "#2a78d6", "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"]
-V0, V1 = 1.0, 9.0
+# fastest lap drawn under the hits, its speed from violet (slow) through blue to near white (fast), the same 2-9 m/s scale on every
+# checkpoint; the page shows the map at about a third of its pixels on the phone, so line, labels and dots are drawn thick
+# ("속도도 좀 빠르고 느린거 구분이 안되잖아": the one-blue ramp at 3 px read as one colour there). VER marks the frames drawn with
+# the current look, older ones are drawn again
+VER = 4
+SPD = ["#7b3fe4", "#4f6ef7", "#2fa6f5", "#5fe0f0", "#e8fbff"]
+V0, V1 = 2.0, 9.0
 INK = "#e6edf3"
 
 
@@ -111,18 +113,18 @@ def frame(run, u, p):
         v = np.abs(R.st[t0: t1 + 1, b, 3]).astype(float)
         xc, vc = np.vstack([xy, xy[:1]]), np.append(v, v[0])          # closed at the line
         lc = LineCollection(np.stack([xc[:-1], xc[1:]], 1), cmap=LinearSegmentedColormap.from_list("spd", SPD),
-                            norm=plt.Normalize(V0, V1), linewidths=3.0, capstyle="round", zorder=2)
+                            norm=plt.Normalize(V0, V1), linewidths=8.0, capstyle="round", zorder=2)
         lc.set_array(0.5 * (vc[:-1] + vc[1:]))
         ax.add_collection(lc)
         for i in speed_marks(v):
-            ax.annotate(f"{v[i]:.1f}", xy[i], xytext=(7, 4), textcoords="offset points", fontsize=13, fontweight="bold",
-                        color=INK, zorder=4, path_effects=[pe.withStroke(linewidth=3, foreground=PAGE)])
+            ax.annotate(f"{v[i]:.1f}", xy[i], xytext=(9, 6), textcoords="offset points", fontsize=24, fontweight="bold",
+                        color=INK, zorder=4, path_effects=[pe.withStroke(linewidth=5, foreground=PAGE)])
     n = {}
     for k, c in COLS.items():
         t, b = np.nonzero(hard[..., k] > 0)
         n[k] = int(len(t))
         if len(t):
-            ax.scatter(st[t, b, 0], st[t, b, 1], s=26, c=c, alpha=0.8, edgecolors="none", zorder=3)
+            ax.scatter(st[t, b, 0], st[t, b, 1], s=60, c=c, alpha=0.9, edgecolors=PAGE, linewidths=0.8, zorder=3)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect("equal"); ax.axis("off")
     d = os.path.join(SP, run); os.makedirs(d, exist_ok=True)
     fig.savefig(os.path.join(d, f"u{u}.png"), dpi=100, facecolor=PAGE)
