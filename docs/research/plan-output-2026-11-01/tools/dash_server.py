@@ -327,6 +327,32 @@ def live_meta(name):
     return out
 
 
+def spots_runs():
+    """(11-20, the user: "쭈르르륵 드래그하면 어디박았는지 볼 수 있게") runs with exam collision maps (tools/spots_frames.py), newest first"""
+    d = os.path.join(OUT, "spots")
+    out = []
+    for r in os.listdir(d) if os.path.isdir(d) else []:
+        p = os.path.join(d, r, "index.json")
+        if os.path.isfile(p):
+            out.append({"name": r, "age": time.time() - os.path.getmtime(p)})
+    return sorted(out, key=lambda r: r["age"])
+
+
+def spots(name):
+    """a run's exam collision maps, the runs it was continued from first (each up to the update it was taken at)"""
+    from run_chain import parent
+    frames, cur, cut = [], name, None
+    for _ in range(10):
+        p = os.path.join(OUT, "spots", cur, "index.json")
+        rows = json.load(open(p)) if os.path.isfile(p) else []
+        frames = [r for r in rows if cut is None or r["u"] <= cut] + frames
+        par, c = parent(cur)
+        if not par:
+            break
+        cur, cut = par, c
+    return {"frames": frames}
+
+
 def live_runs():
     """runs that write the live view, newest first"""
     out = []
@@ -418,6 +444,12 @@ class H(BaseHTTPRequestHandler):
                                    "mtime": os.path.getmtime(p_) if os.path.exists(p_) else None})
             if u.path == "/api/live_runs":
                 return self._json(memo("live_runs", 5, live_runs))
+            if u.path == "/api/spots_runs":
+                return self._json(memo("spots_runs", 20, spots_runs))
+            if u.path == "/api/spots":
+                if not re.fullmatch(r"[A-Za-z0-9_]+", name or ""):
+                    return self._send(404, json.dumps({"error": "no such run"}))
+                return self._json(memo(("spots", name), 20, lambda: spots(name)))
             if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes", "/api/overview") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":

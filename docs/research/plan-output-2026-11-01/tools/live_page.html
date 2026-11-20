@@ -89,6 +89,22 @@
     .strip { flex: none; height: 150px; }
     .key { right: 14px; bottom: 44px; }
   }
+  /* (11-20, the user: "저 이미지 추이들을 ... 실시간에다가 계속 업로드 ... 쭈르르륵 드래그하면 어디박았는지 볼 수 있게") the exam's
+     collision map per checkpoint: the header button swaps the live view for it; one slider over the checkpoints (the runs it was
+     continued from first), a strip of hard contacts per checkpoint above it (click a bar to jump), arrows step */
+  #spots { display: none; grid-column: 1 / -1; min-height: 0; flex-direction: column; gap: 8px; padding: 10px 12px; }
+  body.spotmode main > .mapwrap, body.spotmode main > .side { display: none; }
+  body.spotmode #spots { display: flex; }
+  #b_spots.on, .viewbar button.on { color: var(--ink); border-color: var(--ink-2); }
+  .sp_top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .sp_info { font-size: 14px; color: var(--ink); }
+  .sp_info .m { color: var(--ink-2); }
+  .sp_info .w { color: var(--s-opp); } .sp_info .b { color: var(--warning); }
+  .sp_body { flex: 1; min-height: 0; display: flex; justify-content: center; }
+  .sp_body img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 6px; }
+  #sp_strip { width: 100%; height: 54px; display: block; cursor: pointer; }
+  #sp_slider { width: 100%; accent-color: var(--s-car); }
+  .sp_ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -102,6 +118,7 @@
   <span class="pill" id="ep">-</span>
   <span class="pill" id="opp">-</span>
   <span class="grow"></span>
+  <button id="b_spots" title="시험(같은 128판)에서 세게 닿은 자리를 checkpoint마다 -- 슬라이더를 끌어 넘겨 봄">시험 충돌 지도</button>
 </header>
 <main>
   <section class="panel mapwrap">
@@ -132,6 +149,17 @@
     <div class="panel strip"><h3>기억 변화량 <span class="note">GRU 128개 평균 변화 · 결정마다</span><span class="now" id="now_mc">-</span></h3>
       <div class="cv"><canvas id="c_mc"></canvas></div></div>
     <div class="panel" id="events"><h3>일어난 일</h3><div id="evlist"></div></div>
+  </section>
+  <section class="panel" id="spots">
+    <div class="sp_top">
+      <select id="sp_run" aria-label="시험 충돌 지도의 학습"></select>
+      <button id="sp_prev" aria-label="앞 checkpoint">◀</button><button id="sp_next" aria-label="다음 checkpoint">▶</button>
+      <span class="sp_info" id="sp_info">-</span>
+    </div>
+    <div class="sp_body"><img id="sp_img" alt="시험 충돌 지도"></div>
+    <canvas id="sp_strip" aria-label="checkpoint별 세게 닿음 (세션당)"></canvas>
+    <input type="range" id="sp_slider" min="0" max="0" step="1" value="0" aria-label="checkpoint">
+    <div class="sp_ends"><span id="sp_first">-</span><span>빨강 = 벽 · 노랑 = 상자 · 파랑 = 차 (같은 시험 128판, 세게 닿은 자리) · 막대 = 세션당 세게 닿음</span><span id="sp_last">-</span></div>
   </section>
 </main>
 <script>
@@ -498,6 +526,76 @@ async function frame() {
   }
   requestAnimationFrame(() => frame().catch(() => requestAnimationFrame(frame)));
 }
+
+const SP = { frames: [], i: -1, run: "", open: false, imgs: {} };
+async function spRuns() {
+  const r = await (await fetch("/api/spots_runs", { cache: "no-store" })).json();
+  const sel = $("sp_run"), cur = SP.run || RUN;
+  sel.innerHTML = r.map((x) => `<option value="${x.name}">${x.name}</option>`).join("");
+  SP.run = r.some((x) => x.name === cur) ? cur : (r[0] ? r[0].name : "");
+  sel.value = SP.run;
+}
+async function spLoad(jumpLast) {
+  if (!SP.run) return;
+  const r = await (await fetch(`/api/spots?run=${encodeURIComponent(SP.run)}`, { cache: "no-store" })).json();
+  const atLast = SP.i < 0 || SP.i >= SP.frames.length - 1;
+  SP.frames = r.frames || [];
+  for (const f of SP.frames) {                                   // preload: dragging must not wait for the network
+    const k = `${f.run}/${f.u}/${f.mtime}`;
+    if (!SP.imgs[k]) { const im = new Image(); im.src = `/file?path=spots/${f.run}/u${f.u}.png&v=${f.mtime}`; SP.imgs[k] = im; }
+  }
+  const sl = $("sp_slider");
+  sl.max = Math.max(0, SP.frames.length - 1);
+  if (jumpLast || atLast || SP.i >= SP.frames.length) SP.i = SP.frames.length - 1;
+  $("sp_first").textContent = SP.frames.length ? `${SP.frames[0].run} u${SP.frames[0].u}` : "-";
+  $("sp_last").textContent = SP.frames.length ? `${SP.frames[SP.frames.length - 1].run} u${SP.frames[SP.frames.length - 1].u}` : "-";
+  spShow();
+}
+function spShow() {
+  const f = SP.frames[SP.i];
+  if (!f) { $("sp_info").textContent = "이 학습에는 아직 시험 기록이 없습니다"; $("sp_img").removeAttribute("src"); spStrip(); return; }
+  $("sp_slider").value = SP.i;
+  $("sp_img").src = `/file?path=spots/${f.run}/u${f.u}.png&v=${f.mtime}`;
+  $("sp_info").innerHTML = `<b>${f.run} u${f.u}</b> <span class="m">·</span> 세게 닿음 <b>${f.hard}</b>번 ` +
+    `(<span class="w">벽 ${f.wall}</span> · <span class="b">상자 ${f.box}</span>${f.car ? ` · 차 ${f.car}` : ""}) ` +
+    `<span class="m">· 세션당 ${f.per_session.toFixed(2)} · 빈 트랙 90초 ${f.empty_m.toFixed(0)} m</span>`;
+  spStrip();
+}
+function spStrip() {
+  const cv = $("sp_strip"), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const n = SP.frames.length; if (!n) return;
+  const mx = Math.max(0.5, ...SP.frames.map((f) => f.per_session)), bw = w / n;
+  SP.frames.forEach((f, k) => {
+    const x = k * bw, bh = Math.max(2, (h - 14) * Math.sqrt(f.per_session / mx));    // square-root height: 0.05 and 5 both readable
+    const wf = f.hard ? f.wall / f.hard : 0;
+    g.fillStyle = k === SP.i ? C.ink : (wf > 0.5 ? C["s-opp"] : C.warning);
+    g.globalAlpha = k === SP.i ? 1 : 0.75;
+    g.fillRect(x + bw * 0.15, h - bh, Math.max(1, bw * 0.7), bh);
+    if (k > 0 && SP.frames[k - 1].run !== f.run) { g.globalAlpha = 1; g.fillStyle = "#898781"; g.fillRect(x - 0.5, 0, 1, h); }
+  });
+  g.globalAlpha = 1;
+}
+function spOpen(on) {
+  SP.open = on; document.body.classList.toggle("spotmode", on); $("b_spots").classList.toggle("on", on);
+  if (on) spRuns().then(() => spLoad(true)).catch(() => {});
+}
+$("b_spots").onclick = () => spOpen(!SP.open);
+$("sp_run").onchange = () => { SP.run = $("sp_run").value; SP.i = -1; spLoad(true).catch(() => {}); };
+$("sp_slider").oninput = () => { SP.i = +$("sp_slider").value; spShow(); };
+$("sp_prev").onclick = () => { if (SP.i > 0) { SP.i--; spShow(); } };
+$("sp_next").onclick = () => { if (SP.i < SP.frames.length - 1) { SP.i++; spShow(); } };
+$("sp_strip").onclick = (e) => { const n = SP.frames.length; if (!n) return; SP.i = Math.min(n - 1, Math.max(0, Math.floor(e.offsetX / ($("sp_strip").clientWidth / n)))); spShow(); };
+document.addEventListener("keydown", (e) => {
+  if (!SP.open || e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft") { $("sp_prev").onclick(); e.preventDefault(); }
+  if (e.key === "ArrowRight") { $("sp_next").onclick(); e.preventDefault(); }
+});
+window.addEventListener("resize", () => { if (SP.open) spStrip(); });
+setInterval(() => { if (SP.open) spLoad(false).catch(() => {}); }, 60000);
+if (new URLSearchParams(location.search).get("spots")) spOpen(true);
 
 (async () => {
   await loadRuns();
