@@ -191,6 +191,10 @@ class PlanReward:
         self.plan_hit_wall_n = None
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
+        #: (11-21, plan_rl --shaping-fade) the weight of the distance shaping: 1 = as agreed 11-07, 0 = the lap bonus alone
+        #: (the user: "왜 그따구로 설계한거지? 랩타임 보상으로 갈아끼우기로 하지않았나" -- the shaping fixed the line on the shortest
+        #: path while the car was slow, and PPO never left it)
+        self.shaping_w = 1.0
         # (11-13) the stall price of 11-06 ("--stall-mode progress"): each second the car's progress over the last
         # `stall_window_s` falls short of `stall_vmin` [m/s] costs `stall_s` seconds x the shortfall's share; 0 = off.
         # Progress = the drop of the walls-only distance left, so standing, rocking and going the wrong way all pay, and a
@@ -329,7 +333,7 @@ class PlanReward:
         jump = d - self.d_prev
         lap = (jump > 0.5 * L).float() - (jump < -0.5 * L).float()   # the car crossed the line forwards / backwards
         phi = self._phi_pts(pts, d)
-        shaping = self.gamma * phi - self.phi
+        shaping = self.shaping_w * (self.gamma * phi - self.phi)
         if restarted is not None:
             shaping = torch.where(restarted, torch.zeros_like(shaping), shaping)
             lap = torch.where(restarted, torch.zeros_like(lap), lap)

@@ -690,6 +690,10 @@ def main(argv=None):
                     help="v2: the exploration noise's floor on the first step's turn output (11-20, the user: '한번 편향이 잡히면 거기서 "
                          "엎치락뒤치락'; it had shrunk 0.31 (u100) -> 0.06 (qual26v u725) and the driven line moved only +-0.15 m under "
                          "training's noise). 0 = none")
+    ap.add_argument("--shaping-fade", default="",
+                    help="U0,U1 (11-21, the user: \"랩타임 보상으로 갈아끼우기로 하지않았나\" -> \"ㅇㅇ\"): the distance shaping keeps its "
+                         "weight until update U0 and fades linearly to 0 at U1 -- after that the reward is the lap bonus (lap time) and "
+                         "the contact costs only")
     ap.add_argument("--session-groups", default="",
                     help="EMPTY,BOX,LONG_S,RM_LO,RM_HI (11-21, the user: \"빈 트랙만 계속 달리는 차들도 있고 에피소드 존나 길게 가져가서 "
                          "장애물 몇분 치우고나서 몇분인 차들도 있고\", \"시간배분도 차마다 다르게\"; the goal: \"미리 알고 미리 라인 다르게 "
@@ -1202,6 +1206,9 @@ def main(argv=None):
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1 + args.update_offset, args.updates + 1):
+        if args.shaping_fade:                                       # --shaping-fade: the distance shaping's weight this update
+            _f0, _f1 = (float(x_) for x_ in args.shaping_fade.split(","))
+            pr.shaping_w = 1.0 - min(1.0, max(0.0, (upd - _f0) / max(1.0, _f1 - _f0)))
         if online_on and upd > 1 + args.update_offset:
             # (11-18) the line the boxes are kept on this rollout: the bins measured often enough, older laps fading
             if dist is not None:
