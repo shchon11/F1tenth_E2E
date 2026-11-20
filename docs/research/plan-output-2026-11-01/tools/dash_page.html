@@ -173,7 +173,7 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     <details style="margin-top:10px"><summary>이 run 설명</summary><div class="note" id="notefull"></div><pre id="hdr"></pre></details>
   </div>
 
-  <div id="sec_table"><div class="sec"><h2>학습 표</h2><span class="sub">같은 checkpoint끼리 · 차 = run − 비교 run (초록 = run이 나음)</span></div>
+  <div id="sec_table" hidden><div class="sec"><h2>학습 표</h2><span class="sub">같은 checkpoint끼리 · 차 = run − 비교 run (초록 = run이 나음)</span></div>
   <div class="card"><div class="tw" id="table"></div><div class="more" id="table_more"></div><div id="table_raw" hidden></div></div></div>
 
   <div id="sec_edge"><div class="sec"><h2>edge case</h2><span class="sub">길 위 상자 통과 중 세게 닿은 비율 % (통과 수)</span></div>
@@ -455,7 +455,7 @@ async function loadSlow() {
   j(`/api/header?run=${run}`).then((h) => { $("hdr").textContent = h.text || ""; $("hdr").hidden = !h.text; });
   Promise.all([j(`/api/table?run=${run}`), ref && ref !== run ? j(`/api/table?run=${ref}`) : Promise.resolve({rows: []})]).then(([T0, T1]) => {
     const t = T0.rows || [], tr = T1.rows || [], inh = new Set(T0.inherited || []);
-    $("sec_table").hidden = !t.length;                              // (11-21) an empty section is not shown at all
+    $("sec_table").hidden = true;                                   // (11-21) the old core-eval table: no longer made (exam2 maps are on /live)
     if (!t.length) { $("table").innerHTML = ""; $("table_raw").innerHTML = ""; $("table_more").innerHTML = ""; return; }
     $("table_raw").innerHTML = "<table><tr>" + t[0].map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>" +
       t.slice(1).map((r) => `<tr class="${inh.has(r[0]) ? "inh" : ""}">` + r.map((c, i) => `<td class="${i < 4 ? "num" : ""}" style="${i >= 4 ? "text-align:left;white-space:normal" : ""}">${esc(c)}</td>`).join("") + "</tr>").join("") + "</table>";
