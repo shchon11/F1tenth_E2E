@@ -552,6 +552,10 @@ def main(argv=None):
                     help="with --init --init-critic: count updates on from this one (11-14: a run forked from a checkpoint numbers its "
                          "updates and checkpoints as the parent did, the lr schedule continues where it was; no optimizer state is "
                          "saved, so Adam starts afresh)")
+    ap.add_argument("--noise-corr-free", type=float, default=0.0,
+                    help="with --noise-corr-box/-car: the steering noise everywhere else is held with this AR(1) coefficient "
+                         "(0 = a fresh draw every decision, as before). 11-20: the line froze by u100 and training's noise moved "
+                         "the driven line only +-0.15 m; 0.95 = half gone after 1.4 s, about one corner")
     ap.add_argument("--noise-corr-ramp", default="",
                     help="U0,U1: --noise-corr starts at 0 (white) and reaches its value linearly from update U0 to U1 (11-14: held "
                          "noise from update 1 stood a fresh policy still -- plan26m u25 drove 1 m in 90 s; at u150 it costs only "
@@ -678,6 +682,10 @@ def main(argv=None):
     ap.add_argument("--mem-keep-log", action="store_true", help="with --mem-keep-s: as many values per octave of keep time")
     ap.add_argument("--speed-std-floor", type=float, default=0.0,
                     help="v2: the exploration noise's floor on the first step's speed output (11-09: it had shrunk to 0.17)")
+    ap.add_argument("--steer-std-floor", type=float, default=0.0,
+                    help="v2: the exploration noise's floor on the first step's turn output (11-20, the user: '한번 편향이 잡히면 거기서 "
+                         "엎치락뒤치락'; it had shrunk 0.31 (u100) -> 0.06 (qual26v u725) and the driven line moved only +-0.15 m under "
+                         "training's noise). 0 = none")
     ap.add_argument("--removal-p", type=float, default=-1.0,
                     help="the share of races whose obstacles are taken away mid-episode (-1 = the world's `removal_p`; 0 = none). "
                          "11-09: plan_rl never ran it, so no plan policy had seen the competition's removal")
@@ -926,6 +934,10 @@ def main(argv=None):
     _O0 = [k for i, k in enumerate(_PK) if i not in _PD].index("opp0_present")   # the nearest car's columns in the critic's input
     if args.noise_corr_steer:
         noise_rho[PS.N_STEP:] = 0.0                                 # the speed outputs: a fresh draw every decision
+    noise_rho_free = torch.zeros(PS.ACT_DIM, device=dev)           # --noise-corr-free: away from boxes / cars, steering only
+    noise_rho_free[:PS.N_STEP] = float(args.noise_corr_free)
+    if args.noise_corr_free > 0 and not (args.noise_corr_box or args.noise_corr_car):
+        raise SystemExit("--noise-corr-free is for the rows away from --noise-corr-box/-car (without them --noise-corr holds everywhere)")
     stall_on = bool(args.noise_corr_stall)
     st_k, st_rho = 0, 0.0
     if stall_on:
@@ -1007,6 +1019,8 @@ def main(argv=None):
     rl_idx = torch.nonzero(rl_mask)[:, 0]
     if args.speed_std_floor > 0:
         actor.log_std_floor[PS.N_STEP] = math.log(args.speed_std_floor)        # the first step's speed: the one driven
+    if args.steer_std_floor > 0:
+        actor.log_std_floor[0] = math.log(args.steer_std_floor)                # the first step's turn: the one driven
     if args.box_memory and not (args.memory and args.mem_front and v2):
         raise SystemExit("--box-memory needs --memory --mem-front (v2)")
     if args.memory:
@@ -1273,7 +1287,7 @@ def main(argv=None):
                         if args.noise_corr_car:
                             _o = pv_[:, _O0:_O0 + 3].float()               # nearest car: present, dx/5, dy/5 (car frame)
                             _near |= (_o[:, 0] > 0.5) & (_o[:, 1] * 5.0 >= ncc_lo) & (_o[:, 1] * 5.0 <= ncc_hi) & ((_o[:, 2] * 5.0).abs() < 1.5)
-                        rho_t = noise_rho[None, :] * _near[:, None].float()
+                        rho_t = torch.where(_near[:, None], noise_rho[None, :], noise_rho_free[None, :])
                         nc_near += float(_near.float().mean())
                     if stall_on:                                   # a car that has stood: its speed noise held (11-16)
                         _st = stuck_now if args.stuck_noise > 0 else (still_n >= st_k)

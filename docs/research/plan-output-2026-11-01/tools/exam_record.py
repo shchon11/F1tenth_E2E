@@ -63,6 +63,18 @@ WIPE = os.environ.get("F1SIM_EXAM_WIPE", "")
 # "rand:P:L:R" freezes L decisions from a random start (chance P a decision) in races WITHOUT an opponent -- the cost of a
 # stale memory alone. The frozen rows go to the record ("frozen")
 FREEZE = os.environ.get("F1SIM_EXAM_FREEZE", "")
+# (11-19) "1": the box memory (`Actor2.box_memory`, plan_rl --box-memory) cleared before every decision -- the policy drives
+# with the box GRU reading only the scan of the moment, nothing remembered of the boxes (does the policy lean on it?)
+WIPE_BOX = os.environ.get("F1SIM_EXAM_WIPE_BOX", "") == "1"
+# (11-20, the user: "한번 편향이 잡히면 거기서 엎치락뒤치락") "1": drive SAMPLED plans with the policy's own exploration noise, as in
+# training (on the empty track the training noise is drawn afresh every decision: --noise-corr-box/-car hold it only near a box
+# or a car) -- how far from its line does training ever take the car?
+SAMPLE = os.environ.get("F1SIM_EXAM_SAMPLE", "") == "1"
+# (11-20) with SAMPLE, as plan_rl's exploration: only the first step's turn and speed get noise (its rl_mask), the turn's noise
+# held AR(1) with this rho (plan_rl --noise-corr; 0 = a fresh draw every decision) and its std floored at this many (plan_rl's
+# log_std_floor; 0 = the policy's own): how far from its line can exploration take the car?
+NOISE_RHO = float(os.environ.get("F1SIM_EXAM_NOISE_RHO", "0") or 0)
+STEER_STD_FLOOR = float(os.environ.get("F1SIM_EXAM_STEER_STD_FLOOR", "0") or 0)
 # (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
 # the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
 CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
@@ -151,6 +163,8 @@ if mode == "track":
                             grip=M.GRIP_LEVELS.index(1.0), wheelbase=float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"]))
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
 actor = load_actor2(ck, dev)
+if STEER_STD_FLOOR > 0:                     # the first step's turn: exploration at least this wide (plan_rl's log_std_floor)
+    actor.log_std_floor[0] = float(np.log(STEER_STD_FLOOR))
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
 
 
@@ -327,6 +341,8 @@ for kd in range(T):
         if getattr(obs, "mem_h", None) is not None:
             obs.mem_h[_wipe] = 0.0
         R.setdefault("wiped", []).append(_wipe.cpu())
+    if WIPE_BOX and getattr(actor, "box_memory", 0) and getattr(obs, "mem_h", None) is not None:
+        obs.mem_h[:, actor.memory_main:] = 0.0
     if FREEZE:
         _f = FREEZE.split(":")
         _near = (~absent[others]) & ((env.sim.state[lid, :2] - env.sim.state[others, :2]).norm(dim=1) < float(_f[-1]))
@@ -342,7 +358,18 @@ for kd in range(T):
         h_prev = obs.mem_h.clone() if getattr(obs, "mem_h", None) is not None else None
         R.setdefault("frozen", []).append(_fz.cpu())
     cmd_d0 = obs.cmd_d.clone()
-    _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
+    _eps = None
+    if SAMPLE:
+        if "_eps_n" not in globals() or _eps_n.shape[0] != obs.scans.shape[0]:
+            _eps_n = torch.randn(obs.scans.shape[0], PS.ACT_DIM, device=obs.scans.device)
+        _rs = env_restarted if "env_restarted" in globals() and env_restarted is not None else None
+        _fresh = torch.randn_like(_eps_n)
+        _eps_n[:, 0] = NOISE_RHO * _eps_n[:, 0] + (1.0 - NOISE_RHO ** 2) ** 0.5 * _fresh[:, 0]
+        _eps_n[:, 1:] = _fresh[:, 1:]
+        if _rs is not None:
+            _eps_n[_rs] = torch.randn_like(_eps_n[_rs])
+        _eps = torch.zeros_like(_eps_n); _eps[:, 0] = _eps_n[:, 0]; _eps[:, PS.N_STEP] = _eps_n[:, PS.N_STEP]
+    _, mean, _, v_hat, p = plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps)
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
@@ -411,7 +438,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["wipe"] = np.array(WIPE); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
+D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
