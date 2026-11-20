@@ -92,17 +92,24 @@
   /* (11-20, the user: "저 이미지 추이들을 ... 실시간에다가 계속 업로드 ... 쭈르르륵 드래그하면 어디박았는지 볼 수 있게") the exam's
      collision map per checkpoint: the header button swaps the live view for it; one slider over the checkpoints (the runs it was
      continued from first), a strip of hard contacts per checkpoint above it (click a bar to jump), arrows step */
-  #spots { display: none; grid-column: 1 / -1; min-height: 0; flex-direction: column; gap: 8px; padding: 10px 12px; }
+  #spots { display: none; grid-column: 1 / -1; min-height: 0; flex-direction: column; gap: 6px; padding: 8px 10px; }
   body.spotmode main > .mapwrap, body.spotmode main > .side { display: none; }
   body.spotmode #spots { display: flex; }
+  /* (11-21, the user on the phone: "너무커") the map fits what is left of the screen under the controls, no page scroll; the
+     live view's progress pills are hidden while the maps are shown */
+  body.spotmode main { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  body.spotmode #spots { flex: 1; }
+  body.spotmode header .pill, body.spotmode header .prog { display: none; }
+  @media (max-width: 900px) { body.spotmode { height: 100vh; height: 100dvh; overflow: hidden; } }
   #b_spots.on, .viewbar button.on { color: var(--ink); border-color: var(--ink-2); }
   .sp_top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
   .sp_info { font-size: 14px; color: var(--ink); }
   .sp_info .m { color: var(--ink-2); }
   .sp_info .w { color: var(--s-opp); } .sp_info .b { color: var(--warning); }
   .sp_body { flex: 1; min-height: 0; display: flex; justify-content: center; }
-  .sp_body img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 6px; }
-  #sp_strip { width: 100%; height: 54px; display: block; cursor: pointer; }
+  .sp_body img { height: 100%; width: auto; max-width: 100%; object-fit: contain; border-radius: 6px; }
+  #sp_strip { width: 100%; height: 40px; display: block; cursor: pointer; flex: none; }
+  #sp_slider { flex: none; }
   #sp_slider { width: 100%; accent-color: var(--s-car); }
   .sp_ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
 </style>
@@ -156,10 +163,10 @@
       <button id="sp_prev" aria-label="앞 checkpoint">◀</button><button id="sp_next" aria-label="다음 checkpoint">▶</button>
       <span class="sp_info" id="sp_info">-</span>
     </div>
-    <div class="sp_body"><img id="sp_img" alt="시험 충돌 지도"></div>
     <canvas id="sp_strip" aria-label="checkpoint별 세게 닿음 (세션당)"></canvas>
     <input type="range" id="sp_slider" min="0" max="0" step="1" value="0" aria-label="checkpoint">
-    <div class="sp_ends"><span id="sp_first">-</span><span>빨강 = 벽 · 노랑 = 상자 · 파랑 = 차 (같은 시험 128판, 세게 닿은 자리) · 막대 = 세션당 세게 닿음</span><span id="sp_last">-</span></div>
+    <div class="sp_ends"><span id="sp_first">-</span><span>빨강 벽 · 노랑 상자 · 파랑 차 · 막대 = 세션당 세게 닿음</span><span id="sp_last">-</span></div>
+    <div class="sp_body"><img id="sp_img" alt="시험 충돌 지도"></div>
   </section>
 </main>
 <script>
