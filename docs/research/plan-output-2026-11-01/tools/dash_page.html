@@ -170,21 +170,20 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     </div>
     <div class="kpis" id="kpis"></div>
     <div class="note" id="runnote"></div>
-    <details style="margin-top:10px"><summary>이 run의 질문 · 근거 · 판정 기준</summary><pre id="hdr"></pre></details>
+    <details style="margin-top:10px"><summary>이 run 설명</summary><div class="note" id="notefull"></div><pre id="hdr"></pre></details>
   </div>
 
-  <div class="sec"><h2>학습 표</h2><span class="sub">plan대로 정확히 실행 · 같은 checkpoint끼리 · 차 = run − 비교 run (낮을수록 좋음: 초록 = run이 나음)</span></div>
-  <div class="card"><div class="tw" id="table"></div><div class="more" id="table_more"></div>
-    <details style="margin-top:8px"><summary>원본 표 (기억 비교 칸 포함)</summary><div class="tw" id="table_raw"></div></details></div>
+  <div id="sec_table"><div class="sec"><h2>학습 표</h2><span class="sub">같은 checkpoint끼리 · 차 = run − 비교 run (초록 = run이 나음)</span></div>
+  <div class="card"><div class="tw" id="table"></div><div class="more" id="table_more"></div><div id="table_raw" hidden></div></div></div>
 
-  <div class="sec"><h2>edge case</h2><span class="sub">frozen exam · 달리던 길 위 상자 통과 중 세게 닿은 비율 % (통과 수) · 마지막 두 줄은 세션 비율</span></div>
-  <div class="card"><div class="tw" id="edge"></div><div class="more" id="edge_more"></div></div>
+  <div id="sec_edge"><div class="sec"><h2>edge case</h2><span class="sub">길 위 상자 통과 중 세게 닿은 비율 % (통과 수)</span></div>
+  <div class="card"><div class="tw" id="edge"></div><div class="more" id="edge_more"></div></div></div>
 
   <div class="sec"><h2>학습 중 기록</h2><span class="sub">학습 rollout (탐색 잡음 포함)</span>
     <span class="legend" id="legend"></span><span class="sub" id="xnote"></span></div>
   <div class="zbar" id="zbar"><label title="TensorBoard처럼 지수 이동 평균(앞부분 치우침 보정). 0 = 원래 값" style="margin-right:12px">EMA <input type="range" id="ema" min="0" max="0.99" step="0.01" value="0.8" style="width:140px;vertical-align:middle"> <b id="ema_v">0.80</b></label><span>가로 범위</span>
     <button data-z="cmp" class="on">비교 구간</button><button data-z="all">전체</button><button data-z="fork">재개 이후</button><button data-z="last200">마지막 200 update</button><button data-z="last50">마지막 50</button>
-    <span>· 그래프에서 끌면 그 구간 확대 · Shift+끌기 이동 · Ctrl+휠 확대·축소 · 두 번 클릭 전체 · 범례 누르면 그 run 숨김 (모든 그래프가 같이 움직임)</span></div>
+</div>
   <div class="charts">
     <div class="card"><h3>바퀴 / 분</h3><div class="cbox"><canvas id="c_laps"></canvas></div></div>
     <div class="card"><h3>평균 속도 <span class="sub">m/s</span></h3><div class="cbox"><canvas id="c_speed"></canvas></div></div>
@@ -360,14 +359,12 @@ async function loadLive() {
     const s = r.status, L = r.last || {}, pct = s.total ? 100 * s.update / s.total : 0;
     const from = r.parent ? `${esc(r.parent)} u${r.cut}에서 이어` : "처음부터";
     return `<div class="card runcard ${r.name === cur ? "sel" : ""}" data-run="${esc(r.name)}">
-      <div class="top"><span class="name">${esc(r.name)}</span><span class="chip live">학습 중</span>
-        <span class="chip">${esc(mapName(r.map))}</span><span class="chip">${from}</span></div>
-      <div class="prog"><span>u${s.update} / ${s.total ?? "?"}</span><span>${s.s_per_update ? f1(s.s_per_update) + " s/update · 끝 " + (s.eta ? fmtClock(s.eta) : "–") : "속도 재는 중"}</span></div>
+      <div class="top"><span class="name">${esc(r.name)}</span><span class="chip live">학습 중</span><span class="chip">${from}</span></div>
+      <div class="prog"><span>u${s.update}</span></div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="mini"><div><span>바퀴/분</span><b>${f1(L.laps_per_min, 2)}</b></div><div><span>속도 m/s</span><b>${f1(L.speed, 2)}</b></div>
         <div><span>서 있음</span><b>${L.stopped == null ? "–" : f1(100 * L.stopped, 0) + " %"}</b></div></div>
-      <div class="cline">접촉/분 &nbsp;벽 <b>${f1(L.contacts_wall_per_min, 2)}</b> · 상자 <b>${f1(L.contacts_prop_per_min, 2)}</b> · 차 <b>${f1(L.contacts_car_per_min, 2)}</b></div>
-      ${r.note ? `<div class="note">${esc(r.note)}</div>` : ""}</div>`;
+      <div class="cline">접촉/분 &nbsp;벽 <b>${f1(L.contacts_wall_per_min, 2)}</b> · 상자 <b>${f1(L.contacts_prop_per_min, 2)}</b></div></div>`;
   }).join("") : '<div class="card empty">지금 도는 학습 없음</div>';
   document.querySelectorAll(".runcard").forEach((c) => c.onclick = () => {
     $("run").value = c.dataset.run; pickRef(); all(); window.scrollTo({top: $("run").getBoundingClientRect().top + scrollY - 80, behavior: "smooth"});
@@ -378,7 +375,7 @@ async function loadRuns() {
   const rs = await j("/api/runs");
   runsCache = rs;
   const run = q.get("run") || rs[0]?.name;
-  const opt = (r, cur) => `<option value="${esc(r.name)}" ${r.name === cur ? "selected" : ""}>${esc(r.name)}${r.alive ? " · 학습 중" : ""} · ${esc(mapName(r.map))}${r.parent ? ` · ${esc(r.parent)} u${r.cut}에서` : ""}</option>`;
+  const opt = (r, cur) => `<option value="${esc(r.name)}" ${r.name === cur ? "selected" : ""}>${esc(r.name)}${r.alive ? " · 학습 중" : ""}${r.parent ? ` · ${esc(r.parent)} u${r.cut}에서` : ""}</option>`;
   $("run").innerHTML = rs.map((r) => opt(r, run)).join("");
   pickRef(q.get("ref"));
 }
@@ -386,8 +383,9 @@ function pickRef(want) {
   const rs = runsCache, run = $("run").value, me = rs.find((r) => r.name === run);
   const same = rs.filter((r) => r.name !== run && r.map === me?.map);
   // default comparison: another run training now on the same map, else plan26l (Korea 2025's reference), else the newest same-map run
-  const ref = want || same.find((r) => r.alive)?.name || (same.find((r) => r.name === "plan26l") ? "plan26l" : same[0]?.name) || "";
-  $("ref").innerHTML = `<option value="">(없음)</option>` + rs.map((r) => `<option value="${esc(r.name)}" ${r.name === ref ? "selected" : ""}>${esc(r.name)}${r.alive ? " · 학습 중" : ""} · ${esc(mapName(r.map))}</option>`).join("");
+  // (11-21) default: the run's own control (out/run_refs.json), else none -- not whatever ran last on the same map
+  const ref = want || (me && me.ref && rs.some((r) => r.name === me.ref) ? me.ref : "");
+  $("ref").innerHTML = `<option value="">(없음)</option>` + rs.map((r) => `<option value="${esc(r.name)}" ${r.name === ref ? "selected" : ""}>${esc(r.name)}${r.alive ? " · 학습 중" : ""}</option>`).join("");
 }
 function setUrl() { const u = new URL(location); u.searchParams.set("run", $("run").value); u.searchParams.set("ref", $("ref").value); history.replaceState(null, "", u); }
 
@@ -406,13 +404,11 @@ async function refresh() {
   const pct = s.total ? 100 * s.update / s.total : 0, L = own[own.length - 1] || {};
   const live = s.alive > 0 ? '<span class="chip live">학습 중</span>' : '<span class="chip">멈춤</span>';
   $("kpis").innerHTML = `
-    <div class="kpi"><span>상태</span>${live}<div><small>${s.jobs.length ? "평가 중: " + esc(s.jobs[0].split(" ")[0]) : "평가 대기"}</small></div></div>
-    <div class="kpi"><span>update</span><b>${s.update}</b> <small>/ ${s.total ?? "?"}</small><div class="bar" style="margin-top:6px"><div style="width:${pct.toFixed(1)}%"></div></div></div>
-    <div class="kpi"><span>update 하나</span><b>${s.s_per_update ? f1(s.s_per_update) : "–"}</b> <small>s</small></div>
-    <div class="kpi"><span>끝나는 시각</span><b>${s.eta && s.alive ? fmtClock(s.eta) : "–"}</b> <small>${s.eta && s.alive ? fmtDur(s.eta - Date.now() / 1000) + " 뒤" : ""}</small></div>
-    <div class="kpi"><span>바퀴/분 · 속도</span><b>${f1(L.laps_per_min, 2)}</b> <small>· ${f1(L.speed, 2)} m/s</small></div>
-    <div class="kpi"><span>마지막 기록</span><b style="font-size:15px">${fmtTime(s.last_mtime)}</b></div>`;
-  $("runnote").innerHTML = `<span class="chip">${esc(mapName(meta.map))}</span> ` + (meta.parent ? `${esc(meta.parent)} u${meta.cut}의 checkpoint에서 이어 시작 (u${meta.cut}까지 기록은 ${esc(meta.parent)} 것). ` : "") + esc(meta.note || "");
+    <div class="kpi"><span>상태</span>${live}</div>
+    <div class="kpi"><span>update</span><b>${s.update}</b></div>
+    <div class="kpi"><span>바퀴/분 · 속도</span><b>${f1(L.laps_per_min, 2)}</b> <small>· ${f1(L.speed, 2)} m/s</small></div>`;
+  $("runnote").innerHTML = meta.parent ? `${esc(meta.parent)} u${meta.cut}에서 이어 시작` : "처음부터";
+  $("notefull").textContent = meta.note || "";
   $("legend").innerHTML = `<span data-run="${esc(run)}" class="${HIDDEN.has(run) ? "off" : ""}"><span class="sw" style="border-color:var(--run);border-top-width:2.4px;opacity:.6"></span>${esc(run)}</span>` + (rr.length ? `<span data-run="${esc(ref)}" class="${HIDDEN.has(ref) ? "off" : ""}"><span class="sw" style="border-color:var(--ref);border-top-width:2px"></span>${esc(ref)}</span>` : "");
   LASTX = (own.length ? own[own.length - 1].update : 0) - offOf(run);
   {   // (11-16, the user: "주황색이 안보이네") the default view starts where the comparison run has data, so both lines show
@@ -456,10 +452,11 @@ async function refresh() {
 let tableAll = false, edgeAll = false;
 async function loadSlow() {
   const run = $("run").value, ref = $("ref").value;
-  j(`/api/header?run=${run}`).then((h) => { $("hdr").textContent = h.text || "(실행 스크립트 없음)"; });
+  j(`/api/header?run=${run}`).then((h) => { $("hdr").textContent = h.text || ""; $("hdr").hidden = !h.text; });
   Promise.all([j(`/api/table?run=${run}`), ref && ref !== run ? j(`/api/table?run=${ref}`) : Promise.resolve({rows: []})]).then(([T0, T1]) => {
     const t = T0.rows || [], tr = T1.rows || [], inh = new Set(T0.inherited || []);
-    if (!t.length) { $("table").innerHTML = '<span class="empty">아직 없음 (u25 평가 뒤에 생김)</span>'; $("table_raw").innerHTML = ""; $("table_more").innerHTML = ""; return; }
+    $("sec_table").hidden = !t.length;                              // (11-21) an empty section is not shown at all
+    if (!t.length) { $("table").innerHTML = ""; $("table_raw").innerHTML = ""; $("table_more").innerHTML = ""; return; }
     $("table_raw").innerHTML = "<table><tr>" + t[0].map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>" +
       t.slice(1).map((r) => `<tr class="${inh.has(r[0]) ? "inh" : ""}">` + r.map((c, i) => `<td class="${i < 4 ? "num" : ""}" style="${i >= 4 ? "text-align:left;white-space:normal" : ""}">${esc(c)}</td>`).join("") + "</tr>").join("") + "</table>";
     const num = (s) => { const m = String(s ?? "").match(/-?\d+(\.\d+)?/); return m ? +m[0] : null; };
@@ -486,7 +483,8 @@ async function loadSlow() {
   });
   const shiftE = offOf(run) - (ref ? offOf(ref) : 0);
   j(`/api/edge?run=${run}&ref=${ref}&shift=${shiftE}`).then((e) => {
-    if (!e.rows.length) { $("edge").innerHTML = '<span class="empty">아직 없음 (frozen exam 뒤에 생김)</span>'; $("edge_more").innerHTML = ""; return; }
+    $("sec_edge").hidden = !e.rows.length;
+    if (!e.rows.length) { $("edge").innerHTML = ""; $("edge_more").innerHTML = ""; return; }
     const rowsE = [...e.rows].sort((a, b) => b.u - a.u), shown = edgeAll ? rowsE : rowsE.slice(0, 3);
     const f = (v) => v ? `${v[1].toFixed(1)}${v[0] != null ? ` <span class="sub">(${v[0]})</span>` : ""}` : "–";
     $("edge").innerHTML = "<table><tr><th rowspan=2>상황</th>" + shown.map((r) => `<th colspan="2" class="grp">u${r.u}${shiftE ? ` · ${esc(ref)} u${r.ru}` : ""}</th>`).join("") + "</tr><tr>" +

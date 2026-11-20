@@ -74,13 +74,18 @@ def runs():
     out = []
     ps = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True).stdout
     notes = run_notes()
+    # (11-21) the run each run is judged against (out/run_refs.json {run: control}); the page's default comparison
+    try:
+        refs = json.load(open(f"{OUT}/run_refs.json"))
+    except (OSError, ValueError):
+        refs = {}
     for p in glob.glob(RUNS + "/*/progress.jsonl"):
         name = p.split("/")[-2]
         if not memo(("isplan", name), 3600, lambda: is_plan_run(name)):
             continue
         par, cut = parent(name)
         out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name), "alive": f"plan_rl --name {name} " in ps,
-                    "parent": par, "cut": cut, "note": notes.get(name, "")})
+                    "parent": par, "cut": cut, "note": notes.get(name, ""), "ref": refs.get(name, "")})
     out.sort(key=lambda r: (not r["alive"], -r["mtime"]))       # the runs training now first
     return out
 
