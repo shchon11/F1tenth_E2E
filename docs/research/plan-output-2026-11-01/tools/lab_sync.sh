@@ -2,9 +2,11 @@
 # (11-15 23:40, 11-16 00:05 고침) 다시 돌리면 최신 코드·checkpoint로 갱신. lab PC(tcar, WireGuard 10.100.0.2)에서 콘솔을 돌릴 수 있게:
 # 최신 코드(f1sim) + 콘솔 주요 checkpoint + 상자 배치 + 캐시 -> ~/F1tenth/console_main/run_console.sh
 # 터널 한 줄은 0.2 MB/s라 여러 줄로 보내되, 한꺼번에 12줄 넘게 열면 lab의 sshd가 연결을 끊음(MaxStartups) -> 5줄씩, 실패하면 3번까지 다시
-H=shchon11@10.100.0.2; SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
+H=${LAB_H:-lab};   # (11-20) Tailscale; the WireGuard path (shchon11@10.100.0.2) timed out from 14:43
+ SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 RUNS=/home/shchon11/f1sim_runs; L=/home/shchon11/F1tenth_E2E
-PICKS="pick_avg26s_u900 pick_kr26a_u550 watch_kr26e watch_kr26g watch_kr26d watch_kr26c watch_kr26b watch_kr26a watch_plan26t watch_plan25r pick_korea26_v2_limits pick_plan25b_u1200 pick_srp25tw3_u800 pick_sst26h3 pick_sst25gwt pick_iccas_s1102_u384"
+# (11-20, the user: "랩 콘솔 내다버린거냐") the console's own list, top 12 -- a fixed list here had gone stale (11-17 picks)
+PICKS=$(python3 -c "import json; print(' '.join(e['run'] for e in json.load(open('/home/shchon11/f1sim_runs/console_picks.json'))['picks'][:12]))")
 export H SSH RUNS L
 echo "$(date +%T) 시작"
 $SSH $H 'mkdir -p ~/F1tenth/console_main ~/f1sim_runs ~/.cache/f1sim/racelines ~/.cache/f1sim/map_lut ~/.cache/f1sim/centerlines'
