@@ -102,6 +102,10 @@
   body.spotmode header .pill, body.spotmode header .prog { display: none; }
   @media (max-width: 900px) { body.spotmode { height: 100vh; height: 100dvh; overflow: hidden; } }
   #b_spots.on, .viewbar button.on { color: var(--ink); border-color: var(--ink-2); }
+  /* (11-21, the user: "이 그림에 빈 트랙에서 라인이랑 속도 어떻게 가져가는지도 같이 plot좀. 한바퀴 최고시간도") the map's line = the empty
+     track's fastest lap, its speed in spots_frames.py's blue ramp (SPD, 1 -> 9 m/s) */
+  .sp_spd { display: inline-block; width: 48px; height: 6px; border-radius: 3px; vertical-align: middle;
+            background: linear-gradient(90deg, #256abf, #3987e5, #6da7ec, #9ec5f4, #cde2fb); }
   .sp_top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
   .sp_info { font-size: 14px; color: var(--ink); }
   .sp_info .m { color: var(--ink-2); }
@@ -165,7 +169,7 @@
     </div>
     <canvas id="sp_strip" aria-label="checkpoint별 세게 닿음 (세션당)"></canvas>
     <input type="range" id="sp_slider" min="0" max="0" step="1" value="0" aria-label="checkpoint">
-    <div class="sp_ends"><span>막대 = 시험 128판의 세게 닿음 (<span style="color:var(--s-opp)">빨강 벽</span> · <span style="color:var(--warning)">노랑 상자</span>) · 막대를 누르거나 끌어서 고름</span><span id="sp_first" hidden></span><span id="sp_last" hidden></span></div>
+    <div class="sp_ends"><span>막대 = 시험 128판의 세게 닿음 (<span style="color:var(--s-opp)">빨강 벽</span> · <span style="color:var(--warning)">노랑 상자</span>) · 막대를 누르거나 끌어서 고름<br>선 = 빈 트랙에서 가장 빠른 한 바퀴 · 색 = 속도 1 <span class="sp_spd"></span> 9 m/s · 숫자 = 코너 최저 · 최고 속도</span><span id="sp_first" hidden></span><span id="sp_last" hidden></span></div>
     <div class="sp_body"><img id="sp_img" alt="시험 충돌 지도"></div>
   </section>
 </main>
@@ -565,7 +569,8 @@ function spShow() {
   $("sp_img").src = `/file?path=spots/${f.run}/u${f.u}.png&v=${f.mtime}`;
   $("sp_info").innerHTML = `<b>${f.run} u${f.u}</b> <span class="m">·</span> 세게 닿음 <b>${f.hard}</b>번 ` +
     `(<span class="w">벽 ${f.wall}</span> · <span class="b">상자 ${f.box}</span>${f.car ? ` · 차 ${f.car}` : ""}) ` +
-    `<span class="m">· 세션당 ${f.per_session.toFixed(2)} · 빈 트랙 90초 ${f.empty_m.toFixed(0)} m</span>`;
+    `<span class="m">· 세션당 ${f.per_session.toFixed(2)} · 빈 트랙 90초 ${f.empty_m.toFixed(0)} m</span>` +
+    (f.best_lap != null ? ` <span class="m">·</span> 빈 트랙 최고 한 바퀴 <b>${f.best_lap.toFixed(2)} s</b>` : "");
   spStrip();
 }
 // (11-21, the user: "표는 왜이렇게 좆같이 만들어놓은거야" -- four blocks filling the width, no numbers, no axis) one thin bar per

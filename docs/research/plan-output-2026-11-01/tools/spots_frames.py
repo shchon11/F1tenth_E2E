@@ -13,13 +13,22 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rec_lib import Rec, plt  # noqa: E402
-from matplotlib.colors import ListedColormap  # noqa: E402
+from matplotlib.collections import LineCollection  # noqa: E402
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap  # noqa: E402
+import matplotlib.patheffects as pe  # noqa: E402
 
 OUT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out"))
 EX, SP = os.path.join(OUT, "exam"), os.path.join(OUT, "spots")
 # live_page.html's tokens: the lane, the walls, the page; hits in its critical red / box amber / car blue
 LANE, WALL, PAGE = "#22272e", "#0b0c0e", "#0d0f12"
 COLS = {0: "#e66767", 1: "#fab219", 2: "#3987e5"}
+# (11-21, the user: "이 그림에 빈 트랙에서 라인이랑 속도 어떻게 가져가는지도 같이 plot좀. 한바퀴 최고시간도") the empty track's
+# fastest lap drawn under the hits, its speed in one blue ramp (slow dark -> fast light, the same scale on every checkpoint);
+# VER marks the frames drawn with it, older ones are drawn again
+VER = 3
+SPD = ["#256abf", "#2a78d6", "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"]
+V0, V1 = 1.0, 9.0
+INK = "#e6edf3"
 
 
 def exams(run):
@@ -45,6 +54,41 @@ def empty_m(R):
     return float(dd.sum(0)[solo].mean())
 
 
+def best_lap(R):
+    """the empty-track sessions' fastest lap, line crossing to line crossing as exam_table.py counts laps:
+    (seconds, session, first decision, last decision) or None"""
+    z = R.z
+    lapsig = z["lap"]
+    solo = ~z["on"][:R.T].any(0) & ~(z["sid"][0] >= 0).any(-1)
+    net = np.cumsum(lapsig, 0)
+    best = None
+    for b in np.nonzero(solo)[0]:
+        hi, t_prev = 0, None
+        for t in np.nonzero(lapsig[:, b] > 0)[0]:
+            if net[t, b] > hi:
+                hi = net[t, b]
+                if t_prev is not None and not R.rs[t_prev:t + 1, b].any():
+                    sec = (t + 1 - t_prev) * R.dt
+                    if best is None or sec < best[0]:
+                        best = (sec, int(b), int(t_prev), int(t))
+                t_prev = t + 1
+    return best
+
+
+def speed_marks(v, w=6, drop=0.8):
+    """the slowest point of each corner (a local minimum the speed rises at least `drop` from on both sides; the lap is a loop,
+    so the windows wrap around the line) and the fastest point"""
+    n, out = len(v), []
+    vv = np.concatenate([v, v, v])
+    for i in range(n):
+        j = i + n
+        if v[i] <= vv[j - w: j + w + 1].min() + 1e-9 and vv[j - 3 * w: j + 1].max() - v[i] >= drop and \
+                vv[j: j + 3 * w + 1].max() - v[i] >= drop:
+            if not out or (i - out[-1] > w and out[0] + n - i > w):     # a flat bottom: its first point only
+                out.append(i)
+    return out + [int(np.argmax(v))]
+
+
 def frame(run, u, p):
     R = Rec(p)
     g, ext = R.grid(0)
@@ -60,19 +104,33 @@ def frame(run, u, p):
     ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor(PAGE)
     ax.imshow((g <= 0).astype(float), origin="lower", extent=ext, cmap=ListedColormap([LANE, WALL]), vmin=0, vmax=1,
               interpolation="nearest")
+    bl = best_lap(R)
+    if bl is not None:
+        _, b, t0, t1 = bl
+        xy = R.st[t0: t1 + 1, b, :2].astype(float)
+        v = np.abs(R.st[t0: t1 + 1, b, 3]).astype(float)
+        xc, vc = np.vstack([xy, xy[:1]]), np.append(v, v[0])          # closed at the line
+        lc = LineCollection(np.stack([xc[:-1], xc[1:]], 1), cmap=LinearSegmentedColormap.from_list("spd", SPD),
+                            norm=plt.Normalize(V0, V1), linewidths=3.0, capstyle="round", zorder=2)
+        lc.set_array(0.5 * (vc[:-1] + vc[1:]))
+        ax.add_collection(lc)
+        for i in speed_marks(v):
+            ax.annotate(f"{v[i]:.1f}", xy[i], xytext=(7, 4), textcoords="offset points", fontsize=13, fontweight="bold",
+                        color=INK, zorder=4, path_effects=[pe.withStroke(linewidth=3, foreground=PAGE)])
     n = {}
     for k, c in COLS.items():
         t, b = np.nonzero(hard[..., k] > 0)
         n[k] = int(len(t))
         if len(t):
-            ax.scatter(st[t, b, 0], st[t, b, 1], s=26, c=c, alpha=0.8, edgecolors="none")
+            ax.scatter(st[t, b, 0], st[t, b, 1], s=26, c=c, alpha=0.8, edgecolors="none", zorder=3)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect("equal"); ax.axis("off")
     d = os.path.join(SP, run); os.makedirs(d, exist_ok=True)
     fig.savefig(os.path.join(d, f"u{u}.png"), dpi=100, facecolor=PAGE)
     plt.close(fig)
     info = {"run": run, "u": int(u), "hard": n[0] + n[1] + n[2], "wall": n[0], "box": n[1], "car": n[2],
             "per_session": round((n[0] + n[1] + n[2]) / R.B, 3), "sessions": int(R.B), "empty_m": round(empty_m(R), 1),
-            "mtime": round(os.path.getmtime(p), 1)}
+            "mtime": round(os.path.getmtime(p), 1), "v": VER,
+            "best_lap": round(bl[0], 2) if bl is not None else None}
     json.dump(info, open(os.path.join(d, f"u{u}.json"), "w"), ensure_ascii=False)
     return info
 
@@ -85,7 +143,8 @@ def update(run):
     made = 0
     for u, p in sorted(ex.items()):
         js = os.path.join(d, f"u{u}.json")
-        if os.path.exists(js) and os.path.exists(os.path.join(d, f"u{u}.png")) and json.load(open(js)).get("mtime") == round(os.path.getmtime(p), 1):
+        if os.path.exists(js) and os.path.exists(os.path.join(d, f"u{u}.png")) and json.load(open(js)).get("mtime") == round(os.path.getmtime(p), 1) \
+                and json.load(open(js)).get("v") == VER:
             continue
         try:
             frame(run, u, p); made += 1
