@@ -369,7 +369,8 @@ for kd in range(T):
         if _rs is not None:
             _eps_n[_rs] = torch.randn_like(_eps_n[_rs])
         _eps = torch.zeros_like(_eps_n); _eps[:, 0] = _eps_n[:, 0]; _eps[:, PS.N_STEP] = _eps_n[:, PS.N_STEP]
-    _, mean, _, v_hat, p = plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps)
+    _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps) if _eps is not None      # plain exams: no new argument
+                            else plan_v2(actor, obs, lim, sample=SAMPLE))
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
