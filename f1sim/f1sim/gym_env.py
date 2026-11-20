@@ -1373,6 +1373,9 @@ class F1VecEnv:
         #: shortens `ecfg.max_steps`, which is still read live -- callers change it after
         #: construction (the episode-boundary tests do), and a copy taken at reset would miss that.
         self.ep_limit = torch.full((self.B,), self.NO_LIMIT, dtype=torch.long, device=self.device)
+        #: (11-21, plan_rl --session-groups) what a reset sets `ep_limit` to, per row: NO_LIMIT = `max_steps`, as before; a
+        #: shorter number = this row's episodes are that long (short sessions beside long ones in one batch)
+        self.ep_limit_base = torch.full((self.B,), self.NO_LIMIT, dtype=torch.long, device=self.device)
         #: Soft contacts begun this episode (onsets, as charged). Under `terminate` an episode holds
         #: at most one and it ends it, so `final["collided"]` counted them; under `soft` nothing
         #: ends and `collided` was always 0, which is what the training log printed as "0.0/km".
@@ -2649,7 +2652,7 @@ class F1VecEnv:
         for seat in self._seat_builders():
             seat.reset_actions(ids, self.prev_action)
         self.ep_step.index_fill_(0, ids, 0); self.ep_return.index_fill_(0, ids, 0.0); self.ep_progress.index_fill_(0, ids, 0.0)
-        self.ep_limit.index_fill_(0, ids, self.NO_LIMIT); self.ep_contacts.index_fill_(0, ids, 0.0)
+        self.ep_limit[ids] = self.ep_limit_base[ids]; self.ep_contacts.index_fill_(0, ids, 0.0)
         self.opponent_held.index_fill_(0, ids, False)  # a fresh car holds no car ahead
         self.lap_start_step.index_fill_(0, ids, 0); self.prev_lap.index_fill_(0, ids, 0)
         if self.ecfg.reward_lap_time > 0:

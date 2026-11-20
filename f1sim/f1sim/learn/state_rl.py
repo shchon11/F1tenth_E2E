@@ -1073,10 +1073,13 @@ class PropRemoval:
     the race. A removed prop is a dead slot like any unused one (`p_sid` -1, z_hi < z_lo, no mass): the beams, the contact test,
     the privileged obs, the corridor and the prop-aware opponents all read those. Call `step()` after every env step."""
 
-    def __init__(self, env, p: float, lo: float, hi: float, seed: int = 0):
-        self.env, self.p, self.lo, self.hi = env, float(p), float(lo), float(hi)
+    def __init__(self, env, p, lo, hi, seed: int = 0):
+        """`p`, `lo`, `hi`: numbers, or (R,) tensors -- one per race (11-21, plan_rl --session-groups: the long sessions take
+        their boxes away at their own time, the short ones as before)"""
         self.R = env.B // env.M
         dev = env.device
+        per = lambda x: (x.to(dev).float() if torch.is_tensor(x) else torch.full((self.R,), float(x), device=dev))
+        self.env, self.p, self.lo, self.hi = env, per(p), per(lo), per(hi)
         self.g = torch.Generator(device=dev); self.g.manual_seed(int(seed))
         self.t_rm = torch.full((self.R,), float("inf"), device=dev)
         self.removed = torch.zeros(self.R, dtype=torch.bool, device=dev)
@@ -1085,14 +1088,14 @@ class PropRemoval:
 
     def step(self):
         env, po = self.env, self.env.procedural
-        if po is None or self.p <= 0:
+        if po is None or not bool((self.p > 0).any()):
             return
         es = env.ep_step[self.first].long()
         new = es < self.prev                                              # this race's episode (and layout) began anew
         if bool(new.any()):
             n = int(new.sum())
-            draw = torch.rand(n, device=es.device, generator=self.g) < self.p
-            t = self.lo + (self.hi - self.lo) * torch.rand(n, device=es.device, generator=self.g)
+            draw = torch.rand(n, device=es.device, generator=self.g) < self.p[new]
+            t = self.lo[new] + (self.hi[new] - self.lo[new]) * torch.rand(n, device=es.device, generator=self.g)
             self.t_rm[new] = torch.where(draw, t, torch.full_like(t, float("inf")))
             self.removed[new] = False
         self.prev = es

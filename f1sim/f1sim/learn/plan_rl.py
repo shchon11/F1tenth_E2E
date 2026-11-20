@@ -690,6 +690,12 @@ def main(argv=None):
                     help="v2: the exploration noise's floor on the first step's turn output (11-20, the user: '한번 편향이 잡히면 거기서 "
                          "엎치락뒤치락'; it had shrunk 0.31 (u100) -> 0.06 (qual26v u725) and the driven line moved only +-0.15 m under "
                          "training's noise). 0 = none")
+    ap.add_argument("--session-groups", default="",
+                    help="EMPTY,BOX,LONG_S,RM_LO,RM_HI (11-21, the user: \"빈 트랙만 계속 달리는 차들도 있고 에피소드 존나 길게 가져가서 "
+                         "장애물 몇분 치우고나서 몇분인 차들도 있고\", \"시간배분도 차마다 다르게\"; the goal: \"미리 알고 미리 라인 다르게 "
+                         "가져가서 여러 상황에서도 가장 빠르고 안박게\"): that share of the races drives LONG_S-second episodes on the empty "
+                         "track, that share LONG_S-second episodes whose boxes go at a time drawn per race in RM_LO..RM_HI s, the rest "
+                         "the world's episodes as before (boxes as drawn, scene replay only there). e.g. 0.333,0.333,300,60,240")
     ap.add_argument("--removal-p", type=float, default=-1.0,
                     help="the share of races whose obstacles are taken away mid-episode (-1 = the world's `removal_p`; 0 = none). "
                          "11-09: plan_rl never ran it, so no plan policy had seen the competition's removal")
@@ -827,7 +833,33 @@ def main(argv=None):
         _slot = json.loads(json.load(open(args.world)).get("opp_slot", "") or "{}")
         _slot["speed_scale"] = [float(x_) for x_ in args.opp_scale.split(",")]
         ov["opp_slot"] = json.dumps(_slot)
+    sg = None
+    if args.session_groups:
+        sg = [float(x_) for x_ in args.session_groups.split(",")]
+        if len(sg) != 5 or not (0 <= sg[0] and 0 <= sg[1] and sg[0] + sg[1] <= 1 and sg[3] <= sg[4] < sg[2]):
+            raise SystemExit("--session-groups EMPTY,BOX,LONG_S,RM_LO,RM_HI: shares adding to <= 1, RM_LO <= RM_HI < LONG_S")
+        short_s = float(json.load(open(args.world)).get("episode_s", 40.0))
+        ov["episode_s"] = sg[2]                                     # the env's longest episode; the short races are cut below
     env, lim, world = build(args.world, args.envs, args.seed, dev, overrides=ov, fmt=args.format)
+    grp = None
+    if sg is not None:
+        # (11-21) races -> 0 long empty, 1 long with boxes taken away, 2 as before; spread over the batch (golden-ratio sequence,
+        # so each GPU's slice has all three) and fixed for the run
+        G_ = env.B // env.M
+        u_ = torch.remainder(torch.arange(G_, device=dev).float() * 0.6180339887 + 0.5 * float(args.dist_rank), 1.0)
+        grp = torch.where(u_ < sg[0], 0, torch.where(u_ < sg[0] + sg[1], 1, 2))
+        rows_g = grp.repeat_interleave(env.M)
+        k_ = max(1, int(getattr(env, "ep_align", 1)))
+        short_steps = int(round(short_s * 40.0)) // k_ * k_
+        env.ep_limit_base[rows_g == 2] = short_steps
+        env.procedural.force_use = torch.where(rows_g == 0, 0, torch.where(rows_g == 1, 1, -1)).to(dev)
+        env.reset(seed=args.seed)                                   # the first layouts again, drawn by group
+        s_r = torch.nonzero(grp == 2).flatten()                     # the short races' first episodes: staggered within their length
+        first = torch.randint(1, short_steps // k_ + 1, (int(s_r.numel()),), device=dev) * k_
+        rws = (s_r[:, None] * env.M + torch.arange(env.M, device=dev)[None, :]).reshape(-1)
+        env.ep_limit[rws] = first.repeat_interleave(env.M)
+        print(f"[plan_rl] session groups: {int((grp == 0).sum())} races {sg[2]:g} s empty, {int((grp == 1).sum())} races {sg[2]:g} s "
+              f"with boxes gone at {sg[3]:g}-{sg[4]:g} s, {int((grp == 2).sum())} races {short_s:g} s as before", flush=True)
     if args.opp_every > 0:
         env.opp_every = int(args.opp_every)
     lid = env.learner_ids; Bl = int(lid.numel())
@@ -901,6 +933,10 @@ def main(argv=None):
     rm_p = float(getattr(world, "removal_p", 0.0)) if args.removal_p < 0 else float(args.removal_p)
     rm_s = tuple(getattr(world, "removal_s", (10.0, 30.0)))
     remover = SR.PropRemoval(env, rm_p, float(rm_s[0]), float(rm_s[1]), seed=args.seed) if rm_p > 0 else None
+    if grp is not None:                                             # --session-groups: the long box races' own times
+        remover = SR.PropRemoval(env, torch.where(grp == 1, 1.0, torch.where(grp == 2, rm_p, 0.0)),
+                                 torch.where(grp == 1, sg[3], float(rm_s[0])), torch.where(grp == 1, sg[4], float(rm_s[1])),
+                                 seed=args.seed)
     if args.opp_restart_s >= 0:
         world.opp_restart_s = float(args.opp_restart_s)
     restarter = SR.opp_restart(env, world, PS.DT)
@@ -921,6 +957,10 @@ def main(argv=None):
         env.scene_replay = scene
         drv.scene = scene
         scene.keep_unsolved = bool(args.scene_keep_unsolved)
+        if grp is not None:                                         # --session-groups: scenes start only short races (the same
+            s_r = torch.nonzero(grp == 2).flatten()                 # share of them as before); a long session runs unbroken
+            every_ = max(int(round(1.0 / args.scene_replay)), 1)
+            scene.races.zero_(); scene.races[s_r[::every_]] = True
     lag_lo, lag_hi = max(args.scene_lag // 2, 1), args.scene_lag + args.scene_lag // 2
     scene_rehit = None                                    # --scene-replay-auto: EMA of the scene episodes' hard-contact share
     _KIND = {"wall": 0, "box": 1, "car": 2}
@@ -2003,6 +2043,17 @@ def main(argv=None):
                  + (f", 몸통 gradient policy 대비 {row['tail_trunk_ratio']:.2f}배" if row.get("tail_trunk_ratio") is not None else "") + " | "
                  if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
+        if grp is not None:                                         # --session-groups: what each group of races is in right now
+            _g = grp.repeat_interleave(env.M)[lid]
+            _box = (env.procedural.p_sid[lid] >= 0).any(-1)
+            _es = env.ep_step[lid].float() * float(env.sim.control_dt)
+            _txt = []
+            for _k, _nm in ((0, "긴 빈 트랙"), (1, "긴 상자 판"), (2, "짧은 판")):
+                _m = _g == _k
+                if bool(_m.any()):
+                    _txt.append(f"{_nm}: 상자 있음 {float(_box[_m].float().mean()) * 100:.0f} %, 판 시작 뒤 평균 {float(_es[_m].mean()):.0f} s "
+                                f"(최대 {float(_es[_m].max()):.0f} s)")
+            print("[판 구성] " + " | ".join(_txt), flush=True)
         if (upd % args.save_every == 0 or upd == args.updates) and args.dist_rank == 0:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},

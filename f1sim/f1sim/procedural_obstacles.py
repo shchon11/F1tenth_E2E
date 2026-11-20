@@ -515,6 +515,8 @@ class ProceduralObstacles:
         #: first (`b_online`, set by `set_driven_line`), the layout and its count drawn as always. qual26e u100's exam: all 23
         #: hard box hits were boxes within 0.40 m of the line the policy drives on an empty track, 0 of 857 passes beyond it
         self.online_p = 0.0
+        #: (11-21, plan_rl --session-groups) (B,) per row: -1 = `fraction` decides as before, 0 = never props, 1 = always
+        self.force_use = None
         self.b_online = None
         #: (11-18, the user: "이런 특정 라인에 장애물이 몰려있으니 그 라인을 피해버리네") `line3`: every bank draw is three pieces from the
         #: whole bank on the policy's OWN driven line (`set_driven_line`), one from each third of the lap (a random start), each drawn
@@ -688,7 +690,7 @@ class ProceduralObstacles:
             # (11-18) this share of the draws: the pieces on the policy's own line are the first kept (ranked below the rest)
             on_ = (self._rand((D, 1)) < self.online_p) & self.b_online[t, k_idx] & live
             r = torch.where(on_, r - 1.0, r)
-        live = live & (r.argsort(1).argsort(1) < k) & (self._rand((D, 1)) < self.fraction)
+        live = live & (r.argsort(1).argsort(1) < k) & self._use(D, dst, src)
         sid = sid.clamp_min(0)
         if self.has_raceline:
             j, v = self.b_j[t, k_idx], self.b_v[t, k_idx]
@@ -853,6 +855,16 @@ class ProceduralObstacles:
 
     # ------------------------------------------------------------------ the draw
     @torch.no_grad()
+    def _use(self, D: int, dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+        """(D, 1): which of the D layouts carry props -- `fraction` of them, unless `force_use` fixes it for the rows they go to
+        (one race = one layout: the rows of a race share their group)"""
+        use = self._rand((D, 1)) < self.fraction
+        if self.force_use is None:
+            return use
+        ov = torch.full((D,), -1, dtype=torch.long, device=use.device)
+        ov[src] = self.force_use[dst].long()
+        return torch.where(ov[:, None] >= 0, ov[:, None] > 0, use)
+
     def redraw(self, draw_tid: torch.Tensor, dst: torch.Tensor, src: torch.Tensor, opp: Optional[torch.Tensor] = None):
         """Draw `len(draw_tid)` layouts and write them into env rows `dst` (layout `src[i]` each).
 
@@ -872,7 +884,7 @@ class ProceduralObstacles:
         dev = self.device
         pat = torch.arange(P, device=dev)[None, :].expand(D, P)       # (D,P) pattern slot index
         n_pat = self.n_pat[t][:, None]
-        use = (self._rand((D, 1)) < self.fraction)
+        use = self._use(D, dst, src)
         act = (pat < n_pat) & use
         if self.count == "uniform":
             # keep k of the lap's patterns, k uniform in 1 .. n_pat, a random subset (not the first k sectors,
@@ -1002,7 +1014,7 @@ class ProceduralObstacles:
         """`place="uniform"`: C pieces per layout (1 .. C at count "uniform"), each a random catalogue shape at a point
         drawn uniformly over the lane's area, kept only while a PASS_MIN way stays open around it (`PASS_MIN`)."""
         D, C, M, dev = int(t.numel()), self.C, U_CANDIDATES, self.device
-        use = self._rand((D, 1)) < self.fraction
+        use = self._use(D, dst, src)
         k = (torch.full((D, 1), C, device=dev) if self.count == "fixed"
              else 1 + torch.floor(self._rand((D, 1)) * C).long())
         live = use & (torch.arange(C, device=dev)[None, :] < k)                  # (D,C)
