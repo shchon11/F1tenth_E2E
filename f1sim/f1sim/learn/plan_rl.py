@@ -664,6 +664,10 @@ def main(argv=None):
                     help="> 0, with --memory --mem-front: a second GRU of this size for the side task (`Actor2.box_memory`): the "
                          "trunk reads it (from a checkpoint without it: its columns start at zero), --mem-aux reads and teaches only it, "
                          "the first GRU stays the policy's own. 0 = one memory")
+    ap.add_argument("--mem-aux-in", action="store_true",
+                    help="with --box-memory --mem-aux --mem-aux-seen: the trunk also reads the box memory's answer (3 boxes: P(present), "
+                         "position x P; detached, Actor2.aux_in). 11-20: the memory knew the passed boxes (98-100 %% in training) but "
+                         "driving weighted its 128 values a tenth of the rest and re-hits swung 17 %% <-> 44-63 %% between checkpoints")
     ap.add_argument("--mem-aux-lr", type=float, default=0.0,
                     help="> 0, with --mem-aux: the side task trains the memory (GRU) and its read-out with an Adam of its own at this "
                          "learning rate, a step every minibatch, outside the policy's loss (the policy's accumulated step and its Adam "
@@ -1009,7 +1013,8 @@ def main(argv=None):
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
-                    mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory) if v2
+                    mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
+                    aux_in=args.mem_aux_in) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -1023,6 +1028,8 @@ def main(argv=None):
         actor.log_std_floor[0] = math.log(args.steer_std_floor)                # the first step's turn: the one driven
     if args.box_memory and not (args.memory and args.mem_front and v2):
         raise SystemExit("--box-memory needs --memory --mem-front (v2)")
+    if args.mem_aux_in and not (args.box_memory and aux_on and args.mem_aux_seen):
+        raise SystemExit("--mem-aux-in needs --box-memory --mem-aux --mem-aux-seen (the answer is the memory's own, of passed boxes)")
     if args.memory:
         obs.mem_h = torch.zeros(Bl, actor.memory, device=dev)          # both GRUs' states with --box-memory
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
@@ -1556,7 +1563,7 @@ def main(argv=None):
             # (11-14) what `remember` does after the GRU, once over the whole sequence instead of per step: the same
             # numbers, ~10 fewer kernel launches per step forward and backward in the update's 128-step loop
             hcat_ = torch.cat(hs_, 0); fflat_ = f.reshape(-1, f.shape[-1])
-            fc = (actor.trunk(torch.cat([fflat_, hcat_], 1)) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            fc = (actor.mem_trunk(fflat_, hcat_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
             if aux_on or memv_on:
                 # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
                 hs = actor.memory_alone(f, h0, bD[sel], bHM[sel])

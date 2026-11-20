@@ -418,13 +418,19 @@ class Actor2(nn.Module):
     car is (decoder 0.32 m); taught the side task in the policy's step it learnt nothing in 60 updates, taught by an
     optimizer of its own it learnt (AUC 0.37 -> 0.68 in 5 updates) and the car lost its way -- walls 0.05 -> 8.4 a minute,
     and 9.8-11.8 at the same update on both GPUs even at a tenth of the step, while the side task left in the policy's
-    loss stayed at 0.07-0.29. From a checkpoint without it the trunk's columns for it start at zero: same driving."""
+    loss stayed at 0.07-0.29. From a checkpoint without it the trunk's columns for it start at zero: same driving.
+    `aux_in` (11-20, with `box_memory` and `aux_dim`; the user: "명시적으로 장애물이 어디인지 기억하는지까지 학습시켰는데 달라지는게
+    없냐"): the trunk also reads the box memory's own answer -- the read-out's first AUX_IN_SLOTS boxes as (P(present),
+    position x P) -- through weights it cannot move (detached), so the answer keeps the side task's meaning. Why: the box
+    memory told passed boxes apart at 98-100 % in training (0.87-0.94 on held-out layouts) while the trunk's weights on its
+    128 values were a tenth of the others' and re-hits swung 17 % <-> 44-63 % between checkpoints 25 updates apart."""
 
     GAP0 = 0.5                # the gap between the two plans' first-step turn at the start (the action before its tanh)
+    AUX_IN_SLOTS, AUX_IN_KEYS = 3, 4     # `aux_in`: the read-out's boxes (present, dx/5, dy/5, distance/5 along the track)
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
-                 mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0):
+                 mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False):
         super().__init__()
         self.branches = int(branches)
         if self.branches not in (1, 2):
@@ -436,7 +442,11 @@ class Actor2(nn.Module):
         self.box_memory = int(box_memory) if self.mem_front else 0
         if int(box_memory) and not self.mem_front:
             raise ValueError("box_memory needs mem_front")
-        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory) if self.mem_front else 0), hidden), nn.Tanh(),
+        self.aux_in = bool(aux_in)
+        if self.aux_in and not (self.box_memory and int(aux_dim) >= self.AUX_IN_SLOTS * self.AUX_IN_KEYS):
+            raise ValueError("aux_in needs box_memory and the boxes' read-out (aux_dim)")
+        n_ai = self.AUX_IN_SLOTS * self.AUX_IN_KEYS if self.aux_in else 0
+        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
         self.pi = nn.Linear(hidden, self.branches * PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
@@ -512,6 +522,19 @@ class Actor2(nn.Module):
         """the side task's read-out: of the box memory's part when there is one"""
         return self.aux(hs[:, self.memory_main:] if self.box_memory else hs)
 
+    def aux_feed(self, hs: torch.Tensor) -> torch.Tensor:
+        """`aux_in`: the box memory's answer as the trunk reads it, (n, 12): per box P(present) and its position x P (an absent
+        box reads zeros, as the side task's target does). Detached: driving cannot bend what the side task taught"""
+        k, n = self.AUX_IN_SLOTS, self.AUX_IN_KEYS
+        a = nn.functional.linear(hs[:, self.memory_main:].detach(), self.aux.weight[:k * n].detach(), self.aux.bias[:k * n].detach())
+        a = a.view(-1, k, n)
+        p = torch.sigmoid(a[..., :1])
+        return torch.cat([p, a[..., 1:] * p], -1).reshape(-1, k * n)
+
+    def mem_trunk(self, f: torch.Tensor, hs: torch.Tensor) -> torch.Tensor:
+        """`mem_front`: the trunk on the inputs and the memory's state (and its answer with `aux_in`)"""
+        return self.trunk(torch.cat([f, hs, self.aux_feed(hs)] if self.aux_in else [f, hs], 1))
+
     def vmem_read(self, hs: torch.Tensor) -> torch.Tensor:
         """the value read-out: of the first GRU's part"""
         return self.v_mem(hs[:, :self.memory_main])
@@ -537,7 +560,7 @@ class Actor2(nn.Module):
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
         h1 = self.mem_cell(f, h0)
         if self.mem_front:
-            return self.trunk(torch.cat([f, h1], 1)), h1
+            return self.mem_trunk(f, h1), h1
         return f + self.mem_out(h1), h1
 
     def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None):
@@ -623,7 +646,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,
                    mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"],
                    branches=int(ck["args"].get("branches", 1) or 1),
-                   box_memory=int(ck["args"].get("box_memory", 0) or 0)).to(device)
+                   box_memory=int(ck["args"].get("box_memory", 0) or 0),
+                   aux_in=bool(ck["args"].get("mem_aux_in", False))).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
