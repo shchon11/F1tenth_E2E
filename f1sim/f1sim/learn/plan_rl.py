@@ -95,6 +95,26 @@ def box_along(env, goal, lid: torch.Tensor):
     return ds, (po.p_sid[lid] >= 0) & torch.isfinite(ds), pos
 
 
+def boxes_in_view(env, lid: torch.Tensor, pos: torch.Tensor, live: torch.Tensor, mount_x: float, rmax: float,
+                  fov: float = math.radians(135.0), step: float = 0.1) -> torch.Tensor:
+    """(B_l, C) bool: box slots whose centre the LiDAR sees now -- within `rmax` and the field of view, and no wall cell on
+    the line from the scanner to 0.35 m short of the centre (a duct hose counts as a wall: never more seen than there is)"""
+    st = env.sim.state[lid].float()
+    sx = st[:, 0] + mount_x * torch.cos(st[:, 2]); sy = st[:, 1] + mount_x * torch.sin(st[:, 2])
+    dx, dy = pos[..., 0] - sx[:, None], pos[..., 1] - sy[:, None]
+    d = torch.sqrt(dx * dx + dy * dy)
+    rel = torch.remainder(torch.atan2(dy, dx) - st[:, 2:3] + math.pi, 2.0 * math.pi) - math.pi
+    ok = live & (d <= rmax) & (rel.abs() <= fov)
+    n = max(1, int(math.ceil(rmax / step)))
+    t = torch.arange(1, n + 1, device=pos.device, dtype=pos.dtype) * step                        # (n,) along the line
+    ux, uy = dx / d.clamp_min(1e-6), dy / d.clamp_min(1e-6)
+    px = sx[:, None, None] + ux[..., None] * t; py = sy[:, None, None] + uy[..., None] * t     # (B_l, C, n)
+    tid = env.sim.tid[lid][:, None, None].expand(px.shape)
+    wall = env.sim.track.sample_edt(torch.stack([px, py], -1), tid) <= 0.0
+    wall = wall & (t[None, None, :] < (d - 0.35)[..., None])
+    return ok & ~wall.any(-1)
+
+
 def boxes_passed(seen, prev_ds, prev_pos, ds, live, pos):
     """--mem-aux-seen, one decision: (seen, prev_ds, prev_pos) brought up to now from `box_along`'s (ds, live, pos). A box slot
     counts as passed once the car went by it (0..3 m ahead at the last decision, 0..3 m behind now); a slot whose box moved (a
@@ -588,6 +608,11 @@ def main(argv=None):
                     help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices); "
                          "default: the world json's \"contact_scale\" (6.59 s / the map's raceline lap, 11-15), else 1")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
+    ap.add_argument("--plan-hit-seen", action="store_true",
+                    help="(11-21, the user \"이렇게 밀어붙이자\") the plan-hit cost for every obstacle the policy can know: the boxes "
+                         "this car has seen (centre in the LiDAR's view, no wall between) or passed this episode, and the walls within "
+                         "--plan-hit-wall-s of the plan (its far end grazes walls on 7 %% of empty-track decisions -- pricing that slowed "
+                         "every 11-17/18 run); boxes never seen are left out")
     ap.add_argument("--plan-hit-known", action="store_true",
                     help="(11-21, the user \"좋다이거\") the plan-hit cost only for the boxes this car has already passed (--mem-aux-seen) "
                          "-- no walls, no unseen boxes. A box hit is paid once, 1 s and more after the line was chosen; its memory "
@@ -1070,6 +1095,19 @@ def main(argv=None):
         if aux_seen is None or not args.plan_hit_share > 0:
             raise SystemExit("--plan-hit-known needs --mem-aux-seen and --plan-hit-share > 0")
         pr.plan_known = aux_seen                                     # updated every decision with the passing bookkeeping
+    seen_on = bool(args.plan_hit_seen)
+    if seen_on:
+        if args.plan_hit_known or env.procedural is None or not args.plan_hit_share > 0:
+            raise SystemExit("--plan-hit-seen: a world with boxes, --plan-hit-share > 0, not with --plan-hit-known")
+        if args.plan_hit_wall_s is None:
+            raise SystemExit("--plan-hit-seen: give --plan-hit-wall-s (how far into the plan walls are priced)")
+        C_s = env.procedural.C
+        sb_seen = torch.zeros(Bl, C_s, dtype=torch.bool, device=dev)
+        sb_ds = torch.full((Bl, C_s), float("nan"), device=dev)
+        sb_pos = torch.zeros(Bl, C_s, 2, device=dev)
+        sb_mx = float(args.lidar_mount_x) if args.lidar_mount_x else 0.297
+        sb_rmax = float(env.cfg.lidar.range_max)
+        pr.plan_known, pr.plan_known_walls = sb_seen, True
     known_on = bool(args.noise_corr_known)
     if known_on:
         kn_rho, kn_std, kn_d0, kn_d1 = (float(x) for x in args.noise_corr_known.split(","))
@@ -1338,6 +1376,13 @@ def main(argv=None):
                     hold_left = torch.where(near, torch.zeros_like(hold_left), hold_left)
                     near_sum += near.float()
                 newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
+                if seen_on:                                        # --plan-hit-seen: boxes seen or passed this episode
+                    _ds, _live, _pos = box_along(env, pr.goal, lid)
+                    _moved = ((_pos - sb_pos).abs().sum(-1) > 0.05) | ~_live
+                    _passed = _live & ~_moved & (sb_ds > 0.0) & (sb_ds <= 3.0) & (_ds <= 0.0) & (_ds > -3.0)
+                    sb_seen = (sb_seen & ~_moved) | _passed | boxes_in_view(env, lid, _pos, _live, sb_mx, sb_rmax)
+                    sb_ds = torch.where(_live, _ds, torch.full_like(_ds, float("nan"))); sb_pos = _pos
+                    pr.plan_known = sb_seen
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from

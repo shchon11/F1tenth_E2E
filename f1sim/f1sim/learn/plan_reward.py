@@ -193,6 +193,8 @@ class PlanReward:
         #: crossing the boxes this car has already passed -- what its memory knows (97 % of them 4-8 m ahead in the exam) --
         #: not walls, not boxes it has never seen
         self.plan_known = None
+        #: (11-21, --plan-hit-seen) with `plan_known` set: price the walls too (within `plan_hit_wall_n`)
+        self.plan_known_walls = False
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
         #: (11-21, plan_rl --shaping-fade) the weight of the distance shaping: 1 = as agreed 11-07, 0 = the lap bonus alone
@@ -300,7 +302,7 @@ class PlanReward:
         tid = self.env.sim.tid[self.lid]
         c, s = torch.cos(psi)[..., None], torch.sin(psi)[..., None]
         place = lambda P: torch.stack([x[..., None] + P[:, 0] * c - P[:, 1] * s, y[..., None] + P[:, 0] * s + P[:, 1] * c], -1)
-        if self.plan_hit_wall_n == 0 or self.plan_known is not None:                  # (11-18) walls not looked at
+        if self.plan_hit_wall_n == 0 or (self.plan_known is not None and not self.plan_known_walls):   # walls not looked at
             hit = torch.zeros(x.shape, dtype=torch.bool, device=x.device)
         else:
             pts = place(self.corners)                                                 # (B_l, n, 4, 2)
