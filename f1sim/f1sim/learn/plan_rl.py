@@ -750,6 +750,13 @@ def main(argv=None):
                     help="size variants added to the world's tracks: per cents, comma-separated, or 'korea25' = "
                          "`state_rl.TRACK_SCALES_25` (0.60-0.92 and 1.08-1.20 of a warp each; 11-12, the user: \"트랙 변형도 스케일 "
                          "자체가 변하는것도\"). '' = the world's `track_scales` (none in plan_world_korea25)")
+    ap.add_argument("--pace-caps", default="",
+                    help="C1,C2,... [m/s] (11-21 redesign, the user \"ㄱㄱ\"): every --pace-hold decisions the policy picks a level -- no "
+                         "cap or one of these -- and every plan until the next pick is drawn under it (`Actor2.pace_levels`). "
+                         "Output noise is re-planned away within 0.1 s; a held level is not (oracle: 5.5 m/s 10 m before boxes cut "
+                         "hard box hits 91 -> 30 for +0.3 s a lap)")
+    ap.add_argument("--pace-hold", type=int, default=10, help="decisions a picked pace level holds (10 = 1 s)")
+    ap.add_argument("--pace-floor", type=float, default=0.05, help="training picks every pace level at least this often")
     ap.add_argument("--branches", type=int, default=1, choices=(1, 2),
                     help="2 = two plans and a choice between them (`Actor2.branches`); --format v2 with --tail-consistency")
     ap.add_argument("--branch-floor", type=float, default=0.1,
@@ -1063,7 +1070,8 @@ def main(argv=None):
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
-                    aux_in=args.mem_aux_in) if v2
+                    aux_in=args.mem_aux_in, pace_caps=args.pace_caps, pace_hold=args.pace_hold,
+                    pace_floor=args.pace_floor) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -1081,6 +1089,11 @@ def main(argv=None):
         raise SystemExit("--mem-aux-in needs --box-memory --mem-aux --mem-aux-seen (the answer is the memory's own, of passed boxes)")
     if args.memory:
         obs.mem_h = torch.zeros(Bl, actor.memory, device=dev)          # both GRUs' states with --box-memory
+    pace_on = bool(getattr(actor, "pace_levels", 0))
+    if pace_on:
+        if v3 or not v2 or two or args.hold_p > 0 or args.init:
+            raise SystemExit("--pace-caps: --format v2, one plan, no holding, from scratch")
+        obs.pace_on(actor.pace_levels, args.pace_hold)                 # the state's last inputs: the level in force, its hold left
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     if args.init:
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
@@ -1252,6 +1265,8 @@ def main(argv=None):
         S, X, PV, U, LP, V, R, D, VT, FM, HM = [], [], [], [], [], [], [], [], [], [], []
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
         BR = []                                                # --branches 2: the plan each decision drove
+        PD, PI, CAPL = [], [], []                              # --pace-caps: picked now?, the level in force, its cap [m/s]
+        pace_n = torch.zeros(max(getattr(actor, "pace_levels", 0), 1), device=dev)
         br_n = {k: 0.0 for k in ("b0", "gap", "switch", "arg_switch", "pmax", "pairs")}
         sc_new = torch.zeros(3, device=dev)                    # --scene-replay: scenes taken this update, by what was hit
         sc_dec = sc_end = sc_end_hit = 0
@@ -1318,6 +1333,16 @@ def main(argv=None):
                     mean, log_std, v_hat = actor(sc, s)
                 else:
                     mean, log_std = actor(sc, s)
+                if pace_on:
+                    # the pace: rows whose level ran out pick again (never below --pace-floor each); its probability joins the
+                    # decision's when picked, a held level is the state's
+                    due_p = obs.pace_left <= 0
+                    pp_ = actor.pace_p(actor.pace_logits_out)
+                    obs.pace_idx = torch.where(due_p, torch.multinomial(pp_, 1)[:, 0], obs.pace_idx)
+                    obs.pace_left = torch.where(due_p, torch.full_like(obs.pace_left, args.pace_hold), obs.pace_left) - 1
+                    cap_ = actor.pace_v[obs.pace_idx]
+                    PD.append(due_p); PI.append(obs.pace_idx.clone()); CAPL.append(cap_)
+                    pace_n += torch.bincount(obs.pace_idx, minlength=actor.pace_levels).float()
                 if two:
                     # the choice: sampled with a number that mostly stays (see the module's note), both plans kept alive
                     pb = branch_p(actor.logits_out)
@@ -1367,6 +1392,8 @@ def main(argv=None):
                 if two:
                     lp = lp + pb[ar_l, br].log()
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
+                if pace_on:
+                    lp = lp + torch.where(due_p, pp_.gather(1, obs.pace_idx[:, None])[:, 0].log(), torch.zeros_like(lp))
                 v = critic(sc, s, pv_)
                 v_true = env.sim.state[lid, dyn.IVX].float().clone()
                 if args.dump_rollout:
@@ -1387,11 +1414,11 @@ def main(argv=None):
                     vest_err.append((v_hat - v_true).abs())
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
-                    p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
+                    p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap_ if pace_on else None)
                     if tap is not None:                            # the plan the mean action makes, for the live view
                         _q = tap.row
                         _pm = PS.roll(torch.tanh(mean[_q:_q + 1]), v_hat[_q:_q + 1].clamp(-PS.V_REV, PS.V_FWD),
-                                      obs.cmd_d[_q:_q + 1], lim)
+                                      obs.cmd_d[_q:_q + 1], lim, cap_[_q:_q + 1] if pace_on else None)
                         _xm, _ym, _ = plan_world(_pm, env.sim.state[lid[_q:_q + 1]])
                         tap_pm = torch.stack([_xm[0, PT_IDX.to(dev)], _ym[0, PT_IDX.to(dev)]], -1)
                     vest_err.append((v_hat - v_true).abs())
@@ -1640,6 +1667,8 @@ def main(argv=None):
                    (bR - float(r_mu)) / max(float(r_sd), 1e-6))
         if two:
             bBR = torch.cat(BR)
+        if pace_on:
+            bPD, bPI, bCAP = torch.cat(PD), torch.cat(PI), torch.cat(CAPL)
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
             bPTS, bPVS = torch.cat(PTS), torch.cat(PVS)
@@ -1766,6 +1795,9 @@ def main(argv=None):
                     lp = tanh_logp(bU[mb], mean, log_std)
                 if two:
                     lp = lp + branch_p(aux_box["logits"])[torch.arange(mb.numel(), device=dev), bBR[mb]].log()
+                if pace_on:
+                    lp = lp + torch.where(bPD[mb], actor.pace_p(actor.pace_logits_out).gather(1, bPI[mb][:, None])[:, 0].log(),
+                                          torch.zeros_like(lp))
                 ratio = (lp - bLP[mb]).exp()
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0)
                 a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
@@ -1793,7 +1825,7 @@ def main(argv=None):
                         tail_mean = (actor.all_heads(fh_)[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
                                      if two else actor.pi(fh_))      # the plan that was driven
                         a_c = torch.where(rl_mask[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
-                        pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim)
+                        pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim, bCAP[mb_c] if pace_on else None)
                         xw_c, yw_c, _ = plan_world(pc_, bST0[mb_c])
                         ii_ = PT_IDX.to(dev)
                         pts_c = torch.stack([xw_c[:, ii_], yw_c[:, ii_]], -1)
@@ -2000,6 +2032,8 @@ def main(argv=None):
                 row[f"g_mem_{k_}"] = float(g_.norm(dim=1).mean())
                 row[f"g_mem_{k_}_agree"] = float((c_.sum() - c_.diagonal().sum()) / max(1, n_g * (n_g - 1)))
             row["g_mem_cos"] = float(nn.functional.cosine_similarity(gp_.mean(0), ge_.mean(0), dim=0))
+        if pace_on:                                                # --pace-caps: the share of decisions under each level
+            row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
         if two:
             row.update(branch0_share=br_n["b0"] / T, branch_gap=br_n["gap"] / T, branch_pmax=br_n["pmax"] / T,
                        branch_switch=br_n["switch"] / max(br_n["pairs"], 1.0),
@@ -2039,6 +2073,8 @@ def main(argv=None):
               + (f"두 plan: 0번 고름 {row['branch0_share'] * 100:.0f} %, 첫 조향 차이 {row['branch_gap']:.2f}, 고른 plan 바뀜 "
                  f"{row['branch_switch'] * 100:.1f} % (확률 큰 쪽 바뀜 {row['branch_arg_switch'] * 100:.1f} %), 큰 쪽 확률 "
                  f"{row['branch_pmax'] * 100:.0f} % | " if two else "")
+              + ("속도 단계 " + " · ".join(f"{'없음' if k_ == 0 else f'{float(actor.pace_v[k_]):g}'} {v_ * 100:.0f} %"
+                                          for k_, v_ in enumerate(row["pace_share"])) + " | " if pace_on else "")
               + (f"접촉 직전 장면: 보관 {row['scene_store']}개 (새로 벽 {row['scene_new'][0]} 상자 {row['scene_new'][1]} 차 "
                  f"{row['scene_new'][2]}), 장면에서 시작한 결정 {row['scene_share'] * 100:.1f} %, 끝난 {sc_end}판 중 다시 세게 닿음 "
                  f"{sc_end_hit / max(sc_end, 1) * 100:.0f} % | " if scene is not None else "")

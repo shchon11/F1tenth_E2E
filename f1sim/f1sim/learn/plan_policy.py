@@ -306,12 +306,17 @@ class PlanRunner:
                 h_old = getattr(self.obs, "mem_h", None)
                 h_old = h_old.clone() if h_old is not None else None
                 b_old = self.obs.prev_branch.clone() if self.obs.prev_branch is not None else None
+                pc_old = ((self.obs.pace_idx.clone(), self.obs.pace_left.clone())
+                          if getattr(self.obs, "pace_idx", None) is not None else None)
                 _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 if h_old is not None and getattr(self.actor, "memory", 0):
                     # a memory steps once per decision: rows not deciding now keep theirs
                     self.obs.mem_h = torch.where(due[:, None], self.obs.mem_h, h_old)
                 if b_old is not None:
                     self.obs.prev_branch = torch.where(due, self.obs.prev_branch, b_old)
+                if pc_old is not None:                            # the pace level: only deciding rows move on
+                    self.obs.pace_idx = torch.where(due, self.obs.pace_idx, pc_old[0])
+                    self.obs.pace_left = torch.where(due, self.obs.pace_left, pc_old[1])
                 self.v_hat = v_hat
             else:
                 mean, _ = self.actor(self.obs.scans, self.obs.state())
@@ -430,12 +435,26 @@ class Actor2(nn.Module):
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
-                 mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False):
+                 mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
+                 pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05):
         super().__init__()
         self.branches = int(branches)
+        # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
+        # `pace_hold` decisions the policy picks one of 1 + len(caps) levels -- no cap, then each cap [m/s] -- and every plan
+        # until the next pick is drawn under it (`plan_steps.roll` cap). The plan's own noise is taken back by the next
+        # decision (re-planned every 0.1 s: approach speed to a blind box swung 0.2 m/s between passes); a held level is not --
+        # an oracle cap of 5.5 m/s 10 m before boxes cut hard box hits 91 -> 30 for +0.3 s a lap
+        caps = [float(x) for x in str(pace_caps or "").split(",") if x.strip()]
+        self.pace_levels = (1 + len(caps)) if caps else 0
+        self.pace_hold, self.pace_floor = int(pace_hold), float(pace_floor)
+        if self.pace_levels and self.branches != 1:
+            raise ValueError("pace: one plan only")
+        if self.pace_levels and not 0.0 <= self.pace_floor * self.pace_levels < 1.0:
+            raise ValueError("pace_floor x levels must stay below 1")
         if self.branches not in (1, 2):
             raise ValueError("branches: 1 or 2")
-        sd = (STATE_DIM2 + (1 if self.branches == 2 else 0)) if state_dim is None else int(state_dim)
+        sd = (STATE_DIM2 + (1 if self.branches == 2 else 0) + ((self.pace_levels + 1) if self.pace_levels else 0)
+              if state_dim is None else int(state_dim))
         self.mem_front = bool(mem_front) and int(memory) > 0
         self.enc = ScanEncoder(beams)
         self.norm = RunningNorm(sd)
@@ -456,6 +475,13 @@ class Actor2(nn.Module):
             with torch.no_grad():
                 self.pi.bias[PS.ACT_DIM] = math.log(math.expm1(self.GAP0))
         self.branch_out = self.logits_out = self.means_out = None
+        self.pace_logits_out = None
+        if self.pace_levels:
+            self.pace_head = nn.Linear(hidden, self.pace_levels)
+            nn.init.zeros_(self.pace_head.weight); nn.init.zeros_(self.pace_head.bias)
+            with torch.no_grad():
+                self.pace_head.bias[0] = 1.0                    # no cap twice as likely as each cap at the start
+            self.register_buffer("pace_v", torch.tensor([math.inf] + caps))
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
         self.memory_main = int(memory)
@@ -489,7 +515,13 @@ class Actor2(nn.Module):
             self.branch_out, self.logits_out, self.means_out = br, logits, means
             return means[torch.arange(f.shape[0], device=f.device), br], log_std, v_hat
         log_std = torch.maximum(self.log_std, self.log_std_floor)
+        if self.pace_levels:
+            self.pace_logits_out = self.pace_head(f)
         return self.pi(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
+
+    def pace_p(self, logits: torch.Tensor) -> torch.Tensor:
+        """the levels' probabilities, never below `pace_floor` each"""
+        return self.pace_floor + (1.0 - self.pace_levels * self.pace_floor) * torch.softmax(logits, 1)
 
     def all_heads(self, f: torch.Tensor):
         """two plans: (means (B, 2, 20), the choice's logits (B, 2), log_std (B, 20), the speed estimate (B,)). Plan 0's
@@ -583,7 +615,17 @@ class PlanObs2(PlanObs):
         # a two-plan actor (`Actor2.branches`): which plan was chosen last, +1 / -1, 0 at a start (B_l,). None = no such
         # input (every one-plan policy)
         self.prev_branch = None
+        # a pace actor (`Actor2.pace_levels`): the level in force (B_l,) long and the decisions it still holds; None = no such
+        # input. A new episode picks at once (left 0, level 0 = no cap until then)
+        self.pace_idx = self.pace_left = None
+        self.pace_k = 0
         super().__init__(env, lim, goal, rows)
+
+    def pace_on(self, levels: int, hold: int) -> None:
+        Bl = self.rel.shape[0]
+        self.pace_k, self.pace_hold = int(levels), int(hold)
+        self.pace_idx = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
+        self.pace_left = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
 
     def reset_rows(self, rows: torch.Tensor) -> None:
         super().reset_rows(rows)
@@ -594,6 +636,8 @@ class PlanObs2(PlanObs):
             self.mem_h[rows] = 0.0                                   # a new episode remembers nothing
         if self.prev_branch is not None:
             self.prev_branch[rows] = 0.0
+        if self.pace_idx is not None:
+            self.pace_idx[rows] = 0; self.pace_left[rows] = 0
 
     def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
         """the plan just drawn (`plan_steps.roll`, in the frame it was drawn from): kept in its own 0.1 s pose's frame"""
@@ -620,7 +664,12 @@ class PlanObs2(PlanObs):
         else:
             imu = torch.zeros(Bl, 6, device=self.rel.device)
         s = torch.cat([imu, self.cmd_d[:, None], self.cmd_v[:, None], self.rel.reshape(Bl, -1), self.rel_v], 1)
-        return s if self.prev_branch is None else torch.cat([s, self.prev_branch[:, None]], 1)
+        if self.prev_branch is not None:
+            s = torch.cat([s, self.prev_branch[:, None]], 1)
+        if self.pace_idx is not None:                               # the level in force and the share of its hold left
+            s = torch.cat([s, nn.functional.one_hot(self.pace_idx, self.pace_k).to(s.dtype),
+                           (self.pace_left.to(s.dtype) / float(self.pace_hold))[:, None]], 1)
+        return s
 
     def priv(self) -> torch.Tensor:
         """v1's critic extras and the true speed / steering (training only)"""
@@ -647,7 +696,9 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"],
                    branches=int(ck["args"].get("branches", 1) or 1),
                    box_memory=int(ck["args"].get("box_memory", 0) or 0),
-                   aux_in=bool(ck["args"].get("mem_aux_in", False))).to(device)
+                   aux_in=bool(ck["args"].get("mem_aux_in", False)),
+                   pace_caps=str(ck["args"].get("pace_caps", "") or ""), pace_hold=int(ck["args"].get("pace_hold", 10) or 10),
+                   pace_floor=float(ck["args"].get("pace_floor", 0.05) or 0.05)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
@@ -667,9 +718,21 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, 
         h = getattr(obs, "mem_h", None)
         if h is None or h.shape != (obs.scans.shape[0], actor.memory):
             h = obs.mem_h = torch.zeros(obs.scans.shape[0], actor.memory, device=obs.scans.device)
+    pace = getattr(actor, "pace_levels", 0)
+    if pace and getattr(obs, "pace_idx", None) is None:
+        obs.pace_on(pace, actor.pace_hold)
     mean, log_std, v_hat = actor(obs.scans, obs.state(), h)
     if getattr(actor, "memory", 0):
         obs.mem_h = actor.h_out.detach()
+    if pace:
+        # the pace: rows whose level ran out pick again (sampled with `sample`, else the likeliest), held `pace_hold` decisions
+        due = obs.pace_left <= 0
+        pick = (torch.multinomial(actor.pace_p(actor.pace_logits_out), 1)[:, 0] if sample
+                else actor.pace_logits_out.argmax(1))
+        obs.pace_idx = torch.where(due, pick, obs.pace_idx)
+        obs.pace_left = torch.where(due, torch.full_like(obs.pace_left, actor.pace_hold), obs.pace_left) - 1
+        pc = actor.pace_v[obs.pace_idx]
+        cap = pc if cap is None else torch.minimum(cap, pc)
     if two:
         obs.prev_branch = 1.0 - 2.0 * actor.branch_out.float()
     u = mean + log_std.exp() * (torch.randn_like(mean) if eps is None else eps) if sample else mean      # `eps`: the caller's noise (e.g. held)

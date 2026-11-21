@@ -390,6 +390,8 @@ for kd in range(T):
         _cap = torch.where(_ok.any(1), torch.full_like(_dc, CAP[0]), torch.full_like(_dc, float("inf")))
     _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                             else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if getattr(obs, "pace_idx", None) is not None:              # (11-21) a pace policy: the level in force each decision
+        R.setdefault("pace", []).append(obs.pace_idx.to(torch.int8).cpu())
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
