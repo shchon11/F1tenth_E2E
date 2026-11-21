@@ -1402,8 +1402,8 @@ def main(argv=None):
                 else:
                     eps = torch.randn_like(mean)
                 if known_on:                                       # ... and at least kn_std wide there (the policy's distribution)
-                    log_std = log_std.clone()
-                    log_std[:, 0] = torch.where(kz, log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])
+                    log_std = torch.cat([torch.where(kz, log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])[:, None],
+                                         log_std[:, 1:]], 1)
                     KZ.append(kz); kz_n += float(kz.float().mean())
                 if tailc:
                     u = mean + log_std.exp() * eps * rl_mask                         # the tail: its mean, no noise
@@ -1814,8 +1814,8 @@ def main(argv=None):
                     mean, log_std = actor(bX[mb], bS[mb])
                     el = torch.zeros((), device=dev)
                 if known_on:                                       # the rows drawn in the known zone: scored as they were drawn
-                    log_std = log_std.clone()
-                    log_std[:, 0] = torch.where(bKZ[mb], log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])
+                    log_std = torch.cat([torch.where(bKZ[mb], log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])[:, None],
+                                         log_std[:, 1:]], 1)      # (not in place: autograd needs the column it read)
                 if tailc:
                     lp = tanh_logp(bU[mb][:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
                 else:
