@@ -27,7 +27,7 @@ COLS = {0: "#e66767", 1: "#fab219", 2: "#3987e5"}
 # checkpoint; the page shows the map at about a third of its pixels on the phone, so line, labels and dots are drawn thick
 # ("속도도 좀 빠르고 느린거 구분이 안되잖아": the one-blue ramp at 3 px read as one colour there). VER marks the frames drawn with
 # the current look, older ones are drawn again
-VER = 4
+VER = 6
 SPD = ["#7b3fe4", "#4f6ef7", "#2fa6f5", "#5fe0f0", "#e8fbff"]
 V0, V1 = 2.0, 9.0
 INK = "#e6edf3"
@@ -77,6 +77,76 @@ def best_lap(R):
     return best
 
 
+def smooth_path(st, vy, dt, sub=8):
+    """the driven path between the 0.1 s records as a cubic Hermite curve through each record's position, the velocity
+    (heading, speed and side slip) as the tangent: (n, 2) points and (n,) speeds"""
+    x, y, h, vx = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
+    mx, my = dt * (vx * np.cos(h) - vy * np.sin(h)), dt * (vx * np.sin(h) + vy * np.cos(h))
+    v = np.hypot(vx, vy)
+    s_ = np.linspace(0.0, 1.0, sub, endpoint=False)[:, None]
+    h00, h10 = 2 * s_ ** 3 - 3 * s_ ** 2 + 1, s_ ** 3 - 2 * s_ ** 2 + s_
+    h01, h11 = -2 * s_ ** 3 + 3 * s_ ** 2, s_ ** 3 - s_ ** 2
+    X = (h00 * x[:-1] + h10 * mx[:-1] + h01 * x[1:] + h11 * mx[1:]).T.reshape(-1)
+    Y = (h00 * y[:-1] + h10 * my[:-1] + h01 * y[1:] + h11 * my[1:]).T.reshape(-1)
+    V = ((1 - s_) * v[:-1] + s_ * v[1:]).T.reshape(-1)
+    return np.append(np.stack([X, Y], 1), [[x[-1], y[-1]]], 0), np.append(V, v[-1])
+
+
+def lap_loop(R, b, t0, t1, tol=0.03, sub=8):
+    """(11-22, the user: "대충 그리지 말고 똑바로좀 그리자 ... 아래쪽 말하는거야") the fastest lap as one closed line of driving.
+    The timing line sits at the bottom U-turn's exit, where consecutive laps pass up to 1 m apart: joining the lap's end to
+    its start there drew a V across the corner. The loop is closed where the next lap (the previous one when there is no
+    clean next lap) passes this lap again within `tol` at the same distance to go: this lap from there to the line, then the
+    next lap's start up to that point. Returns the curve's points and speeds and the records' points and speeds (labels)"""
+    z, st = R.z, R.st[:, b].astype(float)
+    rem = z["rem"][:, b].astype(float)
+    vy = np.append(z["vy"][:, b], z["vy"][-1:, b]).astype(float)
+    N, last = t1 - t0 + 1, R.st.shape[0] - 1
+
+    def at_rem(js, r):
+        """the first record j in js whose step passes distance to go r, and the point there"""
+        for j in js:
+            if 0 <= j < last and rem[j] >= r > rem[j + 1] and rem[j] - rem[j + 1] < 3.0:
+                f = (rem[j] - r) / (rem[j] - rem[j + 1])
+                return j, st[j, :2] + f * (st[j + 1, :2] - st[j, :2])
+        return None, None
+
+    best = None                                              # (gap [m], start record, end record, forward)
+    w_ = N + 20
+    if t1 + 1 + w_ <= last and not R.rs[t1 + 1: t1 + 1 + w_, b].any():
+        for i in range(t0, t1 + 1):                          # this lap from i, the next lap up to i's distance to go
+            j, q = at_rem(range(t1 + 1, t1 + 1 + w_), rem[i])
+            if j is not None:
+                d = float(np.hypot(*(q - st[i, :2])))
+                if best is None or d < best[0]:
+                    best = (d, i, j + 1, True)
+                if d < tol:
+                    break
+    if (best is None or best[0] >= tol) and t0 - w_ >= 0 and not R.rs[t0 - w_: t0, b].any():
+        for i in range(t1, t0 - 1, -1):                      # the previous lap from i's distance to go, this lap up to i
+            j, q = at_rem(range(t0 - 1, t0 - w_ - 1, -1), rem[i])
+            if j is not None:
+                d = float(np.hypot(*(q - st[i, :2])))
+                if best is None or d < best[0] - 1e-9:
+                    best = (d, j, i, False)
+                if d < tol:
+                    break
+    if best is None:                                         # no clean lap next to it: the timing lap, left open
+        P, V = smooth_path(st[t0: t1 + 2], vy[t0: t1 + 2], R.dt, sub)
+        return P, V, st[t0: t1 + 2, :2], np.hypot(st[t0: t1 + 2, 3], vy[t0: t1 + 2])
+    _, a, c, fwd = best
+    P, V = smooth_path(st[a: c + 1], vy[a: c + 1], R.dt, sub)
+    if fwd:                                                  # cut the last step where it comes back to the start record
+        k0 = (c - 1 - a) * sub
+        k = k0 + int(np.argmin(np.hypot(*(P[k0:] - st[a, :2]).T)))
+        P, V, rec = P[:k + 1], V[:k + 1], slice(a, c)
+    else:                                                    # cut the first step where it leaves from the end record
+        k = int(np.argmin(np.hypot(*(P[:sub + 1] - st[c, :2]).T)))
+        P, V, rec = P[k:], V[k:], slice(a + 1, c + 1)
+    P, V = np.vstack([P, P[:1]]), np.append(V, V[0])         # closed: the step left is the gap measured above
+    return P, V, st[rec, :2], np.hypot(st[rec, 3], vy[rec])
+
+
 def speed_marks(v, w=6, drop=0.8):
     """the slowest point of each corner (a local minimum the speed rises at least `drop` from on both sides; the lap is a loop,
     so the windows wrap around the line) and the fastest point"""
@@ -109,11 +179,9 @@ def frame(run, u, p):
     bl = best_lap(R)
     if bl is not None:
         _, b, t0, t1 = bl
-        xy = R.st[t0: t1 + 1, b, :2].astype(float)
-        v = np.abs(R.st[t0: t1 + 1, b, 3]).astype(float)
-        xc, vc = np.vstack([xy, xy[:1]]), np.append(v, v[0])          # closed at the line
+        xc, vc, xy, v = lap_loop(R, b, t0, t1)
         lc = LineCollection(np.stack([xc[:-1], xc[1:]], 1), cmap=LinearSegmentedColormap.from_list("spd", SPD),
-                            norm=plt.Normalize(V0, V1), linewidths=8.0, capstyle="round", zorder=2)
+                            norm=plt.Normalize(V0, V1), linewidths=8.0, capstyle="round", joinstyle="round", zorder=2)
         lc.set_array(0.5 * (vc[:-1] + vc[1:]))
         ax.add_collection(lc)
         for i in speed_marks(v):
