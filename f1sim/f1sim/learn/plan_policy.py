@@ -239,6 +239,8 @@ class PlanRunner:
                 print(f"[plan] LiDAR {mx:.3f} m ahead of the CoG (the checkpoint's)", flush=True)
             self.actor = load_actor2(ck, device, check_mount=False)
             self.obs = PlanObs2(env, self.lim, None)
+            if getattr(self.actor, "pace_levels", 0):            # its state inputs exist before anything reads the state
+                self.obs.pace_on(self.actor.pace_levels, self.actor.pace_hold)
             if self.actor.branches == 2:
                 self.obs.prev_branch = torch.zeros(int(self.lid.numel()), device=device)
         else:

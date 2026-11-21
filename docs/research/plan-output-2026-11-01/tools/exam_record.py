@@ -222,6 +222,8 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
 
 
 obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
+if getattr(actor, "pace_levels", 0):                         # (11-21) a pace policy: its state inputs exist before the first read
+    obs.pace_on(actor.pace_levels, actor.pace_hold)
 po = env.procedural
 if LINE3:
     # the races the reset gave boxes are exam1's (the draw takes the same random numbers whatever the bank holds); each gets bank
