@@ -189,6 +189,10 @@ class PlanReward:
         # the car then drives (tail error, qual26b u344), so on an empty track 7 % of plans graze a wall 0.5-1.0 s ahead that
         # the car never touches -- priced like boxes that is half the lap reward, for prediction error, not driving
         self.plan_hit_wall_n = None
+        #: (11-21, plan_rl --plan-hit-known; the user "좋다이거") (B_l, slots) bool or None: when set, a plan is priced only for
+        #: crossing the boxes this car has already passed -- what its memory knows (97 % of them 4-8 m ahead in the exam) --
+        #: not walls, not boxes it has never seen
+        self.plan_known = None
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
         #: (11-21, plan_rl --shaping-fade) the weight of the distance shaping: 1 = as agreed 11-07, 0 = the lap bonus alone
@@ -296,7 +300,7 @@ class PlanReward:
         tid = self.env.sim.tid[self.lid]
         c, s = torch.cos(psi)[..., None], torch.sin(psi)[..., None]
         place = lambda P: torch.stack([x[..., None] + P[:, 0] * c - P[:, 1] * s, y[..., None] + P[:, 0] * s + P[:, 1] * c], -1)
-        if self.plan_hit_wall_n == 0:                                                 # (11-18) walls not looked at
+        if self.plan_hit_wall_n == 0 or self.plan_known is not None:                  # (11-18) walls not looked at
             hit = torch.zeros(x.shape, dtype=torch.bool, device=x.device)
         else:
             pts = place(self.corners)                                                 # (B_l, n, 4, 2)
@@ -308,7 +312,9 @@ class PlanReward:
         if proc is not None:
             ol = place(self.outline)                                                  # (B_l, n, k, 2): the whole outline
             eid = self.env.sim.eid[self.lid][:, None, None].expand(ol.shape[:-1]).reshape(-1)
-            cl = proc.clearance(ol.reshape(-1, 2), eid).reshape(ol.shape[:-1])
+            km = (self.plan_known[:, None, None, :].expand(*ol.shape[:-1], self.plan_known.shape[1]).reshape(-1, self.plan_known.shape[1])
+                  if self.plan_known is not None else None)
+            cl = proc.clearance(ol.reshape(-1, 2), eid, slot_mask=km).reshape(ol.shape[:-1])
             hit = hit | (cl <= 0.0).any(-1)
         hit[:, 0] = False
         if self.plan_hit_n is not None:                                               # only the plan's first poses

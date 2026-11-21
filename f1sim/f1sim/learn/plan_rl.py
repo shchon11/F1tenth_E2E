@@ -588,6 +588,11 @@ def main(argv=None):
                     help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices); "
                          "default: the world json's \"contact_scale\" (6.59 s / the map's raceline lap, 11-15), else 1")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
+    ap.add_argument("--plan-hit-known", action="store_true",
+                    help="(11-21, the user \"좋다이거\") the plan-hit cost only for the boxes this car has already passed (--mem-aux-seen) "
+                         "-- no walls, no unseen boxes. A box hit is paid once, 1 s and more after the line was chosen; its memory "
+                         "already knows it 4-8 m ahead (97 % in the exam) yet the same blind box is hit lap after lap. A plan drawn "
+                         "through a known box pays at the decision that drew it (--plan-hit-share of a contact)")
     ap.add_argument("--plan-hit-wall-s", type=float, default=None,
                     help="(11-18) walls only this far into the plan [s] (boxes still --plan-hit-s); default: as --plan-hit-s")
     ap.add_argument("--hold-p", type=float, default=0.0,
@@ -1061,6 +1066,10 @@ def main(argv=None):
         aux_seen = torch.zeros(Bl, C_, dtype=torch.bool, device=dev)
         aux_prev_ds = torch.full((Bl, C_), float("nan"), device=dev)
         aux_prev_pos = torch.zeros(Bl, C_, 2, device=dev)
+    if args.plan_hit_known:
+        if aux_seen is None or not args.plan_hit_share > 0:
+            raise SystemExit("--plan-hit-known needs --mem-aux-seen and --plan-hit-share > 0")
+        pr.plan_known = aux_seen                                     # updated every decision with the passing bookkeeping
     known_on = bool(args.noise_corr_known)
     if known_on:
         kn_rho, kn_std, kn_d0, kn_d1 = (float(x) for x in args.noise_corr_known.split(","))
@@ -1336,6 +1345,8 @@ def main(argv=None):
                         if aux_seen is not None:
                             aux_seen, aux_prev_ds, aux_prev_pos = boxes_passed(aux_seen, aux_prev_ds, aux_prev_pos,
                                                                                *box_along(env, pr.goal, lid))
+                            if args.plan_hit_known:
+                                pr.plan_known = aux_seen               # the boxes known now price this decision's plan
                         ax_ = (track_boxes(env, pr.goal, lid, AUXK, args.box_range, known=aux_seen) if args.box_range > 0
                                else env._prop_block(env.sim.state)[lid].float().clone())
                         if aux_opp:

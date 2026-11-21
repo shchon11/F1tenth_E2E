@@ -1422,7 +1422,7 @@ class ProceduralObstacles:
         return out + (idx,) if return_idx else out
 
     def clearance(self, xy: torch.Tensor, eid: Optional[torch.Tensor] = None,
-                  k: int = CONTACT_SLOTS) -> torch.Tensor:
+                  k: int = CONTACT_SLOTS, slot_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(n,) metres from each point of `xy` (n, 2) to the nearest live prop, `inf` if none.
 
         Why this exists: everything that reads the occupancy grid is blind to these props -- they
@@ -1445,7 +1445,8 @@ class ProceduralObstacles:
         n_pts = xy.shape[0]
         if eid is None:
             eid = torch.arange(n_pts, device=xy.device) % self.p_poses.shape[0]
-        poses, pn, pd, zlo, zhi = self.near(xy, eid, k)
+        # (11-21) `slot_mask` (n, slots) bool: only these layout slots count for each point (the boxes a car already knows)
+        poses, pn, pd, zlo, zhi, idx = self.near(xy, eid, k, return_idx=True)
         C, K = pn.shape[1], pn.shape[2]
         flat = lambda a: a.reshape(n_pts * C, *a.shape[2:])
         nw, dw = _to_world(flat(pn), flat(pd), flat(poses))
@@ -1454,8 +1455,10 @@ class ProceduralObstacles:
         # max over the prism's own faces of the signed plane distance; padded faces cannot win
         sd = (nw * xy.repeat_interleave(C, 0)[:, None, :]).sum(-1) - dw
         sd = torch.where(valid, sd, torch.full_like(sd, -float("inf"))).max(1).values
-        sd = torch.where(live, sd, torch.full_like(sd, float("inf")))
-        return sd.view(n_pts, C).min(1).values
+        sd = torch.where(live, sd, torch.full_like(sd, float("inf"))).view(n_pts, C)
+        if slot_mask is not None:
+            sd = torch.where(torch.gather(slot_mask, 1, idx), sd, torch.full_like(sd, float("inf")))
+        return sd.min(1).values
 
     def stats(self) -> Dict[str, float]:
         draws, pieces, dropped, missed = (float(x) for x in self._stat.tolist())
