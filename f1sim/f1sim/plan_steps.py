@@ -97,7 +97,7 @@ def _spread(a: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor
     return lo + (a.clamp(-1.0, 1.0) + 1.0) * 0.5 * (hi - lo)
 
 
-def step_targets(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits):
+def step_targets(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits, cap: torch.Tensor = None):
     """(B, 20) action, start speed v0 (B,) [m/s, signed] and steering d0 (B,) [rad] -> the steering and speed at the end
     of every step, (B, N) each, and how far each step's steering had to unwind past its range (B, N) [rad] (0 unless the
     start was already outside the tyres' grip)"""
@@ -127,18 +127,20 @@ def step_targets(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: 
         vcap = torch.maximum(lim.speed_for(steer_to_kappa(d, lim)), slowest)
         hi_v = torch.minimum(v_hi, vcap)
         lo_v = torch.maximum(v_lo, -vcap)
+        if cap is not None:                                    # (11-21) a speed cap per row [m/s]: braking to it at most a_brake a step
+            hi_v = torch.minimum(hi_v, torch.maximum(cap, lo_v))
         hi_v = torch.maximum(hi_v, lo_v)                       # a forced unwind can leave no room: take the slowest
         v = _spread(a_speed[:, k], lo_v, hi_v)
         ds_.append(d); vs_.append(v)
     return torch.stack(ds_, 1), torch.stack(vs_, 1), torch.stack(forced, 1)
 
 
-def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits) -> Dict[str, torch.Tensor]:
+def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits, cap: torch.Tensor = None) -> Dict[str, torch.Tensor]:
     """The plan in the car's frame now (its CoG): dense poses on the control grid, (B, N SUB + 1) each of x, y, psi, v,
     delta, t (index 0 = now), the 10 points `pts` (B, N, 2) / their speeds `pv` (B, N), and the command of every control
     step `cmd_d` / `cmd_v` (B, N SUB) -- held over its 0.025 s, the kinematic bicycle about the CoG driven by them is
     exactly these poses (`Sim.ideal_rows`)."""
-    d_end, v_end, forced = step_targets(action, v0, d0, lim)
+    d_end, v_end, forced = step_targets(action, v0, d0, lim, cap)
     B = action.shape[0]
     dev = action.device
     h = DT / SUB

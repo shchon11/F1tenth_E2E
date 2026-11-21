@@ -653,7 +653,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
     return actor
 
 
-def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, eps: Optional[torch.Tensor] = None):
+def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, eps: Optional[torch.Tensor] = None,
+            cap: Optional[torch.Tensor] = None):
     """one decision of a v2 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate and the last
     steering command. A memory actor's state is `obs.mem_h` (made here, cleared by `obs.reset_rows`), stepped once per call:
     call once per decision. A two-plan actor (`Actor2.branches`): the plan with the larger logit; `obs.prev_branch` (made
@@ -672,7 +673,7 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, 
     if two:
         obs.prev_branch = 1.0 - 2.0 * actor.branch_out.float()
     u = mean + log_std.exp() * (torch.randn_like(mean) if eps is None else eps) if sample else mean      # `eps`: the caller's noise (e.g. held)
-    p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
+    p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap)     # `cap`: a speed cap per row
     return u, mean, log_std, v_hat, p
 
 

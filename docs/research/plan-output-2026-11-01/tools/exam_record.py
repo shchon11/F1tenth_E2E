@@ -78,6 +78,10 @@ STEER_STD_FLOOR = float(os.environ.get("F1SIM_EXAM_STEER_STD_FLOOR", "0") or 0)
 # (11-21) with SAMPLE: the first step's SPEED noise held as AR(1) with this rho (0 = fresh, as training) -- how far the approach
 # speed to a blind box swings between passes when the speed noise is held 1-2 s (training's fresh noise: 0.20 m/s, needed ~2 m/s)
 SPEED_RHO = float(os.environ.get("F1SIM_EXAM_SPEED_RHO", "0") or 0)
+# (11-21, measurement for the redesign: can a speed cap alone avoid the blind-corner boxes the policy hits every lap?) "C,D": while a
+# box is present within D m ahead along the track, the plan's speeds are capped at C m/s (braking to it at most a_brake a step).
+# An oracle: it knows every box from the start (perfect memory, the first pass too)
+CAP = [float(x) for x in os.environ.get("F1SIM_EXAM_CAP", "").split(",") if x.strip()]
 # (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
 # the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
 CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
@@ -374,7 +378,17 @@ for kd in range(T):
         if _rs is not None:
             _eps_n[_rs] = torch.randn_like(_eps_n[_rs])
         _eps = torch.zeros_like(_eps_n); _eps[:, 0] = _eps_n[:, 0]; _eps[:, PS.N_STEP] = _eps_n[:, PS.N_STEP]
-    _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps) if _eps is not None      # plain exams: no new argument
+    _cap = None
+    if CAP and po is not None:                                  # F1SIM_EXAM_CAP: a box present within D m ahead -> the cap
+        _tid = env.sim.tid[lid]
+        _dc = pr.goal.remaining(env.sim.state[lid, :2].float(), _tid)                                   # (Bl,)
+        _pb = po.p_poses[lid][..., :2].float()                                                        # (Bl, P, 2)
+        _db = pr.goal.remaining(_pb.reshape(-1, 2), _tid[:, None].expand(-1, _pb.shape[1]).reshape(-1)).view(_pb.shape[:2])
+        _L = pr.goal.lap[_tid][:, None]
+        _ah = torch.remainder(_dc[:, None] - _db, _L)
+        _ok = (po.p_sid[lid] >= 0) & torch.isfinite(_ah) & (_ah < CAP[1])
+        _cap = torch.where(_ok.any(1), torch.full_like(_dc, CAP[0]), torch.full_like(_dc, float("inf")))
+    _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                             else plan_v2(actor, obs, lim, sample=SAMPLE))
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
