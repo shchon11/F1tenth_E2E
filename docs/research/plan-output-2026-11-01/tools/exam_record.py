@@ -75,6 +75,9 @@ SAMPLE = os.environ.get("F1SIM_EXAM_SAMPLE", "") == "1"
 # log_std_floor; 0 = the policy's own): how far from its line can exploration take the car?
 NOISE_RHO = float(os.environ.get("F1SIM_EXAM_NOISE_RHO", "0") or 0)
 STEER_STD_FLOOR = float(os.environ.get("F1SIM_EXAM_STEER_STD_FLOOR", "0") or 0)
+# (11-21) with SAMPLE: the first step's SPEED noise held as AR(1) with this rho (0 = fresh, as training) -- how far the approach
+# speed to a blind box swings between passes when the speed noise is held 1-2 s (training's fresh noise: 0.20 m/s, needed ~2 m/s)
+SPEED_RHO = float(os.environ.get("F1SIM_EXAM_SPEED_RHO", "0") or 0)
 # (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
 # the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
 CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
@@ -364,8 +367,10 @@ for kd in range(T):
             _eps_n = torch.randn(obs.scans.shape[0], PS.ACT_DIM, device=obs.scans.device)
         _rs = env_restarted if "env_restarted" in globals() and env_restarted is not None else None
         _fresh = torch.randn_like(_eps_n)
+        _sp = SPEED_RHO * _eps_n[:, PS.N_STEP] + (1.0 - SPEED_RHO ** 2) ** 0.5 * _fresh[:, PS.N_STEP]
         _eps_n[:, 0] = NOISE_RHO * _eps_n[:, 0] + (1.0 - NOISE_RHO ** 2) ** 0.5 * _fresh[:, 0]
         _eps_n[:, 1:] = _fresh[:, 1:]
+        _eps_n[:, PS.N_STEP] = _sp
         if _rs is not None:
             _eps_n[_rs] = torch.randn_like(_eps_n[_rs])
         _eps = torch.zeros_like(_eps_n); _eps[:, 0] = _eps_n[:, 0]; _eps[:, PS.N_STEP] = _eps_n[:, PS.N_STEP]
