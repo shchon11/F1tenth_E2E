@@ -613,6 +613,9 @@ def main(argv=None):
                          "this car has seen (centre in the LiDAR's view, no wall between) or passed this episode, and the walls within "
                          "--plan-hit-wall-s of the plan (its far end grazes walls on 7 %% of empty-track decisions -- pricing that slowed "
                          "every 11-17/18 run); boxes never seen are left out")
+    ap.add_argument("--plan-hit-ramp", default="",
+                    help="U0,U1 (11-22): --plan-hit-share is 0 until update U0 and reaches its value at U1 -- the plan cost once the "
+                         "car drives (qual28d with it from the start stood 29-64 %% of the time at u20-54 where qual27c stood 4-45 %%)")
     ap.add_argument("--plan-hit-known", action="store_true",
                     help="(11-21, the user \"좋다이거\") the plan-hit cost only for the boxes this car has already passed (--mem-aux-seen) "
                          "-- no walls, no unseen boxes. A box hit is paid once, 1 s and more after the line was chosen; its memory "
@@ -1284,6 +1287,9 @@ def main(argv=None):
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
     for upd in range(1 + args.update_offset, args.updates + 1):
+        if args.plan_hit_ramp:                                      # --plan-hit-ramp: the plan cost's share this update
+            _h0, _h1 = (float(x_) for x_ in args.plan_hit_ramp.split(","))
+            pr.plan_hit_share = float(args.plan_hit_share) * min(1.0, max(0.0, (upd - _h0) / max(1.0, _h1 - _h0)))
         if args.shaping_fade:                                       # --shaping-fade: the distance shaping's weight this update
             _f0, _f1 = (float(x_) for x_ in args.shaping_fade.split(","))
             pr.shaping_w = 1.0 - min(1.0, max(0.0, (upd - _f0) / max(1.0, _f1 - _f0)))
