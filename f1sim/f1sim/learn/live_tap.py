@@ -26,9 +26,15 @@ def _r(a, n=3):
 
 
 class LiveTap:
-    def __init__(self, env, run_dir: str, row: int = 0, trail: int = 80, beam_every: int = 4):
+    def __init__(self, env, run_dir: str, row: int = 0, trail: int = 80, beam_every: int = 4, name: str = "live_tap.json",
+                 label: str = ""):
         self.env, self.row = env, int(row)
-        self.path = os.path.join(run_dir, "live_tap.json")
+        self.path = os.path.join(run_dir, name)
+        self.label = str(label)
+        # (11-22, the user: "항목별 보상값들이라던지 아니면 좀 기억관련 좀 직관적이게 볼 수 있는것들?") the reward's parts summed
+        # over this episode and the last 10 s, and the episode's lap times -- the page polls slower than decisions come
+        self.ep_sum = np.zeros(5); self.win = deque(maxlen=100); self.laps = deque(maxlen=6)
+        self.dec_ep, self.cross = 0, None
         self.run = os.path.basename(os.path.normpath(run_dir))
         self.trail = deque(maxlen=int(trail))
         lid = env.learner_ids
@@ -46,9 +52,10 @@ class LiveTap:
                     pass
         # (11-18) the car's length and width: the page draws the plan's footprints and the half-width band with them
         car = np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)])
-        np.savez(os.path.join(run_dir, "live_tracks.npz"), edt=tr.edt.float().cpu().numpy(), t_off=tr.t_off.cpu().numpy(),
-                 t_H=tr.t_H.cpu().numpy(), t_W=tr.t_W.cpu().numpy(), t_res=tr.t_res.cpu().numpy(),
-                 t_origin=tr.t_origin.cpu().numpy(), car=car, **fps)
+        if name == "live_tap.json":                                 # the drawing set once, by the first car's tap
+            np.savez(os.path.join(run_dir, "live_tracks.npz"), edt=tr.edt.float().cpu().numpy(), t_off=tr.t_off.cpu().numpy(),
+                     t_H=tr.t_H.cpu().numpy(), t_W=tr.t_W.cpu().numpy(), t_res=tr.t_res.cpu().numpy(),
+                     t_origin=tr.t_origin.cpu().numpy(), car=car, **fps)
         sim = env.sim
         self.beam_every = int(beam_every)
         self.angles = sim.lidar.angles.float()[::self.beam_every].cpu().numpy()
@@ -65,7 +72,7 @@ class LiveTap:
     def record(self, upd: int, kd: int, pts: torch.Tensor, pts_mean: torch.Tensor, plan_v: torch.Tensor,
                value: torch.Tensor, reward: torch.Tensor, lap: torch.Tensor, contact: torch.Tensor, shaping: torch.Tensor,
                vhat: torch.Tensor, noise: torch.Tensor, std: torch.Tensor, mem=None, replay: bool = False,
-               copy_opp: bool = False) -> None:
+               copy_opp: bool = False, mem_read=None, mem_pose=None, known=None) -> None:
         """after a decision, learner `row`'s: `pts` (10, 2) the plan it drove (world), `pts_mean` (10, 2) the plan its mean
         action makes, `plan_v` (10,) the driven plan's speeds, the critic's `value`, the reward and its parts, the speed
         estimate `vhat`, the size of the noise drawn (`noise`, in std units) and the policy's mean std, `mem` (memory,) the
@@ -108,7 +115,26 @@ class LiveTap:
         self.prev_plan, self.prev_mem, self.prev_xy = plan_xy, (mm.copy() if len(mm) else None), car[:2].copy()
         if new_ep:
             self.trail.clear()
+            self.ep_sum[:] = 0.0; self.win.clear(); self.laps.clear(); self.dec_ep, self.cross = 0, None
         self.trail.append(_r([car[0], car[1], car[3]], 2))
+        # the reward's parts: lap bonus, distance shaping, contacts, the plan-hit price (what the total leaves), the total
+        parts = np.array([lap_[0], shp[0], con[0], rew[0] - lap_[0] - shp[0] - con[0], rew[0]])
+        self.ep_sum += parts; self.win.append(parts); self.dec_ep += 1
+        if lap_[0] > 0.5:
+            if self.cross is not None:
+                self.laps.append(round((self.dec_ep - self.cross) * 0.1, 1))
+            self.cross = self.dec_ep
+        # the memory's read-out (`Actor2.aux_read`, 3 slots of present-logit, dx/5, dy/5, ds/5 in the car's frame at the
+        # decision's start): where it thinks the boxes ahead are, in the world
+        mem_boxes = None
+        if mem_read is not None and mem_pose is not None:
+            a_ = mem_read.float().reshape(-1).cpu().numpy(); x0, y0, h0 = (float(v_) for v_ in mem_pose.float().reshape(-1)[:3].cpu())
+            mem_boxes = []
+            for k_ in range(min(3, len(a_) // 4)):
+                pk = 1.0 / (1.0 + np.exp(-a_[4 * k_])); dx_, dy_, ds_ = 5.0 * a_[4 * k_ + 1], 5.0 * a_[4 * k_ + 2], 5.0 * a_[4 * k_ + 3]
+                if pk > 0.05:
+                    mem_boxes.append([round(float(pk), 2), round(x0 + dx_ * np.cos(h0) - dy_ * np.sin(h0), 2),
+                                      round(y0 + dx_ * np.sin(h0) + dy_ * np.cos(h0), 2), round(float(ds_), 1)])
         now = {"t": round(time.time(), 3), "upd": int(upd), "k": int(kd), "tid": int(tid[0]),
                "car": _r(car), "opp": _r(opp) if pres[0] > 0.5 else None,
                "plan": _r(plan.reshape(10, 2)), "plan_mean": _r(plan_m.reshape(10, 2)), "plan_v": _r(pv, 2),
@@ -118,7 +144,10 @@ class LiveTap:
                "contact": round(float(con[0]), 5), "shaping": round(float(shp[0]), 5), "vhat": round(float(vh[0]), 3),
                "noise": round(float(noi[0]), 3), "std": round(float(sd[0]), 4), "new_ep": bool(new_ep),
                "plan_change": None if plan_change is None else round(plan_change, 4),
-               "mem_change": None if mem_change is None else round(mem_change, 5)}
+               "mem_change": None if mem_change is None else round(mem_change, 5),
+               "label": self.label, "parts_ep": _r(self.ep_sum, 3), "parts_win": _r(np.sum(self.win, 0), 3),
+               "laps": list(self.laps), "ep_s": round(self.dec_ep * 0.1, 1), "mem_boxes": mem_boxes,
+               "known": None if known is None else int(known)}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))

@@ -811,6 +811,9 @@ def main(argv=None):
     ap.add_argument("--live-tap", type=int, default=-1, metavar="ROW",
                     help="write learner ROW's car every decision to <run>/live_tap.json for the live view (11-17, the user: "
                          "\"콘솔에서 막 학습중인거 실시간으로 뭐 차 하나만 볼 수 없나\"); -1 = off")
+    ap.add_argument("--live-taps", type=int, default=0,
+                    help="(11-22, the user: \"이차밖에 못보나? 다른 차들을 볼 수 없나\") this many more cars besides --live-tap's, spread over "
+                         "the session groups, each to <run>/live_tap_<k>.json")
     ap.add_argument("--scene-keep-unsolved", action="store_true",
                     help="a slot is given up by the scene driven clean the most times in a row, not by the oldest: a scene the "
                          "policy keeps failing stays until it is driven clean (11-17: the FIFO store dropped every scene after "
@@ -1269,9 +1272,30 @@ def main(argv=None):
         raise SystemExit("--horizon-auto needs --accum-actor-auto (it reads the noise scale that measures)")
     log = open(os.path.join(run, "progress.jsonl"), "a")
     tap = None
+    taps = []
     if args.live_tap >= 0:
         from .live_tap import LiveTap
-        tap = LiveTap(env, run, row=args.live_tap)
+        _gl = {0: "긴 빈 트랙", 1: "긴 상자 판 (도중에 치움)", 2: "짧은 판"}
+        _rg = rows_g[lid] if grp is not None else None
+        lab_ = lambda r_: _gl.get(int(_rg[r_]), "") if _rg is not None else ""
+        tap = LiveTap(env, run, row=args.live_tap, label=lab_(args.live_tap))
+        taps = [tap]
+        if args.live_taps > 0:
+            # more cars, spread over the groups (with session groups) or over the batch
+            if _rg is not None:
+                cand = [torch.nonzero(_rg == g_)[:, 0].tolist() for g_ in (0, 1, 2)]
+                pick, i_ = [], 0
+                while len(pick) < args.live_taps and any(cand):
+                    c_ = cand[i_ % 3]
+                    if c_:
+                        r_ = c_.pop(len(c_) // 2 if len(pick) < 3 else 0)
+                        if r_ != args.live_tap:
+                            pick.append(r_)
+                    i_ += 1
+            else:
+                pick = [int(r_) for r_ in torch.linspace(0, Bl - 1, args.live_taps + 2)[1:-1].round().long().tolist()]
+            for k_, r_ in enumerate(pick[:args.live_taps], start=1):
+                taps.append(LiveTap(env, run, row=r_, name=f"live_tap_{k_}.json", label=lab_(r_)))
     tap_pm = torch.zeros(10, 2, device=dev)
     t0 = time.time()
     trk = None
@@ -1499,12 +1523,13 @@ def main(argv=None):
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap_ if pace_on else None)
-                    if tap is not None:                            # the plan the mean action makes, for the live view
-                        _q = tap.row
+                    for tp_ in taps:                               # the plan the mean action makes, for the live view
+                        _q = tp_.row
                         _pm = PS.roll(torch.tanh(mean[_q:_q + 1]), v_hat[_q:_q + 1].clamp(-PS.V_REV, PS.V_FWD),
                                       obs.cmd_d[_q:_q + 1], lim, cap_[_q:_q + 1] if pace_on else None)
                         _xm, _ym, _ = plan_world(_pm, env.sim.state[lid[_q:_q + 1]])
-                        tap_pm = torch.stack([_xm[0, PT_IDX.to(dev)], _ym[0, PT_IDX.to(dev)]], -1)
+                        tp_.pm = torch.stack([_xm[0, PT_IDX.to(dev)], _ym[0, PT_IDX.to(dev)]], -1)
+                        tp_.pose0 = env.sim.state[lid[_q], :3].clone()   # where the memory's read-out is measured from
                     vest_err.append((v_hat - v_true).abs())
                     if tailc:
                         V0.append(v_hat.clamp(-PS.V_REV, PS.V_FWD).clone()); D0.append(obs.cmd_d.clone())
@@ -1524,15 +1549,20 @@ def main(argv=None):
                 if levels is not None:
                     hard0 = env.sim.contact_counts[lid, 3:6].clone()
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
-                if tap is not None:
-                    _ii, _q = PT_IDX.to(dev), tap.row
+                for tp_ in taps:
+                    _ii, _q = PT_IDX.to(dev), tp_.row
                     _ls = log_std.expand_as(mean)
-                    tap.record(upd, t, torch.stack([xw_[_q, _ii], yw_[_q, _ii]], -1), tap_pm, p["pv"][_q], v[_q],
+                    _mh = getattr(obs, "mem_h", None)
+                    _mr = (actor.aux_read(_mh[_q:_q + 1])[0] if (_mh is not None and getattr(actor, "aux", None) is not None
+                                                                 and getattr(actor, "box_memory", 0)) else None)
+                    tp_.record(upd, t, torch.stack([xw_[_q, _ii], yw_[_q, _ii]], -1), getattr(tp_, "pm", tap_pm), p["pv"][_q], v[_q],
                                out["reward"][_q], out["lap"][_q], out["contact"][_q], out["shaping"][_q], v_hat[_q],
                                ((u - mean)[_q] / _ls[_q].exp()).pow(2).mean().sqrt(), _ls[_q].exp().mean(),
-                               mem=getattr(obs, "mem_h", None)[_q] if getattr(obs, "mem_h", None) is not None else None,
+                               mem=_mh[_q] if _mh is not None else None,
                                replay=bool(scene.in_replay[_q]) if scene is not None else False,
-                               copy_opp=bool(drv.opp.on[opp_index[others[_q, 0]]]) if drv.opp is not None else False)
+                               copy_opp=bool(drv.opp.on[opp_index[others[_q, 0]]]) if drv.opp is not None else False,
+                               mem_read=_mr, mem_pose=getattr(tp_, "pose0", None),
+                               known=int(aux_seen[_q].sum()) if aux_seen is not None else None)
                 if args.dump_rollout:
                     DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
                     for k in ("contact", "lap", "shaping"):

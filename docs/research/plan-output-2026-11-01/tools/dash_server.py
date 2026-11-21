@@ -358,6 +358,22 @@ def spots(name):
     return {"frames": frames}
 
 
+def live_cars(name):
+    """(11-22, the user: "이차밖에 못보나? 다른 차들을 볼 수 없나") the cars a run writes: 0 = live_tap.json, k = live_tap_<k>.json"""
+    d = os.path.join(RUNS, os.path.basename(name))
+    out = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        m = re.fullmatch(r"live_tap(?:_(\d+))?\.json", f)
+        if not m:
+            continue
+        try:
+            lab = json.load(open(os.path.join(d, f))).get("now", {}).get("label", "")
+        except (ValueError, OSError):
+            lab = ""
+        out.append({"car": int(m.group(1) or 0), "label": lab})
+    return {"cars": sorted(out, key=lambda c: c["car"])}
+
+
 def live_runs():
     """runs that write the live view, newest first"""
     out = []
@@ -486,7 +502,9 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/live":
                 return self._send(200, open(os.path.join(TOOLS, "live_page.html"), "rb").read(), "text/html; charset=utf-8")
             if u.path == "/api/live":
-                return self._live(name)
+                return self._live(name, q.get("car", "0"))
+            if u.path == "/api/live_cars":
+                return self._json(memo(("live_cars", name), 5, lambda: live_cars(name)))
             if u.path == "/api/live_track":
                 return self._json(memo(("live_track", name, q.get("tid", "0")), 3600, lambda: live_track(name, int(q.get("tid", "0")))))
             if u.path == "/api/live_runs":
@@ -495,8 +513,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(500, json.dumps({"error": str(exc)[:300]}))
         self._send(404, "{}")
 
-    def _live(self, name):
-        p = os.path.join(RUNS, os.path.basename(name), "live_tap.json")
+    def _live(self, name, car="0"):
+        k = int(car) if str(car).isdigit() else 0
+        p = os.path.join(RUNS, os.path.basename(name), "live_tap.json" if k == 0 else f"live_tap_{k}.json")
         if not name or not os.path.isfile(p):
             return self._send(404, json.dumps({"error": "이 run에는 실시간 기록이 없습니다 (plan_rl --live-tap)"}))
         body = open(p, "rb").read()

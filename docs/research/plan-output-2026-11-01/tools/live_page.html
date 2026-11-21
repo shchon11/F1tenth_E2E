@@ -74,6 +74,15 @@
   .strip .cv { position: relative; flex: 1; min-height: 56px; margin-top: 4px; }
   .strip canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   #events { flex: 0 0 132px; display: flex; flex-direction: column; padding: 8px 10px; }
+  /* (11-22, the user: "항목별 보상값들이라던지 아니면 좀 기억관련 좀 직관적이게") the reward's parts and what the memory thinks */
+  #rwp, #memp { padding: 8px 10px; }
+  #rwp h3, #memp h3 { margin: 0 0 4px; font-size: 13px; }
+  .rwt { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .rwt th { font-weight: 400; color: var(--muted); text-align: right; padding: 1px 6px; }
+  .rwt td { text-align: right; padding: 1px 6px; color: var(--ink); }
+  .rwt td:first-child { text-align: left; color: var(--ink-2); }
+  .rwt tr.tot td { border-top: 1px solid var(--line); font-weight: 600; }
+  .laps, .memrow { font-size: 13px; color: var(--ink-2); margin-top: 4px; font-variant-numeric: tabular-nums; }
   #events h3 { margin: 0 0 4px; font-size: 13px; }
   #evlist { flex: 1; min-height: 0; overflow: auto; font-size: 12px; }
   #evlist div { display: flex; gap: 10px; padding: 3px 0; border-top: 1px solid var(--grid); color: var(--ink-2); }
@@ -122,6 +131,7 @@
 <header>
   <span class="title">학습 차 실시간</span>
   <select id="run" aria-label="학습"></select>
+  <select id="car" aria-label="차" hidden></select>
   <span class="pill" id="status"><span class="dot"></span><span id="status_t">-</span></span>
   <span class="pill" id="upd">-</span>
   <span class="prog" id="p_upd">다음 update까지 <span class="bar"><i id="p_upd_b"></i></span><span id="p_upd_t">-</span></span>
@@ -150,10 +160,11 @@
     <div class="viewbar"><button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
   </section>
   <section class="side">
-    <div class="panel strip"><h3>속도 <span class="note">m/s · 최근 20초</span><span class="now" id="now_v">-</span></h3>
-      <div class="legend"><span><i style="background:var(--s-car)"></i>지금 속도</span><span><i style="background:var(--s-plan)"></i>plan이 1초 뒤에 낼 속도</span></div>
-      <div class="cv"><canvas id="c_v"></canvas></div></div>
-    <!-- (11-22, the user: "필요한것만 넣어 여기애 쫌 넘 쓸모없는개 많어") critic value, plan change and memory change taken out -->
+    <!-- (11-22, the user: "필요한것만 넣어", "속도이런건 plot할 필요가 없자나", "항목별 보상값들 ... 기억관련 ... 직관적이게") -->
+    <div class="panel" id="rwp" hidden><h3>보상 항목</h3>
+      <table class="rwt"><thead><tr><th></th><th>최근 10초</th><th>이번 에피소드</th></tr></thead><tbody id="rw_b"></tbody></table>
+      <div class="laps" id="laps"></div></div>
+    <div class="panel" id="memp" hidden><h3>기억 <span class="note">앞에 있다고 보는 상자 · 지도의 점선 원</span></h3><div id="mem_b"></div></div>
     <div class="panel" id="events"><h3>일어난 일</h3><div id="evlist"></div></div>
   </section>
   <section class="panel" id="spots">
@@ -175,7 +186,7 @@ const C = {};
 for (const k of ["page","surface","line","grid","ink","ink-2","muted","lane","wall","scan","s-car","s-plan","s-mean","s-box","s-copy","s-opp","critical","warning","band"]) C[k] = tok("--" + k);
 
 const SPAN_S = 20;                                  // the strips show the last 20 s of decisions
-let RUN = new URLSearchParams(location.search).get("run") || "", TRACK = {}, lastKey = null;
+let RUN = new URLSearchParams(location.search).get("run") || "", TRACK = {}, lastKey = null, CAR = "0";
 let F0 = null, F1 = null, t1 = 0, dtF = 0.15;        // the two newest frames, for a smooth car between them
 const S = [];                                       // history: {t, v, vp, val, pc, mc}
 const EV = [];                                      // events on the time axis: {t, kind}
@@ -231,13 +242,29 @@ $("v_track").onclick = () => setMode("track");
   c.addEventListener("dblclick", toggleFollow);
 })();
 
+function resetCar() { S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; PR.trailLen = null; }
+// (11-22, the user: "이차밖에 못보나? 다른 차들을 볼 수 없나") the cars this run writes (plan_rl --live-taps), one picked at a time
+async function loadCars() {
+  if (!RUN) return;
+  const r = await (await fetch(`/api/live_cars?run=${encodeURIComponent(RUN)}`, { cache: "no-store" })).json();
+  const cs = r.cars || [], sel = $("car");
+  sel.hidden = cs.length <= 1;
+  const want = cs.map((c) => `${c.car}|${c.label}`).join(",");
+  if (sel.dataset.cars !== want) {
+    sel.dataset.cars = want;
+    sel.innerHTML = cs.map((c) => `<option value="${c.car}">차 ${c.car + 1}${c.label ? " · " + c.label : ""}</option>`).join("");
+  }
+  if (!cs.some((c) => String(c.car) === CAR)) CAR = "0";
+  sel.value = CAR;
+  sel.onchange = () => { CAR = sel.value; resetCar(); };
+}
 async function loadRuns() {
   const r = await (await fetch("/api/live_runs")).json();
   const sel = $("run"); const cur = sel.value || RUN; sel.innerHTML = "";
   for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = x.name; sel.appendChild(o); }
   if (!r.length) return;
   RUN = r.some((x) => x.name === cur) ? cur : r[0].name; sel.value = RUN;
-  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; PR.trailLen = null; };
+  sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); CAR = "0"; resetCar(); loadCars().catch(() => {}); };
 }
 
 async function track(tid) {
@@ -363,6 +390,13 @@ function drawMap(f, carP, oppP, T, trail) {
   g.lineJoin = "round";
   for (const b of f.boxes) if (boxPath(b)) { g.strokeStyle = C.band; g.lineWidth = T.car[1] * s; g.stroke(); }
   for (const b of f.boxes) if (boxPath(b)) { g.fillStyle = C["s-box"]; g.fill(); }
+  // the memory's read-out: where it thinks the boxes ahead are (dashed circles, stronger = surer)
+  for (const b of f.mem_boxes || []) {
+    if (b[0] < 0.3) continue;
+    const [x, y] = P(b[1], b[2]);
+    g.save(); g.setLineDash([5, 4]); g.lineWidth = 2; g.globalAlpha = Math.min(1, 0.3 + b[0]); g.strokeStyle = C.warning;
+    g.beginPath(); g.arc(x, y, Math.max(6, 0.35 * s), 0, 2 * Math.PI); g.stroke(); g.restore();
+  }
   // trail, fading into the past
   g.lineWidth = 3; g.lineCap = "round"; g.lineJoin = "round";
   for (let i = 1; i < trail.length; i++) {
@@ -458,7 +492,7 @@ let tick0 = performance.now();
 async function poll() {
   if (!RUN) return;
   let r;
-  try { r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}`, { cache: "no-store" }); } catch (e) { return; }
+  try { r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}&car=${CAR}`, { cache: "no-store" }); } catch (e) { return; }
   if (!r.ok) return;
   const age = parseFloat(r.headers.get("X-Age") || "0");
   const live = age < 2;
@@ -493,20 +527,33 @@ async function poll() {
   if (f.new_ep) { EV.push({ t, kind: "ep" }); addEvent(f.replay ? "새 에피소드: 장면 재생 (예전에 세게 닿은 장면)" : "새 에피소드: 일반 경주", false); }
   const kinds = ["벽", "상자", "상대 차"];
   f.hit.forEach((h, i) => { if (h > 0) { EV.push({ t, kind: "hit" }); addEvent(`${kinds[i]}에 세게 닿음 · ${f.car[3].toFixed(1)} m/s`, true); } });
-  S.push({ t, v: f.car[3], vp: f.plan_v[9], val: f.value, pc: f.plan_change, mc: f.mem_change });
   while (S.length && S[0].t < t - SPAN_S - 2) S.shift();
   while (EV.length && EV[0].t < t - SPAN_S - 2) EV.shift();
   $("upd").textContent = `update ${f.upd} · 결정 ${f.k}`;
   $("ep").textContent = f.replay ? "장면 재생 중" : "일반 경주"; $("ep").className = "pill" + (f.replay ? " scene" : "");
   $("opp").textContent = f.opp ? (f.copy ? "상대: 우리 policy 복제본" : "상대: 기존 상대 차") : "상대 차 없음";
   for (const k of document.querySelectorAll(".k-opp")) k.style.display = f.opp ? "" : "none";   // a solo run has no opponents to key
-  $("now_v").textContent = f.car[3].toFixed(2);
+  panels(f);
   $("hud_sub").textContent = `plan 목표 ${f.plan_v[0].toFixed(1)} · 1초 뒤 ${f.plan_v[9].toFixed(1)} m/s`;
   F1.trail = d.trail;
   strips();
 }
-function strips() {
-  strip("c_v", [{ key: "v", col: C["s-car"] }, { key: "vp", col: C["s-plan"] }], { lo: 0, minSpan: 2 });
+function strips() {}
+// the reward's parts (the tap sums them: the page polls slower than decisions come) and the memory's boxes ahead
+function panels(f) {
+  const sg = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
+  if (f.parts_win) {
+    const names = ["바퀴", "전진", "접촉", "박는 plan", "합"];
+    $("rw_b").innerHTML = names.map((n, i) => `<tr${i === 4 ? ' class="tot"' : ""}><td>${n}</td><td>${sg(f.parts_win[i])}</td><td>${sg(f.parts_ep[i])}</td></tr>`).join("");
+    $("laps").textContent = (f.laps && f.laps.length ? "바퀴 시간 " + f.laps.map((x) => x.toFixed(1)).join(" · ") + " s" : "바퀴 시간 -") + ` · 에피소드 ${f.ep_s.toFixed(0)} s`;
+    $("rwp").hidden = false;
+  } else $("rwp").hidden = true;
+  if (f.mem_boxes != null) {
+    const mb = f.mem_boxes.filter((b) => b[0] >= 0.3);
+    $("mem_b").innerHTML = (mb.length ? mb.map((b) => `<div class="memrow">${b[3].toFixed(1)} m 앞 · 확신 ${(100 * b[0]).toFixed(0)} %</div>`).join("") : `<div class="memrow">앞 12 m에 아는 상자 없음</div>`)
+      + (f.known != null ? `<div class="memrow">이번 에피소드에 지나간 상자 ${f.known}개</div>` : "");
+    $("memp").hidden = false;
+  } else $("memp").hidden = true;
 }
 window.addEventListener("resize", () => { try { strips(); } catch (e) {} });
 
@@ -617,9 +664,10 @@ if (new URLSearchParams(location.search).get("spots")) spOpen(true);
 
 (async () => {
   await loadRuns();
+  await loadCars().catch(() => {});
   if (!RUN) { document.querySelector("main").innerHTML = '<div class="empty">실시간 기록을 쓰는 학습이 없습니다 (plan_rl --live-tap)</div>'; return; }
   setInterval(() => poll().catch(() => {}), 100);
-  setInterval(() => loadRuns().catch(() => {}), 20000);
+  setInterval(() => { loadRuns().catch(() => {}); loadCars().catch(() => {}); }, 20000);
   frame();
 })();
 </script>
