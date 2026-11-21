@@ -82,6 +82,15 @@ SPEED_RHO = float(os.environ.get("F1SIM_EXAM_SPEED_RHO", "0") or 0)
 # box is present within D m ahead along the track, the plan's speeds are capped at C m/s (braking to it at most a_brake a step).
 # An oracle: it knows every box from the start (perfect memory, the first pass too)
 CAP = [float(x) for x in os.environ.get("F1SIM_EXAM_CAP", "").split(",") if x.strip()]
+# (11-21, the user: "미리 알고 미리 라인 다르게" -- a known box is not blind any more) "oracle": every box the car has passed
+# once in this session is drawn into the policy's LiDAR input at its true place, as if no wall hid it (min with the real
+# scan); the walls, the contacts and the boxes themselves are untouched. Measures whether the avoid-when-visible skill, fed
+# what a memory knows, takes a different line before the box shows. Passing = the car's distance to go crosses the box's
+VIRT = os.environ.get("F1SIM_EXAM_VIRTUAL_BOXES", "")
+# (11-21, measurement for "미리 라인 다르게": does trying a different line before a KNOWN box avoid it at speed?) "RHO,STD,D0,D1"
+# with SAMPLE: only while a box the car has passed once this session lies D0..D1 m ahead along the track, the first step's
+# turn gets noise held as AR(1) (RHO) at least STD wide; everywhere else, and the speed always, the policy's mean
+TARGET = [float(x) for x in os.environ.get("F1SIM_EXAM_TARGET_NOISE", "").split(",") if x.strip()]
 # (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
 # the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
 CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
@@ -245,6 +254,53 @@ if LINE3:
     _nk = (po.p_sid[box_l] >= 0).sum(1)
     print(f"[exam2] 상자 경주 {box_l.numel()}개에 은행 배치 0..{box_l.numel() - 1}을 차례로: 경주마다 상자 {int(_nk.min())}-{int(_nk.max())}개", flush=True)
 remover = SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if po is not None else None
+KNOWN = bool(VIRT) or bool(TARGET)
+if KNOWN:
+    v_seen = torch.zeros(Bl, po.C, dtype=torch.bool, device=dev)    # passed at least once this session
+    v_prev = torch.full((Bl, po.C), float("nan"), device=dev)       # last decision's distance along the track to the box
+    v_zone = torch.zeros(Bl, dtype=torch.bool, device=dev)          # TARGET: a known box D0..D1 m ahead
+    t_stat = {"zone": 0.0, "n": 0.0}
+if VIRT:
+    assert VIRT == "oracle" and po is not None, VIRT
+    _fp = [torch.as_tensor(np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint), dtype=torch.float32)
+           for sh in po.shapes]
+    _V = max(int(f.shape[0]) for f in _fp)
+    FPV = torch.zeros(len(_fp), _V, 2, device=dev)                 # each shape's footprint, the last vertex repeated to _V
+    for _k, _f in enumerate(_fp):
+        FPV[_k, :_f.shape[0]] = _f.to(dev); FPV[_k, _f.shape[0]:] = _f[-1].to(dev)
+    _ang = env.sim.lidar.angles.float()
+    _mx = float(os.environ.get("F1SIM_LIDAR_MOUNT_X") or 0.297)
+    _orig_scan = obs._scan
+    v_stat = {"drawn": 0.0, "n": 0.0}
+
+    def _virt_scan():
+        sc_ = _orig_scan()                                           # (Bl, beams) normalized
+        sid_ = po.p_sid[lid]; ok_ = (sid_ >= 0) & v_seen
+        if not bool(ok_.any()):
+            return sc_
+        st_ = env.sim.state[lid].float()
+        sx = st_[:, 0] + _mx * torch.cos(st_[:, 2]); sy = st_[:, 1] + _mx * torch.sin(st_[:, 2])
+        a_ = st_[:, 2:3] + _ang[None, :]                             # (Bl, N) world beam directions
+        dx, dy = torch.cos(a_), torch.sin(a_)
+        pose_ = po.p_poses[lid].float()                              # (Bl, C, 3)
+        fp_ = FPV[sid_.clamp_min(0)]                                 # (Bl, C, V, 2) box frame
+        c_, s_ = torch.cos(pose_[..., 2])[..., None], torch.sin(pose_[..., 2])[..., None]
+        wx = pose_[..., 0:1] + c_ * fp_[..., 0] - s_ * fp_[..., 1]; wy = pose_[..., 1:2] + s_ * fp_[..., 0] + c_ * fp_[..., 1]
+        ax, ay = wx, wy; bx = torch.roll(wx, -1, -1); by = torch.roll(wy, -1, -1)          # edges A -> B, (Bl, C, V)
+        ex, ey = bx - ax, by - ay
+        # ray S + t d against every edge: t = cross(A - S, E) / cross(d, E), u = cross(A - S, d) / cross(d, E)
+        asx = (ax - sx[:, None, None])[:, None]; asy = (ay - sy[:, None, None])[:, None]        # (Bl, 1, C, V)
+        dxx = dx[:, :, None, None]; dyy = dy[:, :, None, None]                                  # (Bl, N, 1, 1)
+        den = dxx * ey[:, None] - dyy * ex[:, None]
+        t_ = (asx * ey[:, None] - asy * ex[:, None]) / den
+        u_ = (asx * dyy - asy * dxx) / den
+        hit = (den.abs() > 1e-9) & (t_ > 0) & (u_ >= 0) & (u_ <= 1) & ok_[:, None, :, None]
+        rng_ = torch.where(hit, t_, torch.full_like(t_, float("inf"))).amin((2, 3))            # (Bl, N) [m]
+        v_ = (rng_ / obs.range).clamp(0.0, 1.0)
+        out_ = torch.minimum(sc_, v_)
+        v_stat["drawn"] += float((out_ < sc_ - 1e-6).float().sum()); v_stat["n"] += float(sc_.numel())
+        return out_
+    obs._scan = _virt_scan
 restarter = SR.OppRestart(env, OPP_RESTART_S, PS.DT) if env.M > 1 else None
 others = env.sim.other_idx[lid][:, 0]
 eid = env.sim.eid[lid]
@@ -380,6 +436,14 @@ for kd in range(T):
         if _rs is not None:
             _eps_n[_rs] = torch.randn_like(_eps_n[_rs])
         _eps = torch.zeros_like(_eps_n); _eps[:, 0] = _eps_n[:, 0]; _eps[:, PS.N_STEP] = _eps_n[:, PS.N_STEP]
+        if TARGET:
+            # held turn noise only in the zone, at least TARGET[1] wide (the policy's own std scaled up); no speed noise
+            if "_tn" not in globals():
+                _tn = torch.randn(obs.scans.shape[0], device=obs.scans.device)
+            _tn = TARGET[0] * _tn + (1.0 - TARGET[0] ** 2) ** 0.5 * torch.randn_like(_tn)
+            _sd0 = float(torch.maximum(actor.log_std, actor.log_std_floor)[0].exp())
+            _eps = torch.zeros_like(_eps_n)
+            _eps[:, 0] = torch.where(v_zone, _tn * max(1.0, TARGET[1] / _sd0), torch.zeros_like(_tn))
     _cap = None
     if CAP and po is not None:                                  # F1SIM_EXAM_CAP: a box present within D m ahead -> the cap
         _tid = env.sim.tid[lid]
@@ -426,6 +490,18 @@ for kd in range(T):
         restarted |= (te | trc)[lid]
         pr.control_step((env.last_result.scan_type[lid] == HIT_CAR).any(1))
     out = pr.decision(pts, pc["price"], restarted)
+    if KNOWN:
+        _tid = env.sim.tid[lid]
+        _dc = pr.goal.remaining(env.sim.state[lid, :2].float(), _tid)
+        _pb = po.p_poses[lid][..., :2].float()
+        _db = pr.goal.remaining(_pb.reshape(-1, 2), _tid[:, None].expand(-1, _pb.shape[1]).reshape(-1)).view(_pb.shape[:2])
+        _L = pr.goal.lap[_tid][:, None]
+        _ah = torch.remainder(_dc[:, None] - _db, _L)               # along the track to the box ahead [m]
+        v_seen |= (v_prev < 3.0) & (_ah > _L - 3.0) & (po.p_sid[lid] >= 0)     # it was just ahead, now just behind
+        v_prev = _ah
+        if TARGET:
+            v_zone = (v_seen & (po.p_sid[lid] >= 0) & (_ah >= TARGET[2]) & (_ah <= TARGET[3])).any(1)
+            t_stat["zone"] += float(v_zone.float().sum()); t_stat["n"] += float(Bl)
     obs.push_scan(); obs.set_plan(pts, p["pv"]); obs.set_plan2(p)
     if bool(restarted.any()):
         rows = torch.nonzero(restarted)[:, 0]
@@ -477,3 +553,9 @@ c = D["cnt"][-1].sum(0)
 print(f"[{EXAM}{' · 진행 방향 틀(' + SLIP + ')' if SLIP else ''} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
       f"{int(D['rs'].sum())}번, 선 상대 차 다시 출발 {restarter.count if restarter is not None else 0}번 | 누적: "
       + " · ".join(f"{k} {int(v)}" for k, v in zip(COLS, c)) + f" | {time.time() - t0:.0f} s | 저장 {out_npz}", flush=True)
+if VIRT:
+    print(f"[virtual boxes] passed boxes drawn into the policy's scan: {100.0 * v_stat['drawn'] / max(v_stat['n'], 1.0):.2f} % of beams "
+          f"shortened; boxes passed at least once at the end: {int(v_seen.sum())}", flush=True)
+if TARGET:
+    print(f"[target noise] decisions in the zone (a passed box {TARGET[2]:g}-{TARGET[3]:g} m ahead): "
+          f"{100.0 * t_stat['zone'] / max(t_stat['n'], 1.0):.1f} %", flush=True)

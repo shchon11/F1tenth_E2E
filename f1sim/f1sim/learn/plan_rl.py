@@ -750,6 +750,13 @@ def main(argv=None):
                     help="size variants added to the world's tracks: per cents, comma-separated, or 'korea25' = "
                          "`state_rl.TRACK_SCALES_25` (0.60-0.92 and 1.08-1.20 of a warp each; 11-12, the user: \"트랙 변형도 스케일 "
                          "자체가 변하는것도\"). '' = the world's `track_scales` (none in plan_world_korea25)")
+    ap.add_argument("--noise-corr-known", default="",
+                    help="RHO,STD,D0,D1 (11-21, the user's goal: \"미리 알고 미리 라인 다르게 가져가서 ... 가장 빠르고 안박게\"): while a box "
+                         "this car has already passed (--mem-aux-seen) lies D0..D1 m ahead along the track, the first step's turn noise "
+                         "is held (AR RHO) and the turn's std there is at least STD -- the policy's own distribution in those rows, "
+                         "sampled and scored with it. Measured on qual27d/f u300 (exam, no training, RHO 0.95 STD 0.16 4-15 m): passes "
+                         "that took a line >= 0.4 m off before a late-visible known box hit it 0 of 62 times at the same speed, the "
+                         "others 39 of 155; training's line noise alone moves the line +-0.1 m")
     ap.add_argument("--pace-caps", default="",
                     help="C1,C2,... [m/s] (11-21 redesign, the user \"ㄱㄱ\"): every --pace-hold decisions the policy picks a level -- no "
                          "cap or one of these -- and every plan until the next pick is drawn under it (`Actor2.pace_levels`). "
@@ -1054,6 +1061,12 @@ def main(argv=None):
         aux_seen = torch.zeros(Bl, C_, dtype=torch.bool, device=dev)
         aux_prev_ds = torch.full((Bl, C_), float("nan"), device=dev)
         aux_prev_pos = torch.zeros(Bl, C_, 2, device=dev)
+    known_on = bool(args.noise_corr_known)
+    if known_on:
+        kn_rho, kn_std, kn_d0, kn_d1 = (float(x) for x in args.noise_corr_known.split(","))
+        kn_logstd = math.log(kn_std)
+        if aux_seen is None:
+            raise SystemExit("--noise-corr-known needs --mem-aux-seen (which boxes this car has passed)")
     memv_on = args.mem_value > 0
     if (memv_on or args.mem_keep_s > 0) and not args.memory:
         raise SystemExit("--mem-value / --mem-keep-s need --memory")
@@ -1266,6 +1279,7 @@ def main(argv=None):
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
         BR = []                                                # --branches 2: the plan each decision drove
         PD, PI, CAPL = [], [], []                              # --pace-caps: picked now?, the level in force, its cap [m/s]
+        KZ, kz_n = [], 0.0                                     # --noise-corr-known: the rows in the known zone, their share
         pace_n = torch.zeros(max(getattr(actor, "pace_levels", 0), 1), device=dev)
         br_n = {k: 0.0 for k in ("b0", "gap", "switch", "arg_switch", "pmax", "pairs")}
         sc_new = torch.zeros(3, device=dev)                    # --scene-replay: scenes taken this update, by what was hit
@@ -1379,10 +1393,18 @@ def main(argv=None):
                         rho_t[:, PS.N_STEP:] = torch.where(_st[:, None], torch.full_like(rho_t[:, PS.N_STEP:], st_rho),
                                                            rho_t[:, PS.N_STEP:])
                         nc_stall += float(_st.float().mean())
+                    if known_on:                                   # a passed box D0..D1 m ahead: the turn's noise held
+                        kz = (aux_seen & torch.isfinite(aux_prev_ds) & (aux_prev_ds >= kn_d0) & (aux_prev_ds <= kn_d1)).any(1)
+                        rho_t = (rho_t if rho_t.ndim == 2 else rho_t[None, :]).expand(Bl, -1).clone()
+                        rho_t[:, 0] = torch.where(kz, torch.full_like(rho_t[:, 0], kn_rho), rho_t[:, 0])
                     eps_n = rho_t * eps_n + (1.0 - rho_t ** 2) ** 0.5 * torch.randn_like(mean)
                     eps = eps_n
                 else:
                     eps = torch.randn_like(mean)
+                if known_on:                                       # ... and at least kn_std wide there (the policy's distribution)
+                    log_std = log_std.clone()
+                    log_std[:, 0] = torch.where(kz, log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])
+                    KZ.append(kz); kz_n += float(kz.float().mean())
                 if tailc:
                     u = mean + log_std.exp() * eps * rl_mask                         # the tail: its mean, no noise
                     lp = tanh_logp(u[:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
@@ -1669,6 +1691,8 @@ def main(argv=None):
             bBR = torch.cat(BR)
         if pace_on:
             bPD, bPI, bCAP = torch.cat(PD), torch.cat(PI), torch.cat(CAPL)
+        if known_on:
+            bKZ = torch.cat(KZ)
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
             bPTS, bPVS = torch.cat(PTS), torch.cat(PVS)
@@ -1789,6 +1813,9 @@ def main(argv=None):
                     mb = sel
                     mean, log_std = actor(bX[mb], bS[mb])
                     el = torch.zeros((), device=dev)
+                if known_on:                                       # the rows drawn in the known zone: scored as they were drawn
+                    log_std = log_std.clone()
+                    log_std[:, 0] = torch.where(bKZ[mb], log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])
                 if tailc:
                     lp = tanh_logp(bU[mb][:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
                 else:
@@ -2032,6 +2059,8 @@ def main(argv=None):
                 row[f"g_mem_{k_}"] = float(g_.norm(dim=1).mean())
                 row[f"g_mem_{k_}_agree"] = float((c_.sum() - c_.diagonal().sum()) / max(1, n_g * (n_g - 1)))
             row["g_mem_cos"] = float(nn.functional.cosine_similarity(gp_.mean(0), ge_.mean(0), dim=0))
+        if known_on:
+            row["known_share"] = kz_n / max(T, 1)
         if pace_on:                                                # --pace-caps: the share of decisions under each level
             row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
         if two:
@@ -2073,6 +2102,7 @@ def main(argv=None):
               + (f"두 plan: 0번 고름 {row['branch0_share'] * 100:.0f} %, 첫 조향 차이 {row['branch_gap']:.2f}, 고른 plan 바뀜 "
                  f"{row['branch_switch'] * 100:.1f} % (확률 큰 쪽 바뀜 {row['branch_arg_switch'] * 100:.1f} %), 큰 쪽 확률 "
                  f"{row['branch_pmax'] * 100:.0f} % | " if two else "")
+              + (f"아는 상자 앞 길 탐색 {row['known_share'] * 100:.1f} % | " if known_on else "")
               + ("속도 단계 " + " · ".join(f"{'없음' if k_ == 0 else f'{float(actor.pace_v[k_]):g}'} {v_ * 100:.0f} %"
                                           for k_, v_ in enumerate(row["pace_share"])) + " | " if pace_on else "")
               + (f"접촉 직전 장면: 보관 {row['scene_store']}개 (새로 벽 {row['scene_new'][0]} 상자 {row['scene_new'][1]} 차 "
