@@ -153,12 +153,7 @@
     <div class="panel strip"><h3>속도 <span class="note">m/s · 최근 20초</span><span class="now" id="now_v">-</span></h3>
       <div class="legend"><span><i style="background:var(--s-car)"></i>지금 속도</span><span><i style="background:var(--s-plan)"></i>plan이 1초 뒤에 낼 속도</span></div>
       <div class="cv"><canvas id="c_v"></canvas></div></div>
-    <div class="panel strip"><h3>critic 값 <span class="note">앞으로 받을 보상의 예상</span><span class="now" id="now_val">-</span></h3>
-      <div class="cv"><canvas id="c_val"></canvas></div></div>
-    <div class="panel strip"><h3>plan이 바뀐 정도 <span class="note">m · 직전 결정의 plan과 같은 시각끼리</span><span class="now" id="now_pc">-</span></h3>
-      <div class="cv"><canvas id="c_pc"></canvas></div></div>
-    <div class="panel strip"><h3>기억 변화량 <span class="note">GRU 128개 평균 변화 · 결정마다</span><span class="now" id="now_mc">-</span></h3>
-      <div class="cv"><canvas id="c_mc"></canvas></div></div>
+    <!-- (11-22, the user: "필요한것만 넣어 여기애 쫌 넘 쓸모없는개 많어") critic value, plan change and memory change taken out -->
     <div class="panel" id="events"><h3>일어난 일</h3><div id="evlist"></div></div>
   </section>
   <section class="panel" id="spots">
@@ -505,18 +500,13 @@ async function poll() {
   $("ep").textContent = f.replay ? "장면 재생 중" : "일반 경주"; $("ep").className = "pill" + (f.replay ? " scene" : "");
   $("opp").textContent = f.opp ? (f.copy ? "상대: 우리 policy 복제본" : "상대: 기존 상대 차") : "상대 차 없음";
   for (const k of document.querySelectorAll(".k-opp")) k.style.display = f.opp ? "" : "none";   // a solo run has no opponents to key
-  $("now_v").textContent = f.car[3].toFixed(2); $("now_val").textContent = f.value.toFixed(2);
-  $("now_pc").textContent = f.plan_change == null ? "-" : f.plan_change.toFixed(2);
-  $("now_mc").textContent = f.mem_change == null ? "-" : f.mem_change.toFixed(3);
+  $("now_v").textContent = f.car[3].toFixed(2);
   $("hud_sub").textContent = `plan 목표 ${f.plan_v[0].toFixed(1)} · 1초 뒤 ${f.plan_v[9].toFixed(1)} m/s`;
   F1.trail = d.trail;
   strips();
 }
 function strips() {
   strip("c_v", [{ key: "v", col: C["s-car"] }, { key: "vp", col: C["s-plan"] }], { lo: 0, minSpan: 2 });
-  strip("c_val", [{ key: "val", col: C["s-car"] }], { minSpan: 0.2 });
-  strip("c_pc", [{ key: "pc", col: C["s-car"] }], { lo: 0, minSpan: 0.1 });
-  strip("c_mc", [{ key: "mc", col: C["s-car"] }], { lo: 0, minSpan: 0.01 });
 }
 window.addEventListener("resize", () => { try { strips(); } catch (e) {} });
 
