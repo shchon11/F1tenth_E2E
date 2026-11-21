@@ -461,6 +461,10 @@ def main(argv=None):
                     "average for its signal to match its noise), measured on the rollout before the epochs and smoothed over updates: "
                     "the smallest power of two of minibatches covering it, up to --minibatches (11-14: plan25y's noise scale grew from "
                     "~5k decisions at u25 to 25k-1.4M at u150; a minibatch is 4k)")
+    ap.add_argument("--accum-hold", type=int, default=0,
+                    help="U (11-21): with --accum-actor-auto, --accum-actor stays as given until update U (the noise scale is still "
+                         "measured): a fork's first probe has no smoothing behind it and locked a K its parent never used (qual26w "
+                         "16 -> 2, qual27d 1 -> 2), a second difference in every fork-vs-parent comparison")
     ap.add_argument("--accum-ratchet", action="store_true",
                     help="with --accum-actor-auto: the minibatches per actor step never go back down (11-14, plan26i: at u236 the "
                          "noise scale read 190k -> 56k -> 15k as the policy got worse, the rule dropped 16 -> 4 -> 1 minibatches, "
@@ -1734,6 +1738,8 @@ def main(argv=None):
                     k_ *= 2
             if args.accum_ratchet:
                 k_ = max(k_, args.accum_actor)
+            if upd < args.accum_hold:                           # --accum-hold: measured, not applied yet
+                k_ = args.accum_actor
             args.accum_actor = k_
             del gsum_
         acc_i = 0
