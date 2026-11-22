@@ -260,6 +260,22 @@ class PlanRunner:
             self.obs = PlanObs(env, self.lim, None)
         self.v_hat = None
         Bl = int(self.lid.numel())
+        # (11-22) a rolling-plan checkpoint (plan_rl --plan-roll) is driven the way it was trained: each decision the committed
+        # plan keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or
+        # when something out of view when its part was added now blocks the committed path (`plan_rl.roll_blocked`)
+        self.roll = bool(self.v2 and not self.v3 and (ck.get("args") or {}).get("plan_roll", False))
+        if self.roll:
+            from .plan_reward import PlanReward
+            self.r_pr = PlanReward(env, float((ck.get("args") or {}).get("gamma", 0.995)), device)
+            self.r_u = torch.zeros(Bl, PS.ACT_DIM, device=device); self.r_p = None
+            self.r_full = torch.ones(Bl, dtype=torch.bool, device=device)
+            self.r_w = torch.zeros(Bl, PS.N_STEP, 3, device=device)
+            self.r_t = torch.zeros(Bl, PS.N_STEP, dtype=torch.long, device=device)
+            self.r_dec = torch.zeros(Bl, dtype=torch.long, device=device)            # each row's own decision count
+            self.r_seenb = None; self.r_scanb = torch.zeros(11, Bl, 3, device=device)
+            self.r_seen = self.r_ds = self.r_pos = None
+            self.r_cnt = env.sim.contact_counts[self.lid, 0:3].clone()               # contact onsets at the last decision
+            self.r_mx = float(env.cfg.lidar.mount_x); self.r_rmax = float(env.cfg.lidar.range_max)
         self.cmd_d = torch.zeros(Bl, PS.N_STEP * PS.SUB, device=device)
         self.cmd_v = torch.zeros(Bl, PS.N_STEP * PS.SUB, device=device)
         self.kk = torch.zeros(env.B, PS.N_STEP, device=device)
@@ -296,6 +312,67 @@ class PlanRunner:
                                                    [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
             env.claim_external(self.lid)
 
+    def _roll_check(self, due: torch.Tensor) -> None:
+        """--plan-roll, deciding rows: the known boxes and the scanner now; a contact since the row's last decision or the
+        committed path blocked by something unseen when its part was added -> a whole new plan"""
+        from .plan_rl import box_along, boxes_in_view, roll_blocked
+        env, lid = self.env, self.lid
+        Bl = int(lid.numel()); dev = self.device
+        cnt = env.sim.contact_counts[lid, 0:3]
+        hit = (cnt - self.r_cnt).clamp_min(0).sum(1) > 0
+        self.r_full |= due & hit
+        self.r_cnt = torch.where(due[:, None], cnt, self.r_cnt)
+        if getattr(env, "procedural", None) is None:
+            return
+        ds, live, pos = box_along(env, self.r_pr.goal, lid)
+        if self.r_seen is None:
+            self.r_seen = torch.zeros_like(live); self.r_ds = torch.full_like(ds, float("nan")); self.r_pos = pos.clone()
+        moved = ((pos - self.r_pos).abs().sum(-1) > 0.05) | ~live
+        passed = live & ~moved & (self.r_ds > 0.0) & (self.r_ds <= 3.0) & (ds <= 0.0) & (ds > -3.0)
+        view = boxes_in_view(env, lid, pos, live, self.r_mx, self.r_rmax)
+        seen = (self.r_seen & ~moved) | passed | view
+        d2 = due[:, None]
+        self.r_seen = torch.where(d2, seen, self.r_seen)
+        self.r_ds = torch.where(d2, torch.where(live, ds, torch.full_like(ds, float("nan"))), self.r_ds)
+        self.r_pos = torch.where(d2[..., None], pos, self.r_pos)
+        sn = env.sim.state[lid, :3].float()
+        sc = torch.stack([sn[:, 0] + self.r_mx * torch.cos(sn[:, 2]), sn[:, 1] + self.r_mx * torch.sin(sn[:, 2]), sn[:, 2]], 1)
+        ar = torch.arange(Bl, device=dev)
+        k = self.r_dec % 11
+        if self.r_seenb is None:
+            self.r_seenb = torch.zeros(11, *self.r_seen.shape, dtype=torch.bool, device=dev)
+        self.r_scanb[k, ar] = torch.where(due[:, None], sc, self.r_scanb[k, ar])
+        self.r_seenb[k, ar] = torch.where(d2, self.r_seen, self.r_seenb[k, ar])
+        chk = due & ~self.r_full
+        if self.r_p is not None and bool(chk.any()):
+            ix = self.r_t % 11
+            bw, bb = roll_blocked(env, lid, self.r_pr, self.r_w, self.r_seenb[ix, ar[:, None]] & ~moved[:, None, :],
+                                  self.r_scanb[ix, ar[:, None]], view, self.r_mx, self.r_rmax)
+            self.r_full |= chk & (bw | bb)
+
+    def _roll_plan(self, due: torch.Tensor, u: torch.Tensor, v_hat: torch.Tensor):
+        """--plan-roll, deciding rows: the committed 0.9 s rolled on from its own state, the policy's last step appended (a
+        whole new plan: from the speed estimate and the last command)"""
+        env, lid = self.env, self.lid
+        u_x = u if self.r_p is None else torch.where(self.r_full[:, None], u, roll_shift(self.r_u, u))
+        v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = self.obs.cmd_d
+        if self.r_p is not None:
+            v_s = torch.where(self.r_full, v_s, self.r_p["v"][:, PS.SUB]); d_s = torch.where(self.r_full, d_s, self.r_p["delta"][:, PS.SUB])
+        p = PS.roll(torch.tanh(u_x), v_s, d_s, self.lim)
+        t_now = self.r_dec[:, None]
+        t_new = torch.where(self.r_full[:, None], t_now.expand_as(self.r_t), torch.cat([self.r_t[:, 1:], t_now], 1))
+        d2 = due[:, None]
+        self.r_t = torch.where(d2, t_new, self.r_t)
+        self.r_u = torch.where(d2, u_x, self.r_u)
+        self.r_p = p if self.r_p is None else {k_: (torch.where(due.view(-1, *([1] * (p[k_].dim() - 1))), p[k_], self.r_p[k_])
+                                                    if torch.is_tensor(p[k_]) and p[k_].dim() and p[k_].shape[0] == due.shape[0]
+                                                    else p[k_]) for k_ in p}
+        xr, yr, pr_ = plan_world(p, env.sim.state[lid]); ir = PT_IDX.to(self.device)
+        self.r_w = torch.where(d2[..., None], torch.stack([xr[:, ir], yr[:, ir], pr_[:, ir]], -1), self.r_w)
+        self.r_full = self.r_full & ~due
+        self.r_dec = self.r_dec + due.long()
+        return p
+
     @torch.no_grad()
     def __call__(self, scan=None, ego=None):
         env, lid = self.env, self.lid
@@ -304,6 +381,8 @@ class PlanRunner:
         if bool(back.any()):
             self.obs.reset_rows(torch.nonzero(back)[:, 0])
             self.first |= back
+            if self.roll:
+                self.r_full |= back
             if hasattr(self.follower, "reset_rows"):
                 self.follower.reset_rows(torch.nonzero(back)[:, 0])
         self.last_ep = ep.clone()
@@ -322,7 +401,11 @@ class PlanRunner:
                 b_old = self.obs.prev_branch.clone() if self.obs.prev_branch is not None else None
                 pc_old = ((self.obs.pace_idx.clone(), self.obs.pace_left.clone())
                           if getattr(self.obs, "pace_idx", None) is not None else None)
-                _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                if self.roll:
+                    self._roll_check(due)
+                u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                if self.roll:
+                    p = self._roll_plan(due, u_, v_hat)
                 if h_old is not None and getattr(self.actor, "memory", 0):
                     # a memory steps once per decision: rows not deciding now keep theirs
                     self.obs.mem_h = torch.where(due[:, None], self.obs.mem_h, h_old)

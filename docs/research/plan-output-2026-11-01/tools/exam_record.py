@@ -239,7 +239,7 @@ if getattr(actor, "pace_levels", 0):                         # (11-21) a pace po
 # (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
 # keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or when something
 # out of view (a box: nor passed) when a part was added now blocks the committed path (`plan_rl.roll_blocked`)
-ROLL = bool(ck["args"].get("plan_roll", False))
+ROLL = bool(ck["args"].get("plan_roll", False)) or os.environ.get("F1SIM_EXAM_ROLL") == "1"   # =1: any v2 checkpoint, rolled
 if ROLL:
     from f1sim.learn.plan_rl import roll_blocked, boxes_in_view, box_along
     from f1sim.learn.plan_policy import roll_shift

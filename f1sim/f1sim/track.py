@@ -354,16 +354,24 @@ class Track:
             raise ValueError("a warp rescales the grid; placed props would have to move with it (not done)")
         rng = np.random.default_rng(int(seed) + 9157)
         res = self.resolution
-        occ0 = self.occupancy
+        # (2026-11-22) pad the grid first: an edit moves a boundary outward by up to width + shave + the new wall, and on
+        # Korea 2026 the top U-turn's wall sat closer than that to the grid's edge -- outside the grid is a wall to the
+        # physics and the plan costs (`sample_edt`) but free to the LiDAR, so 8 of 16 warps had lane up to the edge: a flat
+        # wall the car hit and could not see (the live view: the scan's ground ring beyond it). 1 m is more than any edit
+        P = int(np.ceil(1.0 / res))
+        occ0 = np.pad(self.occupancy, P, constant_values=True)
+        duct0 = None if self.duct is None else np.pad(self.duct, P, constant_values=False)
+        tall0 = None if self.tall is None else np.pad(self.tall, P, constant_values=False)
+        org0 = (self.origin[0] - P * res, self.origin[1] - P * res)
         H, W = occ0.shape
         cl = self.centerline
-        cj = np.clip(((cl[:, 0] - self.origin[0]) / res).astype(int), 0, W - 1)
-        ci = np.clip(((cl[:, 1] - self.origin[1]) / res).astype(int), 0, H - 1)
+        cj = np.clip(((cl[:, 0] - org0[0]) / res).astype(int), 0, W - 1)
+        ci = np.clip(((cl[:, 1] - org0[1]) / res).astype(int), 0, H - 1)
         lab, _ = ndimage.label(~occ0)
         drive = np.isin(lab, np.unique(lab[ci, cj]))
         seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1)
         s_cl = np.concatenate([[0.0], np.cumsum(seg)[:-1]]); L = float(seg.sum())
-        xs = np.arange(W) * res + self.origin[0]; ys = np.arange(H) * res + self.origin[1]
+        xs = np.arange(W) * res + org0[0]; ys = np.arange(H) * res + org0[1]
         gx, gy = np.meshgrid(xs, ys)
         from scipy.spatial import cKDTree
         tree = cKDTree(cl)
@@ -463,19 +471,19 @@ class Track:
         # tall -- the unknown space around a SLAM map, the floor behind a shell) and is its own nearest wall cell, so it
         # stayed unseen: a wall the car hits and the LiDAR reads through (12 m of 2311 m over Korea 2025's 16 warps)
         classed = np.zeros_like(occ0)
-        for m_ in (self.duct, self.tall):
+        for m_ in (duct0, tall0):
             if m_ is not None:
                 classed = classed | m_
         idx = ndimage.distance_transform_edt(~(classed if classed.any() else occ0), return_distances=False, return_indices=True)
         nearest = lambda m: m[idx[0], idx[1]]
         duct = tall = None
-        if self.duct is not None:
-            duct = self.duct.copy(); duct[drive_new] = False; duct |= new_wall & nearest(self.duct)
-        if self.tall is not None:
-            tall = self.tall.copy(); tall[drive_new] = False; tall |= new_wall & nearest(self.tall)
+        if duct0 is not None:
+            duct = duct0.copy(); duct[drive_new] = False; duct |= new_wall & nearest(duct0)
+        if tall0 is not None:
+            tall = tall0.copy(); tall[drive_new] = False; tall |= new_wall & nearest(tall0)
         sc = float(rng.uniform(*scale))
-        cx, cy = self.origin[0] + W * res / 2, self.origin[1] + H * res / 2
-        origin = (cx - (cx - self.origin[0]) * sc, cy - (cy - self.origin[1]) * sc)
+        cx, cy = org0[0] + W * res / 2, org0[1] + H * res / 2            # the same centre as the unpadded grid's
+        origin = (cx - (cx - org0[0]) * sc, cy - (cy - org0[1]) * sc)
         cl_new = np.stack([cx + (cl[:, 0] - cx) * sc, cy + (cl[:, 1] - cy) * sc], 1)
         t = Track.from_occupancy(occ, res * sc, origin, cl_new, f"{self.name}_warp{seed}", duct=duct, tall=tall,
                                  duct_height=self.duct_height)
