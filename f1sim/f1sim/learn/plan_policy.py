@@ -438,7 +438,7 @@ class Actor2(nn.Module):
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
                  mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
-                 pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05):
+                 pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = ""):
         super().__init__()
         self.branches = int(branches)
         # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
@@ -447,7 +447,15 @@ class Actor2(nn.Module):
         # decision (re-planned every 0.1 s: approach speed to a blind box swung 0.2 m/s between passes); a held level is not --
         # an oracle cap of 5.5 m/s 10 m before boxes cut hard box hits 91 -> 30 for +0.3 s a lap
         caps = [float(x) for x in str(pace_caps or "").split(",") if x.strip()]
-        self.pace_levels = (1 + len(caps)) if caps else 0
+        # (11-22, the user: "미리 알고 미리 라인 다르게"; output noise on the plan is re-planned away within 0.1 s -- the driven line
+        # spread 0.09 m in training, and held output noise (qual26w/x) pushed the car into the bottom U-turn's walls) the
+        # line: the same held, picked level, its levels a lateral offset [m] 1 s ahead of the policy's own line (+ left); the
+        # policy sees the level and `plan_rl --line-follow` makes the plan honour it. One or the other of pace and line
+        shifts = [float(x) for x in str(line_shifts or "").split(",") if x.strip()]
+        if caps and shifts:
+            raise ValueError("pace caps or line shifts, not both")
+        self.pace_kind = "line" if shifts else "cap"
+        self.pace_levels = (1 + len(caps or shifts)) if (caps or shifts) else 0
         self.pace_hold, self.pace_floor = int(pace_hold), float(pace_floor)
         if self.pace_levels and self.branches != 1:
             raise ValueError("pace: one plan only")
@@ -483,7 +491,9 @@ class Actor2(nn.Module):
             nn.init.zeros_(self.pace_head.weight); nn.init.zeros_(self.pace_head.bias)
             with torch.no_grad():
                 self.pace_head.bias[0] = 1.0                    # no cap twice as likely as each cap at the start
-            self.register_buffer("pace_v", torch.tensor([math.inf] + caps))
+            self.register_buffer("pace_v", torch.tensor([math.inf] + (caps or [math.inf] * len(shifts))))
+            if shifts:
+                self.register_buffer("line_dy", torch.tensor([0.0] + shifts))
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
         self.memory_main = int(memory)
@@ -700,7 +710,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    box_memory=int(ck["args"].get("box_memory", 0) or 0),
                    aux_in=bool(ck["args"].get("mem_aux_in", False)),
                    pace_caps=str(ck["args"].get("pace_caps", "") or ""), pace_hold=int(ck["args"].get("pace_hold", 10) or 10),
-                   pace_floor=float(ck["args"].get("pace_floor", 0.05) or 0.05)).to(device)
+                   pace_floor=float(ck["args"].get("pace_floor", 0.05) or 0.05),
+                   line_shifts=str(ck["args"].get("line_shifts", "") or "")).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

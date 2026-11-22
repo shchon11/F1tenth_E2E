@@ -797,6 +797,15 @@ def main(argv=None):
                          "hard box hits 91 -> 30 for +0.3 s a lap)")
     ap.add_argument("--pace-hold", type=int, default=10, help="decisions a picked pace level holds (10 = 1 s)")
     ap.add_argument("--pace-floor", type=float, default=0.05, help="training picks every pace level at least this often")
+    ap.add_argument("--line-shifts", default="",
+                    help="S1,S2,... [m] (11-22, the user: \"미리 알고 미리 라인 다르게\"): every --pace-hold decisions the policy picks a "
+                         "level -- its own line, or one of these offsets 1 s ahead (+ left) -- held and seen as an input "
+                         "(`Actor2.pace_kind` 'line'); training samples each level at least --pace-floor. Output noise is re-planned "
+                         "away within 0.1 s (line spread 0.09 m) and held output noise pushed the car into walls; a level the "
+                         "policy picks and knows is a different line driven on purpose, scored by PPO over its hold")
+    ap.add_argument("--line-follow", type=float, default=1.0,
+                    help="--line-shifts: weight of the loss that puts a level's plan end that far across the plan the same state "
+                         "and memory draw at level 0 (across that plan's heading at its 1 s end; the level-0 plan is not moved by it)")
     ap.add_argument("--branches", type=int, default=1, choices=(1, 2),
                     help="2 = two plans and a choice between them (`Actor2.branches`); --format v2 with --tail-consistency")
     ap.add_argument("--branch-floor", type=float, default=0.1,
@@ -1137,7 +1146,7 @@ def main(argv=None):
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
                     aux_in=args.mem_aux_in, pace_caps=args.pace_caps, pace_hold=args.pace_hold,
-                    pace_floor=args.pace_floor) if v2
+                    pace_floor=args.pace_floor, line_shifts=args.line_shifts) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -1160,6 +1169,9 @@ def main(argv=None):
         if v3 or not v2 or two or args.hold_p > 0 or args.init:
             raise SystemExit("--pace-caps: --format v2, one plan, no holding, from scratch")
         obs.pace_on(actor.pace_levels, args.pace_hold)                 # the state's last inputs: the level in force, its hold left
+    line_on = pace_on and getattr(actor, "pace_kind", "cap") == "line"
+    if line_on and not tailc:
+        raise SystemExit("--line-shifts needs --tail-consistency (the loss rolls the plan from the decision's speed and steering)")
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     if args.init:
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
@@ -1740,8 +1752,17 @@ def main(argv=None):
             means_, aux_box["logits"], ls_, vh_ = actor.all_heads(fc)
             return means_[torch.arange(mb_.numel(), device=dev), bBR[mb_]], ls_, vh_, mb_, fc
 
+        def lvl0(s_):
+            """--line-shifts: the same inputs with the level in force set to 0 (the state's last inputs: one-hot, hold left)"""
+            s0_ = s_.clone(); K_ = actor.pace_levels
+            s0_[:, -(K_ + 1):-1] = 0.0; s0_[:, -(K_ + 1)] = 1.0
+            return s0_
+
         def actor_on(sel):
             if not args.memory:
+                if line_on:
+                    with torch.no_grad():
+                        aux_box["fc0"] = actor.features(bX[sel], lvl0(bS[sel]))
                 return heads_on(actor.features(bX[sel], bS[sel]), sel)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
@@ -1757,6 +1778,15 @@ def main(argv=None):
             # numbers, ~10 fewer kernel launches per step forward and backward in the update's 128-step loop
             hcat_ = torch.cat(hs_, 0); fflat_ = f.reshape(-1, f.shape[-1])
             fc = (actor.mem_trunk(fflat_, hcat_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            if line_on:
+                # the plan this state would draw at level 0: the same memory (it went through the levels actually held), the
+                # level input set to 0 -- what a level's plan is measured against
+                with torch.no_grad():
+                    if actor.mem_front:                            # the inputs are the scan's code and the state: swap the state
+                        f0_ = torch.cat([fflat_[:, :fflat_.shape[1] - bS.shape[1]], actor.norm(lvl0(bS[mb_]))], 1)
+                        aux_box["fc0"] = actor.mem_trunk(f0_, hcat_)
+                    else:
+                        aux_box["fc0"] = actor.features(bX[mb_], lvl0(bS[mb_])) + actor.mem_out(hcat_)
             if aux_on or memv_on:
                 # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
                 hs = actor.memory_alone(f, h0, bD[sel], bHM[sel])
@@ -1768,6 +1798,7 @@ def main(argv=None):
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
+        lfs, lfd = [], []                                          # --line-shifts: a level's plan end, off its offset / moved
         ce10, tr_ratio = [], []
         als, aac, aac_far, alo, sms, mvs, akn, aauc = [], [], [], [], [], [], [], []
         aux_box = {}
@@ -1917,6 +1948,25 @@ def main(argv=None):
                 if pace_on:
                     lp = lp + torch.where(bPD[mb], actor.pace_p(actor.pace_logits_out).gather(1, bPI[mb][:, None])[:, 0].log(),
                                           torch.zeros_like(lp))
+                if line_on:
+                    # --line-follow: a level's plan ends its offset across the level-0 plan's heading at the 1 s end
+                    nz_ = bPI[mb] != 0
+                    if bool(nz_.any()):
+                        m0_ = actor.pi(aux_box["fc0"][nz_]).detach()
+                        pz_ = PS.roll(torch.tanh(mean[nz_]), bV0[mb][nz_], bD0[mb][nz_], lim)
+                        p0_ = PS.roll(torch.tanh(m0_), bV0[mb][nz_], bD0[mb][nz_], lim)
+                        ps0_ = p0_["psi"][:, -1]
+                        dl_ = (-(pz_["x"][:, -1] - p0_["x"][:, -1]) * torch.sin(ps0_)
+                               + (pz_["y"][:, -1] - p0_["y"][:, -1]) * torch.cos(ps0_))
+                        # a car that barely moves cannot end 0.6 m aside: the offset in full from 2 m of path in the second
+                        L1_ = torch.hypot(p0_["x"][:, 1:] - p0_["x"][:, :-1], p0_["y"][:, 1:] - p0_["y"][:, :-1]).sum(1)
+                        tg_ = actor.line_dy[bPI[mb][nz_]] * (L1_ / 2.0).clamp(max=1.0)
+                        lf_ = nn.functional.smooth_l1_loss(dl_, tg_, beta=0.1)
+                        loss_line = args.line_follow * lf_
+                        with torch.no_grad():
+                            lfs.append(float((dl_ - tg_).abs().median())); lfd.append(float((dl_ * tg_.sign()).median()))
+                    else:
+                        loss_line = torch.zeros((), device=dev)
                 ratio = (lp - bLP[mb]).exp()
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0)
                 a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
@@ -1925,6 +1975,9 @@ def main(argv=None):
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
                 terms_ = {"policy": pl, "vest": args.vest_coef * el}
+                if line_on:
+                    loss = loss + loss_line
+                    terms_["line"] = loss_line
                 if memv_on:
                     lmv = (aux_box["v"] - bRn[mb]).pow(2).mean()
                     loss = loss + args.mem_value * lmv
@@ -2155,6 +2208,9 @@ def main(argv=None):
             row["known_share"] = kz_n / max(T, 1)
         if pace_on:                                                # --pace-caps: the share of decisions under each level
             row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
+        if line_on:                                                # --line-shifts: how far off its offset a level's plan ends
+            row["line_err"] = float(torch.tensor(lfs).median()) if lfs else None
+            row["line_moved"] = float(torch.tensor(lfd).median()) if lfd else None
         if two:
             row.update(branch0_share=br_n["b0"] / T, branch_gap=br_n["gap"] / T, branch_pmax=br_n["pmax"] / T,
                        branch_switch=br_n["switch"] / max(br_n["pairs"], 1.0),
@@ -2196,7 +2252,10 @@ def main(argv=None):
                  f"{row['branch_pmax'] * 100:.0f} % | " if two else "")
               + (f"아는 상자 앞 길 탐색 {row['known_share'] * 100:.1f} % | " if known_on else "")
               + ("속도 단계 " + " · ".join(f"{'없음' if k_ == 0 else f'{float(actor.pace_v[k_]):g}'} {v_ * 100:.0f} %"
-                                          for k_, v_ in enumerate(row["pace_share"])) + " | " if pace_on else "")
+                                          for k_, v_ in enumerate(row["pace_share"])) + " | " if pace_on and not line_on else "")
+              + ("라인 단계 " + " · ".join(f"{float(actor.line_dy[k_]):+g} m {v_ * 100:.0f} %" for k_, v_ in enumerate(row["pace_share"]))
+                 + (f" (plan이 옮긴 폭 {row['line_moved']:.2f} m, 어긋남 {row['line_err']:.2f} m)" if row.get("line_err") is not None else "")
+                 + " | " if line_on else "")
               + (f"접촉 직전 장면: 보관 {row['scene_store']}개 (새로 벽 {row['scene_new'][0]} 상자 {row['scene_new'][1]} 차 "
                  f"{row['scene_new'][2]}), 장면에서 시작한 결정 {row['scene_share'] * 100:.1f} %, 끝난 {sc_end}판 중 다시 세게 닿음 "
                  f"{sc_end_hit / max(sc_end, 1) * 100:.0f} % | " if scene is not None else "")
