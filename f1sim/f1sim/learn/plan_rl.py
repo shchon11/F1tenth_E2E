@@ -176,12 +176,13 @@ def held_blocked(env, lid: torch.Tensor, pr, xw: torch.Tensor, yw: torch.Tensor,
 
 
 def roll_blocked(env, lid: torch.Tensor, pr, W: torch.Tensor, add_seen: torch.Tensor, add_scan: torch.Tensor,
-                 view_now: torch.Tensor, mount_x: float, rmax: float):
+                 view_now: torch.Tensor, mount_x: float, rmax: float, any_seen: bool = False):
     """--plan-roll: two (B_l,) bools -- the committed path runs into (a) a wall whose face there was out of view when that
     part of the path was added and is in view now, (b) a box in view now that was neither in view nor passed then. W (B_l,
     K, 3): the car now (index 0), then the committed points (x, y, psi) in the world; add_seen (B_l, K, C) / add_scan (B_l,
     K, 3): the known boxes and the scanner (x, y, yaw) when each point's step was added. What a part was added through
-    knowingly is not here: that part is driven"""
+    knowingly is not here: that part is driven. `any_seen` (--roll-replan-seen): (a) a wall whose face there is in view now,
+    (b) a box in view now or known (`add_seen`'s rows are then the boxes known now) -- whenever its part was added"""
     dev = W.device
     X, Y, Pz = W[..., 0], W[..., 1], W[..., 2]
     Bn, K = X.shape
@@ -204,10 +205,10 @@ def roll_blocked(env, lid: torch.Tensor, pr, W: torch.Tensor, add_seen: torch.Te
     sk = add_scan[rows, k]
     sn = env.sim.state[lid, :3].float()
     sxy = torch.stack([sn[:, 0] + mount_x * torch.cos(sn[:, 2]), sn[:, 1] + mount_x * torch.sin(sn[:, 2])], 1)
-    wall_new = (anyw & ~points_in_view(env, lid, sk[:, :2], sk[:, 2], lo, anyw, rmax)
-                & points_in_view(env, lid, sxy, sn[:, 2], lo, anyw, rmax))
+    seen_now = points_in_view(env, lid, sxy, sn[:, 2], lo, anyw, rmax)
+    wall_new = anyw & seen_now if any_seen else anyw & ~points_in_view(env, lid, sk[:, :2], sk[:, 2], lo, anyw, rmax) & seen_now
     box_new = torch.zeros_like(anyw)
-    new_k = view_now[:, None, :] & ~add_seen                            # (B_l, K, C)
+    new_k = ((view_now[:, None, :] | add_seen) if any_seen else view_now[:, None, :] & ~add_seen)   # (B_l, K, C)
     proc = getattr(env, "procedural", None)
     if proc is not None and bool(new_k[:, 1:].any()):
         ol = place(pr.outline)                                          # (B_l, K, n, 2)
@@ -756,6 +757,12 @@ def main(argv=None):
                          "price: a hit in the part committed now. The distance shaping stays on until c = 9 is passed, then "
                          "fades over --roll-grow-fade updates. Why: roll29a-e (c = 9 from the start or from qual28f u100) all "
                          "learnt to stand still. Needs --tail-consistency > 0, --plan-hit-seen")
+    ap.add_argument("--roll-replan-seen", action="store_true",
+                    help="(11-23) with --plan-roll / --roll-grow: a whole new plan also when the committed path runs into a wall "
+                         "whose face is in view now or a box in view now or known (seen / passed) -- not only into what was "
+                         "out of view when its part was added. The decision that drew that part paid the plan-hit price then. "
+                         "Why: grow30a (0.9 s committed) stopped dodging boxes it saw 1.5-3 s ahead (hard 2.6 -> 50 %, moved "
+                         "aside 0.37 -> 0.05 m): a dodge had to start ~2 s ahead and no signal reached those decisions")
     ap.add_argument("--roll-grow-start", type=int, default=0,
                     help="the steps kept at the start: 0 from a policy trained without --roll-grow (the step committed at each "
                          "growth starts as a copy of the last one's output row); a --roll-grow checkpoint's own roll_c to resume it")
@@ -1636,8 +1643,10 @@ def main(argv=None):
                     if roll_p is not None and bool((~roll_full).any()):
                         # the committed points only (--roll-grow: the next c; the rest of the plan is a forecast)
                         ix_ = roll_t[:, :grow_c + 1] % 11; ar_ = torch.arange(Bl, device=dev)[:, None]
-                        bw_, bb_ = roll_blocked(env, lid, pr, roll_w[:, :grow_c + 1], SEENB[ix_, ar_] & ~_moved[:, None, :],
-                                                SCANB[ix_, ar_], sb_view, sb_mx, sb_rmax)
+                        kn_ = ((sb_seen & ~_moved)[:, None, :].expand(-1, grow_c + 1, -1) if args.roll_replan_seen
+                               else SEENB[ix_, ar_] & ~_moved[:, None, :])
+                        bw_, bb_ = roll_blocked(env, lid, pr, roll_w[:, :grow_c + 1], kn_, SCANB[ix_, ar_], sb_view, sb_mx,
+                                                sb_rmax, any_seen=bool(args.roll_replan_seen))
                         bw_ &= ~roll_full; bb_ &= ~roll_full
                         roll_full = roll_full | bw_ | bb_
                         hb_wall += bw_.float(); hb_box += bb_.float()

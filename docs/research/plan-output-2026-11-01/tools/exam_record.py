@@ -243,6 +243,8 @@ ROLL = (bool(ck["args"].get("plan_roll", False)) or bool(ck["args"].get("roll_gr
         or os.environ.get("F1SIM_EXAM_ROLL") == "1")   # =1: any v2 checkpoint, rolled
 # (11-22) --roll-grow: the steps a rolling decision kept when this checkpoint was saved (--plan-roll: 9)
 ROLL_C = int(ck.get("roll_c", PS.N_STEP - 1)) if ck["args"].get("roll_grow", False) else PS.N_STEP - 1
+# (11-23) --roll-replan-seen: a whole new plan also when the committed path runs into a wall / box in view or known now
+REPLAN_SEEN = bool(ck["args"].get("roll_replan_seen", False)) or os.environ.get("F1SIM_EXAM_REPLAN_SEEN") == "1"
 if ROLL:
     from f1sim.learn.plan_rl import roll_blocked, boxes_in_view, box_along
     from f1sim.learn.plan_policy import roll_shift_c
@@ -490,8 +492,10 @@ for kd in range(T):
         _blk = torch.zeros(Bl, dtype=torch.bool, device=dev)
         if r_p is not None and bool((~r_full).any()):
             _ix = r_t[:, :ROLL_C + 1] % 11; _ar = torch.arange(Bl, device=dev)[:, None]     # the committed points only
-            _bw, _bb = roll_blocked(env, lid, pr, r_w[:, :ROLL_C + 1], SEENB[_ix, _ar] & ~_moved[:, None, :], SCANB[_ix, _ar],
-                                    _view, h_mx, h_rmax)
+            _kn = ((sb_seen & ~_moved)[:, None, :].expand(-1, ROLL_C + 1, -1) if REPLAN_SEEN
+                   else SEENB[_ix, _ar] & ~_moved[:, None, :])
+            _bw, _bb = roll_blocked(env, lid, pr, r_w[:, :ROLL_C + 1], _kn, SCANB[_ix, _ar], _view, h_mx, h_rmax,
+                                    any_seen=REPLAN_SEEN)
             _blk = (_bw | _bb) & ~r_full
             r_full = r_full | _blk
         R.setdefault("newp", []).append(r_full.to(torch.int8).cpu()); R.setdefault("blocked", []).append(_blk.to(torch.int8).cpu())

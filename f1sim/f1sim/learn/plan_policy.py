@@ -292,6 +292,7 @@ class PlanRunner:
         self.roll = bool(self.v2 and not self.v3 and (_ca.get("plan_roll", False) or _ca.get("roll_grow", False)))
         # --roll-grow: the steps kept when this checkpoint was saved (--plan-roll: 9)
         self.r_c = int(ck.get("roll_c", PS.N_STEP - 1)) if _ca.get("roll_grow", False) else PS.N_STEP - 1
+        self.r_any = bool(_ca.get("roll_replan_seen", False))      # also re-plan for what is in view / known now
         if self.roll:
             from .plan_reward import PlanReward
             self.r_pr = PlanReward(env, float((ck.get("args") or {}).get("gamma", 0.995)), device)
@@ -377,8 +378,10 @@ class PlanRunner:
         if self.r_p is not None and bool(chk.any()):
             K = self.r_c + 1                                      # the committed points only
             ix = self.r_t[:, :K] % 11
-            bw, bb = roll_blocked(env, lid, self.r_pr, self.r_w[:, :K], self.r_seenb[ix, ar[:, None]] & ~moved[:, None, :],
-                                  self.r_scanb[ix, ar[:, None]], view, self.r_mx, self.r_rmax)
+            kn = ((self.r_seen & ~moved)[:, None, :].expand(-1, K, -1) if self.r_any
+                  else self.r_seenb[ix, ar[:, None]] & ~moved[:, None, :])
+            bw, bb = roll_blocked(env, lid, self.r_pr, self.r_w[:, :K], kn, self.r_scanb[ix, ar[:, None]], view, self.r_mx,
+                                  self.r_rmax, any_seen=self.r_any)
             self.r_full |= chk & (bw | bb)
 
     def _roll_plan(self, due: torch.Tensor, u: torch.Tensor, v_hat: torch.Tensor):
