@@ -766,6 +766,9 @@ def main(argv=None):
     ap.add_argument("--roll-grow-start", type=int, default=0,
                     help="the steps kept at the start: 0 from a policy trained without --roll-grow (the step committed at each "
                          "growth starts as a copy of the last one's output row); a --roll-grow checkpoint's own roll_c to resume it")
+    ap.add_argument("--roll-grow-done", type=int, default=None,
+                    help="resuming a --roll-grow run that already passed 9 (with --roll-grow-start 9): the update it did, so the "
+                         "shaping stays faded out from there instead of coming back on")
     ap.add_argument("--roll-grow-dwell", type=int, default=3)
     ap.add_argument("--roll-grow-keep", type=float, default=0.95)
     ap.add_argument("--roll-grow-fade", type=int, default=50)
@@ -1328,7 +1331,7 @@ def main(argv=None):
                     or not 0 <= grow_c <= PS.N_STEP - 1):
         raise SystemExit("--roll-grow: --format v2, --tail-consistency > 0, --plan-hit-seen, without --hold-p / --branches 2 / pace / line")
     gm_all, gm_new = commit_masks(grow_c, dev)                    # --roll-grow: the outputs a decision commits
-    grow_hist, grow_ref, grow_done = [], None, None               # laps/min at this step / before the last step / u it passed 9
+    grow_hist, grow_ref, grow_done = [], None, args.roll_grow_done   # laps/min at this step / before the last step / u it passed 9
 
     def lp_scored(u_, mean_, log_std_, full_):
         """the log-probability PPO scores: --roll-grow the steps committed (a whole plan 1..c+1, a rolling decision c+1);
