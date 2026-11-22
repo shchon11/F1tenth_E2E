@@ -320,7 +320,9 @@ class PlanRunner:
         Bl = int(lid.numel()); dev = self.device
         cnt = env.sim.contact_counts[lid, 0:3]
         hit = (cnt - self.r_cnt).clamp_min(0).sum(1) > 0
-        self.r_full |= due & hit
+        # not where the last plan put it (held by a wall, pushed; with a follower other than "ideal": its tracking error)
+        off = (env.sim.state[lid, :2].float() - self.r_w[:, 0, :2]).norm(dim=-1) > 0.01 if self.r_p is not None else hit
+        self.r_full |= due & (hit | off)
         self.r_cnt = torch.where(due[:, None], cnt, self.r_cnt)
         if getattr(env, "procedural", None) is None:
             return

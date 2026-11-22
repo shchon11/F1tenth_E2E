@@ -539,8 +539,8 @@ for kd in range(T):
         restarted |= (te | trc)[lid]
         pr.control_step((env.last_result.scan_type[lid] == HIT_CAR).any(1))
     out = pr.decision(pts, pc["price"], restarted)
-    if ROLL:                                                    # a restart or a contact: a whole new plan next
-        r_full = restarted | (out["contact"] < 0)
+    if ROLL:                                                    # off the plan (held / pushed), a restart or a contact: a whole plan
+        r_full = restarted | ((env.sim.state[lid, :2].float() - r_w[:, 0, :2]).norm(dim=-1) > 0.01) | (out["contact"] < 0)
         t_dec += 1
     if KNOWN:
         _tid = env.sim.tid[lid]

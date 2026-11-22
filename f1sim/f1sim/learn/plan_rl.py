@@ -1750,9 +1750,12 @@ def main(argv=None):
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
                                                      charge_from=roll_cf if roll_on else None)
                 if roll_on:
-                    # a restart or a contact draws a whole plan (a contact moved the car off the committed path: what is left
-                    # of it no longer starts where the car is); the others roll on
-                    roll_full = out["restarted"] | (out["contact"] < 0)
+                    # a whole plan next when the car is not where the plan put it: driven exactly, only something that stopped
+                    # or pushed it does that (a wall it is held against, a box) -- 1 cm is far above the rounding; a restart too.
+                    # (11-22: re-planning only at a new contact let a car held against a wall keep extending its plan from the
+                    # plan's own 9.4 m/s through the wall)
+                    off_ = (env.sim.state[lid, :2].float() - roll_w[:, 0, :2]).norm(dim=-1) > 0.01
+                    roll_full = out["restarted"] | off_ | (out["contact"] < 0)
                     t_dec += 1
                 for tp_ in taps:
                     _ii, _q = PT_IDX.to(dev), tp_.row
