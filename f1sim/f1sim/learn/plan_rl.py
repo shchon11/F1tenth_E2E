@@ -220,6 +220,32 @@ def roll_blocked(env, lid: torch.Tensor, pr, W: torch.Tensor, add_seen: torch.Te
     return wall_new, box_new
 
 
+def first_wall_seen(env, lid: torch.Tensor, pr, x: torch.Tensor, y: torch.Tensor, psi: torch.Tensor, first: torch.Tensor,
+                    mount_x: float, rmax: float):
+    """(11-23, --plan-hit-wall-seen) a plan just drawn (dense poses x, y, psi (B_l, n)) whose first hit is at pose `first`:
+    (B_l,) the hit there is a wall, (B_l,) that wall's face there is in view from the scanner now (the face found as in
+    `roll_blocked`: the inside corner bisected toward the same corner one pose earlier)"""
+    rows = torch.arange(x.shape[0], device=x.device)
+    tid = env.sim.tid[lid]
+    P = pr.corners
+
+    def corners(i):
+        c, s = torch.cos(psi[rows, i])[:, None], torch.sin(psi[rows, i])[:, None]
+        return torch.stack([x[rows, i][:, None] + P[:, 0] * c - P[:, 1] * s, y[rows, i][:, None] + P[:, 0] * s + P[:, 1] * c], -1)
+    hi_c, lo_c = corners(first), corners((first - 1).clamp_min(0))      # (B_l, 4, 2)
+    inw = env.sim.track.sample_edt(hi_c, tid[:, None].expand(-1, hi_c.shape[1])) <= 0.0
+    is_wall = inw.any(-1)
+    ci = inw.float().argmax(1)
+    hi, lo = hi_c[rows, ci], lo_c[rows, ci]
+    for _ in range(8):
+        mid = 0.5 * (lo + hi)
+        inside = env.sim.track.sample_edt(mid, tid) <= 0.0
+        hi = torch.where(inside[:, None], mid, hi); lo = torch.where(inside[:, None], lo, mid)
+    sn = env.sim.state[lid, :3].float()
+    sxy = torch.stack([sn[:, 0] + mount_x * torch.cos(sn[:, 2]), sn[:, 1] + mount_x * torch.sin(sn[:, 2])], 1)
+    return is_wall, points_in_view(env, lid, sxy, sn[:, 2], lo, is_wall, rmax)
+
+
 def boxes_passed(seen, prev_ds, prev_pos, ds, live, pos):
     """--mem-aux-seen, one decision: (seen, prev_ds, prev_pos) brought up to now from `box_along`'s (ds, live, pos). A box slot
     counts as passed once the car went by it (0..3 m ahead at the last decision, 0..3 m behind now); a slot whose box moved (a
@@ -484,6 +510,8 @@ class Driver:
         self.lid = env.learner_ids
         self.opp = None                                        # `SelfOpponents`: other cars driven by copies of the policy
         self.scene = None                                      # `SceneReplay`: told where in the decision each step is
+        self.wall_seen = None                                  # --plan-hit-wall-seen: (mount_x, range_max) of the scanner
+        self.n_wall_hidden = 0.0                               # ... plan hits it did not charge (a wall out of view)
         self.act0 = torch.zeros(env.B, env.act_dim, device=env.device)
         from ..lidar import HIT_CAR
         self._hit_car = HIT_CAR
@@ -498,6 +526,11 @@ class Driver:
             p = PS.roll(a, st[:, dyn.IVX], st[:, dyn.ISTEER], self.lim)
         x, y, psi = plan_world(p, st)
         pc = self.pr.plan_cost(x, y, psi, p["v"])
+        wall_hidden = None
+        if self.wall_seen is not None and charge_from is not None and bool(pc["hit"].any()):
+            # (11-23) a wall out of view where the plan first meets it is not charged: the policy could not see it
+            w_, v_ = first_wall_seen(env, lid, self.pr, x, y, psi, pc["first"], *self.wall_seen)
+            wall_hidden = w_ & ~v_
         idx = PT_IDX.to(a.device)
         pts = torch.stack([x[:, idx], y[:, idx]], -1)
         env.sim.ideal_vcap[lid] = 1e3
@@ -525,6 +558,9 @@ class Driver:
             ok_ = pc["hit"] & (pc["first"] >= charge_from)
             if charge_to is not None:                          # --roll-grow: ... and not in the forecast after it
                 ok_ = ok_ & (pc["first"] <= charge_to)
+            if wall_hidden is not None:                        # --plan-hit-wall-seen
+                self.n_wall_hidden += float((ok_ & wall_hidden).sum())
+                ok_ = ok_ & ~wall_hidden
             price, hit = torch.where(ok_, price, torch.zeros_like(price)), ok_.float()
         out = self.pr.decision(pts, price, restarted)
         out["plan_hit_price"] = out.pop("plan_hit")
@@ -766,6 +802,12 @@ def main(argv=None):
     ap.add_argument("--roll-grow-start", type=int, default=0,
                     help="the steps kept at the start: 0 from a policy trained without --roll-grow (the step committed at each "
                          "growth starts as a copy of the last one's output row); a --roll-grow checkpoint's own roll_c to resume it")
+    ap.add_argument("--plan-hit-wall-seen", action="store_true",
+                    help="(11-23) with --plan-roll / --roll-grow: a plan hit on a wall is charged only if that wall's face was in "
+                         "view from the scanner when the part was drawn (boxes are already priced only when seen or passed). Why: "
+                         "grow30b crept through the bottom U-turn exit (2 m/s, nearly stopping at 8-9 m, qual26r 7 m/s): there it "
+                         "sees 3.4-4.3 m of its path and kept its committed 0.9 s inside that (1.9-2.4 m); a hidden wall that "
+                         "comes into view across the committed path still makes a whole new plan (--roll-replan-seen)")
     ap.add_argument("--roll-grow-done", type=int, default=None,
                     help="resuming a --roll-grow run that already passed 9 (with --roll-grow-start 9): the update it did, so the "
                          "shaping stays faded out from there instead of coming back on")
@@ -1281,6 +1323,8 @@ def main(argv=None):
         sb_mx = float(args.lidar_mount_x) if args.lidar_mount_x else 0.297
         sb_rmax = float(env.cfg.lidar.range_max)
         pr.plan_known, pr.plan_known_walls = sb_seen, True
+        if args.plan_hit_wall_seen:
+            drv.wall_seen = (sb_mx, sb_rmax)
     known_on = bool(args.noise_corr_known)
     if known_on:
         kn_rho, kn_std, kn_d0, kn_d1 = (float(x) for x in args.noise_corr_known.split(","))
@@ -1325,6 +1369,8 @@ def main(argv=None):
     roll_on = bool(args.plan_roll or grow_on)
     if args.plan_roll and grow_on:
         raise SystemExit("--plan-roll or --roll-grow, not both")
+    if args.plan_hit_wall_seen and not (roll_on and args.plan_hit_seen):
+        raise SystemExit("--plan-hit-wall-seen: with --plan-roll / --roll-grow and --plan-hit-seen")
     if args.plan_roll and (not v2 or v3 or tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen):
         raise SystemExit("--plan-roll: --format v2, --tail-consistency 0, --plan-hit-seen, without --hold-p / --branches 2 / pace / line")
     if grow_on and (not v2 or v3 or not tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen
@@ -2522,6 +2568,8 @@ def main(argv=None):
                        replay_buffer=levels.stats()["buffer_mean"], replay_score=levels.stats()["score_mean"])
         if grow_on:
             row["roll_c"] = grow_c
+        if args.plan_hit_wall_seen:                                 # plan hits not charged: a wall out of view, per decision
+            row["plan_wall_hidden_share"] = drv.n_wall_hidden / max(1.0, float(T * Bl)); drv.n_wall_hidden = 0.0
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % " + (f"(서 있는 벌점 {row['stall_s_per_min']:.1f} s/분) " if args.stall_s > 0 else "")
