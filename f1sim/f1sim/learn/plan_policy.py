@@ -181,6 +181,18 @@ def plan_world(p: Dict[str, torch.Tensor], st: torch.Tensor):
 
 
 PT_IDX = torch.arange(1, PS.N_STEP + 1) * PS.SUB             # the 10 points among the dense poses
+# (11-22, the user: "0.1초가 지났어. 나머지 0.9초짜리는 그대로 유지하면서 새로운 0.1초짜리를 ... 점점 이어나가게") a rolling plan:
+# every decision keeps the committed plan's next 0.9 s and the policy adds the 0.1 s after it -- its outputs' last step (turn,
+# speed) are the decision; a whole new plan only at a start or when something unseen blocks the committed part
+ROLL_IDX = (PS.N_STEP - 1, 2 * PS.N_STEP - 1)
+
+
+def roll_shift(u_prev: torch.Tensor, u_new: torch.Tensor) -> torch.Tensor:
+    """the committed plan's action (B, 20, pre-tanh) one step on, `u_new`'s last step appended: rolled from the committed
+    plan's state at its first step's end (`plan_steps.roll` is a recursion over the steps), it is the same 0.9 s and then
+    the new 0.1 s"""
+    N = PS.N_STEP
+    return torch.cat([u_prev[:, 1:N], u_new[:, N - 1:N], u_prev[:, N + 1:], u_new[:, 2 * N - 1:]], 1)
 
 def _priv_drop() -> list:
     """the centerline columns of `GymEnv.privileged_v2` (the columns after its keys -- props -- are kept)"""

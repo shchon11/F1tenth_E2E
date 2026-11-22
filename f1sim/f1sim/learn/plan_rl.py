@@ -46,7 +46,7 @@ from .. import plan_steps as PS
 from .. import dynamics as dyn
 from .. import map_controller as M
 from . import state_rl as SR
-from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2
+from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2, ROLL_IDX, roll_shift
 from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
@@ -113,6 +113,109 @@ def boxes_in_view(env, lid: torch.Tensor, pos: torch.Tensor, live: torch.Tensor,
     wall = env.sim.track.sample_edt(torch.stack([px, py], -1), tid) <= 0.0
     wall = wall & (t[None, None, :] < (d - 0.35)[..., None])
     return ok & ~wall.any(-1)
+
+
+def points_in_view(env, lid: torch.Tensor, sxy: torch.Tensor, syaw: torch.Tensor, pts: torch.Tensor, ok: torch.Tensor,
+                   rmax: float, fov: float = math.radians(135.0), step: float = 0.1, short: float = 0.35) -> torch.Tensor:
+    """(B_l,) bool: `pts` (B_l, 2) seen from a scanner at `sxy` (B_l, 2) heading `syaw` (B_l,) -- within `rmax` and the field
+    of view, no wall cell on the line to `short` m before it (`boxes_in_view`'s test from any pose)"""
+    dx, dy = pts[:, 0] - sxy[:, 0], pts[:, 1] - sxy[:, 1]
+    d = torch.sqrt(dx * dx + dy * dy)
+    rel = torch.remainder(torch.atan2(dy, dx) - syaw + math.pi, 2.0 * math.pi) - math.pi
+    ok = ok & (d <= rmax) & (rel.abs() <= fov)
+    n = max(1, int(math.ceil(rmax / step)))
+    t = torch.arange(1, n + 1, device=pts.device, dtype=pts.dtype) * step
+    ux, uy = dx / d.clamp_min(1e-6), dy / d.clamp_min(1e-6)
+    px = sxy[:, 0:1] + ux[:, None] * t; py = sxy[:, 1:2] + uy[:, None] * t
+    tid = env.sim.tid[lid][:, None].expand(px.shape)
+    wall = (env.sim.track.sample_edt(torch.stack([px, py], -1), tid) <= 0.0) & (t[None, :] < (d - short)[:, None])
+    return ok & ~wall.any(-1)
+
+
+def held_blocked(env, lid: torch.Tensor, pr, xw: torch.Tensor, yw: torch.Tensor, pw: torch.Tensor, k_done: torch.Tensor,
+                 st_plan: torch.Tensor, known_plan: torch.Tensor, view_now: torch.Tensor, mount_x: float, rmax: float):
+    """--hold-new-block: two (B_l,) bools -- the held plan's points still ahead run into (a) a wall whose face there was out of
+    view when the plan was drawn and is in view now, (b) a box in view now that was neither in view nor passed when it was
+    drawn (`known_plan`). xw, yw, pw: the held plans' dense poses in the world; k_done: the plan point the car is at (whole
+    steps driven - 1). What a plan was drawn through knowingly is not here: that one is driven on"""
+    dev = xw.device
+    ii = PT_IDX.to(dev)
+    X, Y, Pz = xw[:, ii], yw[:, ii], pw[:, ii]                           # (B_l, 10)
+    ahead = torch.arange(PS.N_STEP, device=dev)[None, :] > k_done[:, None]
+    c, s = torch.cos(Pz)[..., None], torch.sin(Pz)[..., None]
+    place = lambda Q: torch.stack([X[..., None] + Q[:, 0] * c - Q[:, 1] * s, Y[..., None] + Q[:, 0] * s + Q[:, 1] * c], -1)
+    tid = env.sim.tid[lid]
+    cr = place(pr.corners)                                              # (B_l, 10, 4, 2)
+    inw = env.sim.track.sample_edt(cr, tid[:, None, None].expand(cr.shape[:-1])) <= 0.0
+    hitp = inw.any(-1) & ahead
+    anyw = hitp.any(1)
+    rows = torch.arange(X.shape[0], device=dev)
+    k = hitp.float().argmax(1)
+    ci = inw[rows, k].float().argmax(1)
+    hi = cr[rows, k, ci]; lo = cr[rows, (k - 1).clamp_min(0), ci]       # that corner one point earlier: outside the wall
+    for _ in range(8):                                                  # the wall face on the way between
+        mid = 0.5 * (lo + hi)
+        inside = env.sim.track.sample_edt(mid, tid) <= 0.0
+        hi = torch.where(inside[:, None], mid, hi); lo = torch.where(inside[:, None], lo, mid)
+    sp, sn = st_plan[:, :3].float(), env.sim.state[lid, :3].float()
+    scan = lambda q: torch.stack([q[:, 0] + mount_x * torch.cos(q[:, 2]), q[:, 1] + mount_x * torch.sin(q[:, 2])], 1)
+    wall_new = (anyw & ~points_in_view(env, lid, scan(sp), sp[:, 2], lo, anyw, rmax)
+                & points_in_view(env, lid, scan(sn), sn[:, 2], lo, anyw, rmax))
+    box_new = torch.zeros_like(anyw)
+    new = view_now & ~known_plan
+    proc = getattr(env, "procedural", None)
+    if proc is not None and bool(new.any()):
+        ol = place(pr.outline)                                          # (B_l, 10, n, 2)
+        C = new.shape[1]
+        km = new[:, None, None, :].expand(*ol.shape[:-1], C).reshape(-1, C)
+        eid = env.sim.eid[lid][:, None, None].expand(ol.shape[:-1]).reshape(-1)
+        cl = proc.clearance(ol.reshape(-1, 2), eid, slot_mask=km).reshape(ol.shape[:-1])
+        box_new = ((cl <= 0.0).any(-1) & ahead).any(1)
+    return wall_new, box_new
+
+
+def roll_blocked(env, lid: torch.Tensor, pr, W: torch.Tensor, add_seen: torch.Tensor, add_scan: torch.Tensor,
+                 view_now: torch.Tensor, mount_x: float, rmax: float):
+    """--plan-roll: two (B_l,) bools -- the committed path runs into (a) a wall whose face there was out of view when that
+    part of the path was added and is in view now, (b) a box in view now that was neither in view nor passed then. W (B_l,
+    K, 3): the car now (index 0), then the committed points (x, y, psi) in the world; add_seen (B_l, K, C) / add_scan (B_l,
+    K, 3): the known boxes and the scanner (x, y, yaw) when each point's step was added. What a part was added through
+    knowingly is not here: that part is driven"""
+    dev = W.device
+    X, Y, Pz = W[..., 0], W[..., 1], W[..., 2]
+    Bn, K = X.shape
+    ahead = torch.arange(K, device=dev)[None, :] >= 1
+    c, s = torch.cos(Pz)[..., None], torch.sin(Pz)[..., None]
+    place = lambda Q: torch.stack([X[..., None] + Q[:, 0] * c - Q[:, 1] * s, Y[..., None] + Q[:, 0] * s + Q[:, 1] * c], -1)
+    tid = env.sim.tid[lid]
+    cr = place(pr.corners)                                              # (B_l, K, 4, 2)
+    inw = env.sim.track.sample_edt(cr, tid[:, None, None].expand(cr.shape[:-1])) <= 0.0
+    hitp = inw.any(-1) & ahead
+    anyw = hitp.any(1)
+    rows = torch.arange(Bn, device=dev)
+    k = hitp.float().argmax(1)
+    ci = inw[rows, k].float().argmax(1)
+    hi = cr[rows, k, ci]; lo = cr[rows, (k - 1).clamp_min(0), ci]       # that corner one point earlier: outside the wall
+    for _ in range(8):                                                  # the wall face on the way between
+        mid = 0.5 * (lo + hi)
+        inside = env.sim.track.sample_edt(mid, tid) <= 0.0
+        hi = torch.where(inside[:, None], mid, hi); lo = torch.where(inside[:, None], lo, mid)
+    sk = add_scan[rows, k]
+    sn = env.sim.state[lid, :3].float()
+    sxy = torch.stack([sn[:, 0] + mount_x * torch.cos(sn[:, 2]), sn[:, 1] + mount_x * torch.sin(sn[:, 2])], 1)
+    wall_new = (anyw & ~points_in_view(env, lid, sk[:, :2], sk[:, 2], lo, anyw, rmax)
+                & points_in_view(env, lid, sxy, sn[:, 2], lo, anyw, rmax))
+    box_new = torch.zeros_like(anyw)
+    new_k = view_now[:, None, :] & ~add_seen                            # (B_l, K, C)
+    proc = getattr(env, "procedural", None)
+    if proc is not None and bool(new_k[:, 1:].any()):
+        ol = place(pr.outline)                                          # (B_l, K, n, 2)
+        C = new_k.shape[-1]
+        km = new_k[:, :, None, :].expand(*ol.shape[:-1], C).reshape(-1, C)
+        eid = env.sim.eid[lid][:, None, None].expand(ol.shape[:-1]).reshape(-1)
+        cl = proc.clearance(ol.reshape(-1, 2), eid, slot_mask=km).reshape(ol.shape[:-1])
+        box_new = ((cl <= 0.0).any(-1) & ahead).any(1)
+    return wall_new, box_new
 
 
 def boxes_passed(seen, prev_ds, prev_pos, ds, live, pos):
@@ -383,7 +486,7 @@ class Driver:
         from ..lidar import HIT_CAR
         self._hit_car = HIT_CAR
 
-    def decision(self, a: torch.Tensor, p=None, charge=None):
+    def decision(self, a: torch.Tensor, p=None, charge=None, charge_from=None):
         """drive one decision: `p` a plan already made (v2: from the policy's speed estimate and last command), else
         made from `a` at the car's true state (v1). `charge` (B_l,) bool: rows whose plan is new this decision -- the
         plan-hit cost is charged once, when a plan is drawn (a held plan's later decisions pay none)"""
@@ -416,6 +519,9 @@ class Driver:
         price, hit = pc["price"], pc["hit"].float()
         if charge is not None:
             price, hit = torch.where(charge, price, torch.zeros_like(price)), hit * charge.float()
+        if charge_from is not None:                            # --plan-roll: a hit in the part added now (a new plan: anywhere)
+            ok_ = pc["hit"] & (pc["first"] >= charge_from)
+            price, hit = torch.where(ok_, price, torch.zeros_like(price)), ok_.float()
         out = self.pr.decision(pts, price, restarted)
         out["plan_hit_price"] = out.pop("plan_hit")
         out["plan_hit"] = hit
@@ -629,6 +735,21 @@ def main(argv=None):
     ap.add_argument("--hold-clear", type=float, default=0.0,
                     help="hold only when no other car and no box is within this many metres; one that comes inside it ends a "
                          "hold at once (11-09, the user: racing needs the reaction -- holds near them teach timid plans). 0 = anywhere")
+    ap.add_argument("--plan-roll", action="store_true",
+                    help="(11-22, the user: \"0.1초가 지났어. 나머지 0.9초짜리는 그대로 유지하면서 새로운 0.1초짜리를 ... 점점 이어나가게\") "
+                         "every decision keeps the committed plan's next 0.9 s and the policy adds the 0.1 s after it (its last "
+                         "step's turn and speed are the decision, scored by PPO); a whole new plan only at a start or when "
+                         "something out of view (a box: nor passed) when a part was added now blocks the committed path "
+                         "(`roll_blocked`), or after a contact (the car is off the path). The plan-hit price is charged for a "
+                         "hit in the part added now (a new plan: anywhere): that part is driven. Needs --plan-hit-seen, "
+                         "--tail-consistency 0")
+    ap.add_argument("--hold-new-block", action="store_true",
+                    help="(11-22, the user: the plan as the drive -- \"그냥 싹 다 이동해도 되지 않아?\", \"이 방향으로\") with --hold-p: a "
+                         "held plan ends early when what is still ahead of it runs into something out of view when it was drawn "
+                         "and in view now -- a wall face, or a box neither in view nor passed then (needs --plan-hit-seen). What it "
+                         "was drawn through knowingly it drives on. exam2 records, every plan kept to its end: things out of view at "
+                         "the drawing came into view 0.70 s (median) before the plan reached them -- when a plan re-drawn every "
+                         "0.1 s first sees them too")
     ap.add_argument("--init-critic", action="store_true", help="with --init: the critic too, when its inputs match (a run continued)")
     ap.add_argument("--tail-consistency", type=float, default=0.0,
                     help="v2: only the plan's first 0.1 s is the RL action (its noise and log-probability); the other 18 outputs are "
@@ -860,10 +981,10 @@ def main(argv=None):
         import datetime
         import torch.distributed as dist
         if (args.dump_rollout or args.track_steps or args.level_replay > 0 or args.self_opp > 0 or args.branches == 2
-                or args.hold_p > 0 or args.accum > 1):
+                or args.accum > 1):
             # --scene-replay (11-15): each rank keeps its own store from its own races; the statistics are rank 0's ordinary races
             raise SystemExit("--dist-world: not with --dump-rollout / --track-steps / --level-replay / --self-opp / --branches 2 / "
-                             "--hold-p / --accum (use --accum-actor)")
+                             "--accum (use --accum-actor)")
         dist.init_process_group(args.dist_backend, init_method=args.dist_init, rank=args.dist_rank, world_size=args.dist_world,
                                 timeout=datetime.timedelta(hours=24))    # gpu_guard3 may pause both while the console runs
         if args.dist_rank > 0 and not args.dist_same_seed:
@@ -964,6 +1085,10 @@ def main(argv=None):
     hold_left = torch.zeros(Bl, dtype=torch.long, device=dev)      # decisions a held plan still drives after this one
     hold_k = torch.zeros(Bl, dtype=torch.long, device=dev)         # whole steps of the held plan already driven
     p_held = None
+    if args.hold_new_block and not (hold and args.plan_hit_seen):
+        raise SystemExit("--hold-new-block needs --hold-p and --plan-hit-seen (the boxes in view / passed)")
+    st_plan = env.sim.state[lid].clone()                            # --hold-new-block: the pose each held plan was drawn at
+    known_plan = None                                              # and the boxes in view or passed then
     others = env.sim.other_idx[lid] if env.M > 1 else None
 
     def near_threat() -> torch.Tensor:
@@ -1012,8 +1137,8 @@ def main(argv=None):
               if args.level_replay > 0 else None)
     scene = None
     if args.scene_replay > 0:
-        if not v2 or v3 or levels is not None or args.hold_p > 0:
-            raise SystemExit("--scene-replay needs --format v2, without --level-replay / --hold-p")
+        if not v2 or v3 or levels is not None:
+            raise SystemExit("--scene-replay needs --format v2, without --level-replay")
         if not torch.equal(lid, torch.arange(Bl, device=dev) * env.M):
             raise SystemExit("--scene-replay: the learner is expected in the first seat of every race")
         if args.scene_replay_auto:
@@ -1154,10 +1279,20 @@ def main(argv=None):
     rl_mask = torch.zeros(PS.ACT_DIM, dtype=torch.bool, device=dev)
     rl_mask[0] = True; rl_mask[PS.N_STEP] = True                   # the first step's steering and speed
     rl_idx = torch.nonzero(rl_mask)[:, 0]
-    if args.speed_std_floor > 0:
-        actor.log_std_floor[PS.N_STEP] = math.log(args.speed_std_floor)        # the first step's speed: the one driven
+    if args.speed_std_floor > 0:                               # the step decided: the first (--plan-roll: the last)
+        actor.log_std_floor[2 * PS.N_STEP - 1 if args.plan_roll else PS.N_STEP] = math.log(args.speed_std_floor)
     if args.steer_std_floor > 0:
-        actor.log_std_floor[0] = math.log(args.steer_std_floor)                # the first step's turn: the one driven
+        actor.log_std_floor[PS.N_STEP - 1 if args.plan_roll else 0] = math.log(args.steer_std_floor)
+    roll_on = bool(args.plan_roll)
+    if roll_on and (not v2 or v3 or tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen):
+        raise SystemExit("--plan-roll: --format v2, --tail-consistency 0, --plan-hit-seen, without --hold-p / --branches 2 / pace / line")
+    roll_u = torch.zeros(Bl, PS.ACT_DIM, device=dev)               # the committed plan's action (pre-tanh)
+    roll_p = None                                                  # the committed plan
+    roll_full = torch.ones(Bl, dtype=torch.bool, device=dev)      # rows drawing a whole new plan at this decision
+    roll_w = torch.zeros(Bl, PS.N_STEP, 3, device=dev)            # its 10 points in the world (x, y, psi)
+    roll_t = torch.zeros(Bl, PS.N_STEP, dtype=torch.long, device=dev)   # the decision each point's step was added at
+    SEENB = None; SCANB = torch.zeros(11, Bl, 3, device=dev)       # the known boxes / the scanner at the last 11 decisions
+    t_dec = 0
     if args.box_memory and not (args.memory and args.mem_front and v2):
         raise SystemExit("--box-memory needs --memory --mem-front (v2)")
     if args.mem_aux_in and not (args.box_memory and aux_on and args.mem_aux_seen):
@@ -1368,6 +1503,7 @@ def main(argv=None):
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
         BR = []                                                # --branches 2: the plan each decision drove
         PD, PI, CAPL = [], [], []                              # --pace-caps: picked now?, the level in force, its cap [m/s]
+        FULL = []                                              # --plan-roll: a whole new plan drawn at this decision
         KZ, kz_n = [], 0.0                                     # --noise-corr-known: the rows in the known zone, their share
         pace_n = torch.zeros(max(getattr(actor, "pace_levels", 0), 1), device=dev)
         br_n = {k: 0.0 for k in ("b0", "gap", "switch", "arg_switch", "pmax", "pairs")}
@@ -1379,6 +1515,7 @@ def main(argv=None):
         n_removed = 0
         n_restarted = 0
         near_sum = torch.zeros(Bl, device=dev)
+        hb_wall = torch.zeros(Bl, device=dev); hb_box = torch.zeros(Bl, device=dev)   # --hold-new-block: plans ended early
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
@@ -1417,14 +1554,41 @@ def main(argv=None):
                     near = near_threat()
                     hold_left = torch.where(near, torch.zeros_like(hold_left), hold_left)
                     near_sum += near.float()
-                newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
                 if seen_on:                                        # --plan-hit-seen: boxes seen or passed this episode
                     _ds, _live, _pos = box_along(env, pr.goal, lid)
                     _moved = ((_pos - sb_pos).abs().sum(-1) > 0.05) | ~_live
                     _passed = _live & ~_moved & (sb_ds > 0.0) & (sb_ds <= 3.0) & (_ds <= 0.0) & (_ds > -3.0)
-                    sb_seen = (sb_seen & ~_moved) | _passed | boxes_in_view(env, lid, _pos, _live, sb_mx, sb_rmax)
+                    sb_view = boxes_in_view(env, lid, _pos, _live, sb_mx, sb_rmax)
+                    sb_seen = (sb_seen & ~_moved) | _passed | sb_view
                     sb_ds = torch.where(_live, _ds, torch.full_like(_ds, float("nan"))); sb_pos = _pos
                     pr.plan_known = sb_seen
+                if args.hold_new_block and p_held is not None:
+                    # a held plan runs into something it could not know when drawn: draw a new one now
+                    inh = hold_left > 0
+                    if bool(inh.any()):
+                        xw_h, yw_h, pw_h = plan_world(p_held, st_plan)
+                        bw_, bb_ = held_blocked(env, lid, pr, xw_h, yw_h, pw_h, hold_k, st_plan, known_plan & ~_moved, sb_view,
+                                                sb_mx, sb_rmax)
+                        bw_ &= inh; bb_ &= inh
+                        hold_left = torch.where(bw_ | bb_, torch.zeros_like(hold_left), hold_left)
+                        hb_wall += bw_.float(); hb_box += bb_.float()
+                if roll_on:
+                    # the scanner and the known boxes now (for the step added now); then: something unseen when its part was
+                    # added blocks the committed path -> a whole new plan
+                    _sn = env.sim.state[lid, :3].float()
+                    SCANB[t_dec % 11] = torch.stack([_sn[:, 0] + sb_mx * torch.cos(_sn[:, 2]),
+                                                     _sn[:, 1] + sb_mx * torch.sin(_sn[:, 2]), _sn[:, 2]], 1)
+                    if SEENB is None:
+                        SEENB = torch.zeros(11, *sb_seen.shape, dtype=torch.bool, device=dev)
+                    SEENB[t_dec % 11] = sb_seen
+                    if roll_p is not None and bool((~roll_full).any()):
+                        ix_ = roll_t % 11; ar_ = torch.arange(Bl, device=dev)[:, None]
+                        bw_, bb_ = roll_blocked(env, lid, pr, roll_w, SEENB[ix_, ar_] & ~_moved[:, None, :], SCANB[ix_, ar_],
+                                                sb_view, sb_mx, sb_rmax)
+                        bw_ &= ~roll_full; bb_ &= ~roll_full
+                        roll_full = roll_full | bw_ | bb_
+                        hb_wall += bw_.float(); hb_box += bb_.float()
+                newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from
@@ -1509,6 +1673,10 @@ def main(argv=None):
                 else:
                     u = mean + log_std.exp() * eps
                     lp = tanh_logp(u, mean, log_std)
+                    if roll_on:                                    # a rolling decision picks its last step; a new plan all of it
+                        ri_ = list(ROLL_IDX)
+                        lp = torch.where(roll_full, lp, tanh_logp(u[:, ri_], mean[:, ri_], log_std.expand_as(mean)[:, ri_]))
+                        FULL.append(roll_full.clone())
                 if two:
                     lp = lp + pb[ar_l, br].log()
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
@@ -1532,6 +1700,22 @@ def main(argv=None):
                     p = P3.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.servo,
                                 torch.stack([obs.cmd_d, obs.cmd_v], 1), lim, act3, turn3)
                     vest_err.append((v_hat - v_true).abs())
+                elif v2 and roll_on:
+                    # the committed 0.9 s rolled on from its own state after its first step, the new last 0.1 s appended
+                    # (a new plan: from the speed estimate and the last command)
+                    u_x = u if roll_p is None else torch.where(roll_full[:, None], u, roll_shift(roll_u, u))
+                    v_s = v_hat.clamp(-PS.V_REV, PS.V_FWD); d_s = obs.cmd_d
+                    if roll_p is not None:
+                        v_s = torch.where(roll_full, v_s, roll_p["v"][:, PS.SUB]); d_s = torch.where(roll_full, d_s, roll_p["delta"][:, PS.SUB])
+                    p = PS.roll(torch.tanh(u_x), v_s, d_s, lim)
+                    roll_cf = torch.where(roll_full, torch.zeros_like(roll_t[:, 0]),
+                                          torch.full_like(roll_t[:, 0], (PS.N_STEP - 1) * PS.SUB + 1))
+                    roll_t = torch.where(roll_full[:, None], torch.full_like(roll_t, t_dec),
+                                         torch.cat([roll_t[:, 1:], torch.full_like(roll_t[:, :1], t_dec)], 1))
+                    roll_u, roll_p = u_x, p
+                    _xr, _yr, _pr = plan_world(p, env.sim.state[lid]); _ir = PT_IDX.to(dev)
+                    roll_w = torch.stack([_xr[:, _ir], _yr[:, _ir], _pr[:, _ir]], -1)
+                    vest_err.append((v_hat - v_true).abs())
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap_ if pace_on else None)
@@ -1553,6 +1737,9 @@ def main(argv=None):
                                                        else p[k_] for k_ in p}
                     hold_k = torch.where(newp, torch.zeros_like(hold_k), hold_k + 1)
                     p = PS.shift_plan(p_held, hold_k)
+                    if args.hold_new_block:
+                        st_plan = torch.where(newp[:, None], env.sim.state[lid], st_plan)
+                        known_plan = sb_seen.clone() if known_plan is None else torch.where(newp[:, None], sb_seen, known_plan)
                     more = torch.randint(h_lo - 1, h_hi, (Bl,), device=dev)
                     start = newp & (torch.rand(Bl, device=dev) < args.hold_p)
                     if args.hold_clear > 0:
@@ -1560,7 +1747,13 @@ def main(argv=None):
                     hold_left = torch.where(start, more, torch.where(newp, torch.zeros_like(hold_left), hold_left - 1))
                 if levels is not None:
                     hard0 = env.sim.contact_counts[lid, 3:6].clone()
-                out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
+                                                     charge_from=roll_cf if roll_on else None)
+                if roll_on:
+                    # a restart or a contact draws a whole plan (a contact moved the car off the committed path: what is left
+                    # of it no longer starts where the car is); the others roll on
+                    roll_full = out["restarted"] | (out["contact"] < 0)
+                    t_dec += 1
                 for tp_ in taps:
                     _ii, _q = PT_IDX.to(dev), tp_.row
                     _ls = log_std.expand_as(mean)
@@ -1614,6 +1807,10 @@ def main(argv=None):
                             aux_prev_pos[g_l] = Dd["aux_prev_pos"][i_l]
                         if two:
                             obs.prev_branch[g_l] = Dd["pol_branch"][i_l]
+                        if hold:                                 # a scene starts with a plan of its own
+                            hold_left[g_l] = 0
+                        if roll_on:
+                            roll_full[g_l] = True
                     # 2. hard contacts of this decision (a car's only if the reward charges for it)
                     hd = (env.sim.contact_counts[lid, 3:6] - hard0).clamp_min(0).float()
                     hd[:, 2] = hd[:, 2] * (pr.seen_t <= SEEN_S + PS.DT).float()
@@ -1814,6 +2011,8 @@ def main(argv=None):
             bBR = torch.cat(BR)
         if pace_on:
             bPD, bPI, bCAP = torch.cat(PD), torch.cat(PI), torch.cat(CAPL)
+        if roll_on:
+            bFULL = torch.cat(FULL)
         if known_on:
             bKZ = torch.cat(KZ)
         if tailc:
@@ -1943,6 +2142,9 @@ def main(argv=None):
                     lp = tanh_logp(bU[mb][:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
                 else:
                     lp = tanh_logp(bU[mb], mean, log_std)
+                    if roll_on:
+                        ri_ = list(ROLL_IDX)
+                        lp = torch.where(bFULL[mb], lp, tanh_logp(bU[mb][:, ri_], mean[:, ri_], log_std[:, ri_]))
                 if two:
                     lp = lp + branch_p(aux_box["logits"])[torch.arange(mb.numel(), device=dev), bBR[mb]].log()
                 if pace_on:
@@ -2189,7 +2391,7 @@ def main(argv=None):
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
                "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed, "opp_restarted": n_restarted,
                "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None,
-               "tail_driven_10": (sum(ce10) / len(ce10)) if ce10 else None, "tail_trunk_ratio": (sum(tr_ratio) / len(tr_ratio)) if tr_ratio else None, "tail_alpha": tail_alpha if args.tail_trunk else None, "near_share": float(near_sum.mean()) / T,
+               "tail_driven_10": (sum(ce10) / len(ce10)) if ce10 else None, "tail_trunk_ratio": (sum(tr_ratio) / len(tr_ratio)) if tr_ratio else None, "tail_alpha": tail_alpha if args.tail_trunk else None, "near_share": float(near_sum.mean()) / T, "hold_end_wall": float(hb_wall.sum()), "hold_end_box": float(hb_box.sum()),
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
@@ -2209,6 +2411,8 @@ def main(argv=None):
             row["g_mem_cos"] = float(nn.functional.cosine_similarity(gp_.mean(0), ge_.mean(0), dim=0))
         if known_on:
             row["known_share"] = kz_n / max(T, 1)
+        if roll_on:
+            row["roll_full_share"] = float(torch.cat(FULL).float().mean()) if FULL else None
         if pace_on:                                                # --pace-caps: the share of decisions under each level
             row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
         if line_on:                                                # --line-shifts: how far off its offset a level's plan ends
@@ -2249,6 +2453,8 @@ def main(argv=None):
               f"KL {row['kl']:.4f} 잘림 {row['clipfrac'] * 100:.0f} % | 속도 짐작 오차 {row['vest_mae']:.2f} m/s | 표준편차 {sum(row['std']) / len(row['std']):.3f} | "
               + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
               + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
+              + (f"새로 보여 다시 그린 plan: 벽 {row['hold_end_wall']:.0f} 상자 {row['hold_end_box']:.0f} | " if args.hold_new_block or roll_on else "")
+              + (f"통째로 새로 그린 결정 {row['roll_full_share'] * 100:.1f} % | " if roll_on and row.get("roll_full_share") is not None else "")
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
               + (f"두 plan: 0번 고름 {row['branch0_share'] * 100:.0f} %, 첫 조향 차이 {row['branch_gap']:.2f}, 고른 plan 바뀜 "
                  f"{row['branch_switch'] * 100:.1f} % (확률 큰 쪽 바뀜 {row['branch_arg_switch'] * 100:.1f} %), 큰 쪽 확률 "

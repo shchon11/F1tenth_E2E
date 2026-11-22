@@ -236,6 +236,19 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
 obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
 if getattr(actor, "pace_levels", 0):                         # (11-21) a pace policy: its state inputs exist before the first read
     obs.pace_on(actor.pace_levels, actor.pace_hold)
+# (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
+# keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or when something
+# out of view (a box: nor passed) when a part was added now blocks the committed path (`plan_rl.roll_blocked`)
+ROLL = bool(ck["args"].get("plan_roll", False))
+if ROLL:
+    from f1sim.learn.plan_rl import roll_blocked, boxes_in_view, box_along
+    from f1sim.learn.plan_policy import roll_shift
+    r_u = torch.zeros(Bl, PS.ACT_DIM, device=dev); r_p = None; r_full = torch.ones(Bl, dtype=torch.bool, device=dev)
+    r_w = torch.zeros(Bl, PS.N_STEP, 3, device=dev); r_t = torch.zeros(Bl, PS.N_STEP, dtype=torch.long, device=dev)
+    SEENB = None; SCANB = torch.zeros(11, Bl, 3, device=dev); t_dec = 0
+    sb_seen = sb_ds = sb_pos = None
+    h_mx = float(_mx) if _mx else 0.297; h_rmax = float(env.cfg.lidar.range_max)
+    print("[exam] 한 칸씩 이어 붙이는 plan (출발·접촉·안 보이던 게 길을 막을 때만 통째로 새로 그림)", flush=True)
 po = env.procedural
 if LINE3:
     # the races the reset gave boxes are exam1's (the draw takes the same random numbers whatever the bank holds); each gets bank
@@ -457,8 +470,39 @@ for kd in range(T):
         _ah = torch.remainder(_dc[:, None] - _db, _L)
         _ok = (po.p_sid[lid] >= 0) & torch.isfinite(_ah) & (_ah < CAP[1])
         _cap = torch.where(_ok.any(1), torch.full_like(_dc, CAP[0]), torch.full_like(_dc, float("inf")))
-    _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
-                            else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if ROLL:                                                    # the known boxes and the scanner now; is the committed path blocked
+        _ds, _live, _pos = box_along(env, pr.goal, lid)
+        if sb_seen is None:
+            sb_seen = torch.zeros_like(_live); sb_ds = torch.full_like(_ds, float("nan")); sb_pos = _pos.clone()
+        _moved = ((_pos - sb_pos).abs().sum(-1) > 0.05) | ~_live
+        _passed = _live & ~_moved & (sb_ds > 0.0) & (sb_ds <= 3.0) & (_ds <= 0.0) & (_ds > -3.0)
+        _view = boxes_in_view(env, lid, _pos, _live, h_mx, h_rmax)
+        sb_seen = (sb_seen & ~_moved) | _passed | _view
+        sb_ds = torch.where(_live, _ds, torch.full_like(_ds, float("nan"))); sb_pos = _pos
+        _sn = env.sim.state[lid, :3].float()
+        SCANB[t_dec % 11] = torch.stack([_sn[:, 0] + h_mx * torch.cos(_sn[:, 2]), _sn[:, 1] + h_mx * torch.sin(_sn[:, 2]), _sn[:, 2]], 1)
+        if SEENB is None:
+            SEENB = torch.zeros(11, *sb_seen.shape, dtype=torch.bool, device=dev)
+        SEENB[t_dec % 11] = sb_seen
+        _blk = torch.zeros(Bl, dtype=torch.bool, device=dev)
+        if r_p is not None and bool((~r_full).any()):
+            _ix = r_t % 11; _ar = torch.arange(Bl, device=dev)[:, None]
+            _bw, _bb = roll_blocked(env, lid, pr, r_w, SEENB[_ix, _ar] & ~_moved[:, None, :], SCANB[_ix, _ar], _view, h_mx, h_rmax)
+            _blk = (_bw | _bb) & ~r_full
+            r_full = r_full | _blk
+        R.setdefault("newp", []).append(r_full.to(torch.int8).cpu()); R.setdefault("blocked", []).append(_blk.to(torch.int8).cpu())
+    u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
+                             else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if ROLL:                                                    # the committed 0.9 s rolled on, the policy's last step appended
+        u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift(r_u, u_))
+        v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = cmd_d0
+        if r_p is not None:
+            v_s = torch.where(r_full, v_s, r_p["v"][:, PS.SUB]); d_s = torch.where(r_full, d_s, r_p["delta"][:, PS.SUB])
+        p = PS.roll(torch.tanh(u_x), v_s, d_s, lim)
+        r_t = torch.where(r_full[:, None], torch.full_like(r_t, t_dec), torch.cat([r_t[:, 1:], torch.full_like(r_t[:, :1], t_dec)], 1))
+        r_u, r_p = u_x, p
+        _xr, _yr, _pr = plan_world(p, env.sim.state[lid]); _ir = PT_IDX.to(dev)
+        r_w = torch.stack([_xr[:, _ir], _yr[:, _ir], _pr[:, _ir]], -1)
     if LINE_LEVEL != "" and getattr(obs, "pace_idx", None) is not None:   # F1SIM_EXAM_LINE_LEVEL: the level held fixed
         obs.pace_idx[:] = int(LINE_LEVEL)
     if getattr(obs, "pace_idx", None) is not None:              # (11-21) a pace policy: the level in force each decision
@@ -495,6 +539,9 @@ for kd in range(T):
         restarted |= (te | trc)[lid]
         pr.control_step((env.last_result.scan_type[lid] == HIT_CAR).any(1))
     out = pr.decision(pts, pc["price"], restarted)
+    if ROLL:                                                    # a restart or a contact: a whole new plan next
+        r_full = restarted | (out["contact"] < 0)
+        t_dec += 1
     if KNOWN:
         _tid = env.sim.tid[lid]
         _dc = pr.goal.remaining(env.sim.state[lid, :2].float(), _tid)
