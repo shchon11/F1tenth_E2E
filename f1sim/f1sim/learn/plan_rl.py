@@ -46,7 +46,8 @@ from .. import plan_steps as PS
 from .. import dynamics as dyn
 from .. import map_controller as M
 from . import state_rl as SR
-from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2, ROLL_IDX, roll_shift
+from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2, ROLL_IDX, roll_shift, \
+    roll_shift_c, commit_masks, tanh_logp_m
 from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
@@ -486,7 +487,7 @@ class Driver:
         from ..lidar import HIT_CAR
         self._hit_car = HIT_CAR
 
-    def decision(self, a: torch.Tensor, p=None, charge=None, charge_from=None):
+    def decision(self, a: torch.Tensor, p=None, charge=None, charge_from=None, charge_to=None):
         """drive one decision: `p` a plan already made (v2: from the policy's speed estimate and last command), else
         made from `a` at the car's true state (v1). `charge` (B_l,) bool: rows whose plan is new this decision -- the
         plan-hit cost is charged once, when a plan is drawn (a held plan's later decisions pay none)"""
@@ -521,6 +522,8 @@ class Driver:
             price, hit = torch.where(charge, price, torch.zeros_like(price)), hit * charge.float()
         if charge_from is not None:                            # --plan-roll: a hit in the part added now (a new plan: anywhere)
             ok_ = pc["hit"] & (pc["first"] >= charge_from)
+            if charge_to is not None:                          # --roll-grow: ... and not in the forecast after it
+                ok_ = ok_ & (pc["first"] <= charge_to)
             price, hit = torch.where(ok_, price, torch.zeros_like(price)), ok_.float()
         out = self.pr.decision(pts, price, restarted)
         out["plan_hit_price"] = out.pop("plan_hit")
@@ -743,6 +746,20 @@ def main(argv=None):
                          "(`roll_blocked`), or after a contact (the car is off the path). The plan-hit price is charged for a "
                          "hit in the part added now (a new plan: anywhere): that part is driven. Needs --plan-hit-seen, "
                          "--tail-consistency 0")
+    ap.add_argument("--roll-grow", action="store_true",
+                    help="(11-22) --plan-roll's commitment grown a step at a time: each decision keeps the committed plan's next c "
+                         "steps and draws the rest; it commits its step c+1 (scored by PPO; a whole new plan: steps 1..c+1), "
+                         "the steps after it are a forecast (its mean, taught by the tail loss as with --tail-consistency). c "
+                         "starts at --roll-grow-start (0 = every decision a whole new plan, as the policy resumed was trained) "
+                         "and grows by one when laps/min over the last 3 updates is back to --roll-grow-keep x its level before "
+                         "the last step (at least --roll-grow-dwell updates per step), up to 9 (= --plan-roll). The plan-hit "
+                         "price: a hit in the part committed now. The distance shaping stays on until c = 9 is passed, then "
+                         "fades over --roll-grow-fade updates. Why: roll29a-e (c = 9 from the start or from qual28f u100) all "
+                         "learnt to stand still. Needs --tail-consistency > 0, --plan-hit-seen")
+    ap.add_argument("--roll-grow-start", type=int, default=0)
+    ap.add_argument("--roll-grow-dwell", type=int, default=3)
+    ap.add_argument("--roll-grow-keep", type=float, default=0.95)
+    ap.add_argument("--roll-grow-fade", type=int, default=50)
     ap.add_argument("--hold-new-block", action="store_true",
                     help="(11-22, the user: the plan as the drive -- \"그냥 싹 다 이동해도 되지 않아?\", \"이 방향으로\") with --hold-p: a "
                          "held plan ends early when what is still ahead of it runs into something out of view when it was drawn "
@@ -1053,7 +1070,10 @@ def main(argv=None):
         env.opp_every = int(args.opp_every)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
-    pr.phi_end = bool(args.plan_roll)                              # --plan-roll: the shaping reads the point a decision draws
+    if args.plan_roll:                                             # the shaping reads the point a decision commits
+        pr.phi_k = PS.N_STEP - 1
+    elif args.roll_grow:
+        pr.phi_k = int(args.roll_grow_start)
     pr.plan_hit_share = float(args.plan_hit_share)
     pr.contact_scale = float(args.contact_scale)
     pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)
@@ -1280,13 +1300,40 @@ def main(argv=None):
     rl_mask = torch.zeros(PS.ACT_DIM, dtype=torch.bool, device=dev)
     rl_mask[0] = True; rl_mask[PS.N_STEP] = True                   # the first step's steering and speed
     rl_idx = torch.nonzero(rl_mask)[:, 0]
-    if args.speed_std_floor > 0:                               # the step decided: the first (--plan-roll: the last)
-        actor.log_std_floor[2 * PS.N_STEP - 1 if args.plan_roll else PS.N_STEP] = math.log(args.speed_std_floor)
-    if args.steer_std_floor > 0:
-        actor.log_std_floor[PS.N_STEP - 1 if args.plan_roll else 0] = math.log(args.steer_std_floor)
-    roll_on = bool(args.plan_roll)
-    if roll_on and (not v2 or v3 or tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen):
+    grow_on = bool(args.roll_grow)
+    grow_c = int(args.roll_grow_start) if grow_on else PS.N_STEP - 1   # the steps a rolling decision keeps of the committed plan
+
+    def set_floors(k_):                                        # the step decided: the first (--plan-roll: the last; grow: c+1)
+        actor.log_std_floor.fill_(-math.inf)
+        if args.speed_std_floor > 0:
+            actor.log_std_floor[PS.N_STEP + k_] = math.log(args.speed_std_floor)
+        if args.steer_std_floor > 0:
+            actor.log_std_floor[k_] = math.log(args.steer_std_floor)
+    set_floors(grow_c if (grow_on or args.plan_roll) else 0)
+    roll_on = bool(args.plan_roll or grow_on)
+    if args.plan_roll and grow_on:
+        raise SystemExit("--plan-roll or --roll-grow, not both")
+    if args.plan_roll and (not v2 or v3 or tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen):
         raise SystemExit("--plan-roll: --format v2, --tail-consistency 0, --plan-hit-seen, without --hold-p / --branches 2 / pace / line")
+    if grow_on and (not v2 or v3 or not tailc or args.hold_p > 0 or two or args.pace_caps or args.line_shifts or not args.plan_hit_seen
+                    or not 0 <= grow_c <= PS.N_STEP - 1):
+        raise SystemExit("--roll-grow: --format v2, --tail-consistency > 0, --plan-hit-seen, without --hold-p / --branches 2 / pace / line")
+    gm_all, gm_new = commit_masks(grow_c, dev)                    # --roll-grow: the outputs a decision commits
+    grow_hist, grow_ref, grow_done = [], None, None               # laps/min at this step / before the last step / u it passed 9
+
+    def lp_scored(u_, mean_, log_std_, full_):
+        """the log-probability PPO scores: --roll-grow the steps committed (a whole plan 1..c+1, a rolling decision c+1);
+        --plan-roll the last step (a whole plan: all); --tail-consistency the first step; else all"""
+        ls_ = log_std_.expand_as(mean_)
+        if grow_on:
+            return tanh_logp_m(u_, mean_, ls_, torch.where(full_[:, None], gm_all, gm_new))
+        if tailc:
+            return tanh_logp(u_[:, rl_idx], mean_[:, rl_idx], ls_[:, rl_idx])
+        lp_ = tanh_logp(u_, mean_, ls_)
+        if roll_on:
+            ri_ = list(ROLL_IDX)
+            lp_ = torch.where(full_, lp_, tanh_logp(u_[:, ri_], mean_[:, ri_], ls_[:, ri_]))
+        return lp_
     roll_u = torch.zeros(Bl, PS.ACT_DIM, device=dev)               # the committed plan's action (pre-tanh)
     roll_p = None                                                  # the committed plan
     roll_full = torch.ones(Bl, dtype=torch.bool, device=dev)      # rows drawing a whole new plan at this decision
@@ -1465,6 +1512,8 @@ def main(argv=None):
         if args.shaping_fade:                                       # --shaping-fade: the distance shaping's weight this update
             _f0, _f1 = (float(x_) for x_ in args.shaping_fade.split(","))
             pr.shaping_w = 1.0 - min(1.0, max(0.0, (upd - _f0) / max(1.0, _f1 - _f0)))
+        if grow_on:                                                 # --roll-grow: the shaping until c = 9 is passed, then a fade
+            pr.shaping_w = 1.0 if grow_done is None else max(0.0, 1.0 - (upd - grow_done) / max(1, args.roll_grow_fade))
         if online_on and upd > 1 + args.update_offset:
             # (11-18) the line the boxes are kept on this rollout: the bins measured often enough, older laps fading
             if dist is not None:
@@ -1583,9 +1632,10 @@ def main(argv=None):
                         SEENB = torch.zeros(11, *sb_seen.shape, dtype=torch.bool, device=dev)
                     SEENB[t_dec % 11] = sb_seen
                     if roll_p is not None and bool((~roll_full).any()):
-                        ix_ = roll_t % 11; ar_ = torch.arange(Bl, device=dev)[:, None]
-                        bw_, bb_ = roll_blocked(env, lid, pr, roll_w, SEENB[ix_, ar_] & ~_moved[:, None, :], SCANB[ix_, ar_],
-                                                sb_view, sb_mx, sb_rmax)
+                        # the committed points only (--roll-grow: the next c; the rest of the plan is a forecast)
+                        ix_ = roll_t[:, :grow_c + 1] % 11; ar_ = torch.arange(Bl, device=dev)[:, None]
+                        bw_, bb_ = roll_blocked(env, lid, pr, roll_w[:, :grow_c + 1], SEENB[ix_, ar_] & ~_moved[:, None, :],
+                                                SCANB[ix_, ar_], sb_view, sb_mx, sb_rmax)
                         bw_ &= ~roll_full; bb_ &= ~roll_full
                         roll_full = roll_full | bw_ | bb_
                         hb_wall += bw_.float(); hb_box += bb_.float()
@@ -1668,7 +1718,11 @@ def main(argv=None):
                     log_std = torch.cat([torch.where(kz, log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])[:, None],
                                          log_std[:, 1:]], 1)
                     KZ.append(kz); kz_n += float(kz.float().mean())
-                if tailc:
+                if tailc and grow_on:                              # the steps committed now drawn, the forecast its mean
+                    u = mean + log_std.exp() * eps * gm_all
+                    lp = tanh_logp_m(u, mean, log_std.expand_as(mean), torch.where(roll_full[:, None], gm_all, gm_new))
+                    FULL.append(roll_full.clone())
+                elif tailc:
                     u = mean + log_std.exp() * eps * rl_mask                         # the tail: its mean, no noise
                     lp = tanh_logp(u[:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
                 else:
@@ -1678,6 +1732,7 @@ def main(argv=None):
                         ri_ = list(ROLL_IDX)
                         lp = torch.where(roll_full, lp, tanh_logp(u[:, ri_], mean[:, ri_], log_std.expand_as(mean)[:, ri_]))
                         FULL.append(roll_full.clone())
+                u_keep = u                                         # the action kept for the update (--roll-grow: as driven)
                 if two:
                     lp = lp + pb[ar_l, br].log()
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
@@ -1702,18 +1757,23 @@ def main(argv=None):
                                 torch.stack([obs.cmd_d, obs.cmd_v], 1), lim, act3, turn3)
                     vest_err.append((v_hat - v_true).abs())
                 elif v2 and roll_on:
-                    # the committed 0.9 s rolled on from its own state after its first step, the new last 0.1 s appended
-                    # (a new plan: from the speed estimate and the last command)
-                    u_x = u if roll_p is None else torch.where(roll_full[:, None], u, roll_shift(roll_u, u))
+                    # the committed 0.9 s (--roll-grow: its next c steps) rolled on from its own state after its first step,
+                    # the policy's steps after them appended (a new plan: from the speed estimate and the last command)
+                    u_x = u if roll_p is None else torch.where(roll_full[:, None], u, roll_shift_c(roll_u, u, grow_c))
                     v_s = v_hat.clamp(-PS.V_REV, PS.V_FWD); d_s = obs.cmd_d
                     if roll_p is not None:
                         v_s = torch.where(roll_full, v_s, roll_p["v"][:, PS.SUB]); d_s = torch.where(roll_full, d_s, roll_p["delta"][:, PS.SUB])
                     p = PS.roll(torch.tanh(u_x), v_s, d_s, lim)
+                    # the plan-hit price: a hit in the part committed now (step c+1; a new plan: steps 1..c+1)
                     roll_cf = torch.where(roll_full, torch.zeros_like(roll_t[:, 0]),
-                                          torch.full_like(roll_t[:, 0], (PS.N_STEP - 1) * PS.SUB + 1))
+                                          torch.full_like(roll_t[:, 0], grow_c * PS.SUB + 1))
+                    roll_ct = torch.full_like(roll_t[:, 0], (grow_c + 1) * PS.SUB)
                     roll_t = torch.where(roll_full[:, None], torch.full_like(roll_t, t_dec),
-                                         torch.cat([roll_t[:, 1:], torch.full_like(roll_t[:, :1], t_dec)], 1))
+                                         torch.cat([roll_t[:, 1:grow_c + 1], torch.full_like(roll_t[:, grow_c:], t_dec)], 1))
                     roll_u, roll_p = u_x, p
+                    if grow_on:                                    # the tail loss rolls the plan from where this one starts
+                        u_keep = u_x
+                        V0.append(v_s.clone()); D0.append(d_s.clone()); ST0.append(env.sim.state[lid].clone())
                     _xr, _yr, _pr = plan_world(p, env.sim.state[lid]); _ir = PT_IDX.to(dev)
                     roll_w = torch.stack([_xr[:, _ir], _yr[:, _ir], _pr[:, _ir]], -1)
                     vest_err.append((v_hat - v_true).abs())
@@ -1749,7 +1809,7 @@ def main(argv=None):
                 if levels is not None:
                     hard0 = env.sim.contact_counts[lid, 3:6].clone()
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
-                                                     charge_from=roll_cf if roll_on else None)
+                                                     charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None)
                 if roll_on:
                     # a whole plan next when the car is not where the plan put it: driven exactly, only something that stopped
                     # or pushed it does that (a wall it is held against, a box) -- 1 cm is far above the rounding; a restart too.
@@ -1757,6 +1817,8 @@ def main(argv=None):
                     # plan's own 9.4 m/s through the wall)
                     off_ = (env.sim.state[lid, :2].float() - roll_w[:, 0, :2]).norm(dim=-1) > 0.01
                     roll_full = out["restarted"] | off_ | (out["contact"] < 0)
+                    if grow_c == 0:                                # nothing kept: every decision a whole new plan
+                        roll_full = torch.ones_like(roll_full)
                     t_dec += 1
                 for tp_ in taps:
                     _ii, _q = PT_IDX.to(dev), tp_.row
@@ -1889,7 +1951,7 @@ def main(argv=None):
                     n_restarted += restarter.step()
                 if hold:
                     hold_left = torch.where(out["restarted"], torch.zeros_like(hold_left), hold_left)
-            S.append(s); X.append(sc); PV.append(pv_); U.append(u); LP.append(lp); V.append(v); VT.append(v_true)
+            S.append(s); X.append(sc); PV.append(pv_); U.append(u_keep); LP.append(lp); V.append(v); VT.append(v_true)
             FM.append(newp.float())
             R.append(out["reward"]); D.append(out["restarted"].float())
             for k in ("lap", "shaping", "contact"):
@@ -2085,8 +2147,9 @@ def main(argv=None):
             gsum_, gs2_, nb_, bs_ = None, 0.0, 0, 0.0
             for sel in batches():
                 mean, log_std, _, mb, _ = actor_on(sel) if v2 else (*actor(bX[sel], bS[sel]), None, sel, None)
-                ii_ = rl_idx if tailc else torch.arange(PS.ACT_DIM, device=dev)
-                lp_ = tanh_logp(bU[mb][:, ii_], mean[:, ii_], log_std[:, ii_])
+                # (11-22) what PPO scores -- under --plan-roll it read all 20 outputs, 18 of them without effect on a rolling
+                # decision: the noise scale of roll29c-e was too high and the auto batch grew on it
+                lp_ = lp_scored(bU[mb], mean, log_std, bFULL[mb] if roll_on else None)
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0); a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
                 a_ = (a_ - mu_) / (((a_ - mu_).pow(2) * m_).sum() / n_).sqrt().add(1e-8)
                 g_ = torch.autograd.grad(-(lp_ * a_ * m_).sum() / n_, pr_, allow_unused=True)
@@ -2142,13 +2205,7 @@ def main(argv=None):
                 if known_on:                                       # the rows drawn in the known zone: scored as they were drawn
                     log_std = torch.cat([torch.where(bKZ[mb], log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])[:, None],
                                          log_std[:, 1:]], 1)      # (not in place: autograd needs the column it read)
-                if tailc:
-                    lp = tanh_logp(bU[mb][:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
-                else:
-                    lp = tanh_logp(bU[mb], mean, log_std)
-                    if roll_on:
-                        ri_ = list(ROLL_IDX)
-                        lp = torch.where(bFULL[mb], lp, tanh_logp(bU[mb][:, ri_], mean[:, ri_], log_std[:, ri_]))
+                lp = lp_scored(bU[mb], mean, log_std, bFULL[mb] if roll_on else None)
                 if two:
                     lp = lp + branch_p(aux_box["logits"])[torch.arange(mb.numel(), device=dev), bBR[mb]].log()
                 if pace_on:
@@ -2205,7 +2262,7 @@ def main(argv=None):
                                else f_heads[ok_].detach())     # same values; only tail_alpha of the gradient reaches the trunk
                         tail_mean = (actor.all_heads(fh_)[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
                                      if two else actor.pi(fh_))      # the plan that was driven
-                        a_c = torch.where(rl_mask[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
+                        a_c = torch.where((gm_all if grow_on else rl_mask)[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
                         pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim, bCAP[mb_c] if pace_on else None)
                         xw_c, yw_c, _ = plan_world(pc_, bST0[mb_c])
                         ii_ = PT_IDX.to(dev)
@@ -2449,6 +2506,8 @@ def main(argv=None):
             n_end, n_hit = levels.ended - lv0[2], levels.ended_hit - lv0[3]
             row.update(replay_share=n_rep / max(1, n_new + n_rep), replay_ended=n_end, replay_ended_scored=n_hit,
                        replay_buffer=levels.stats()["buffer_mean"], replay_score=levels.stats()["score_mean"])
+        if grow_on:
+            row["roll_c"] = grow_c
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % " + (f"(서 있는 벌점 {row['stall_s_per_min']:.1f} s/분) " if args.stall_s > 0 else "")
@@ -2500,8 +2559,41 @@ def main(argv=None):
             print("[판 구성] " + " | ".join(_txt), flush=True)
         if (upd % args.save_every == 0 or upd == args.updates) and args.dist_rank == 0:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
-                        "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
+                        "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps",
+                        **({"roll_c": grow_c} if grow_on else {})},
                        os.path.join(run, f"plan_u{upd}.pt"))
+        if grow_on:
+            # (11-22) --roll-grow: one more step committed once laps/min (the last 3 updates) is back to keep x its level before
+            # the last step; rank 0 decides for both
+            grow_hist.append(float(row["laps_per_min"]))
+            adv_, fin_ = 0, 0
+            if args.dist_rank == 0 and len(grow_hist) >= max(3, args.roll_grow_dwell):
+                now_ = sum(grow_hist[-3:]) / 3.0
+                if grow_ref is None or now_ >= args.roll_grow_keep * grow_ref:
+                    if grow_c < PS.N_STEP - 1:
+                        adv_ = 1
+                    elif grow_done is None:
+                        fin_ = 1
+            if dist is not None:
+                t_ = torch.tensor([adv_, fin_], dtype=torch.float64, device=dev)
+                dist.broadcast(t_, 0)
+                adv_, fin_ = int(t_[0]), int(t_[1])
+            if adv_:
+                if len(grow_hist) >= 3:
+                    grow_ref = sum(grow_hist[-3:]) / 3.0
+                with torch.no_grad():                               # the step decided now starts with the last one's noise
+                    actor.log_std[grow_c + 1] = actor.log_std[grow_c]
+                    actor.log_std[PS.N_STEP + grow_c + 1] = actor.log_std[PS.N_STEP + grow_c]
+                grow_c += 1
+                gm_all, gm_new = commit_masks(grow_c, dev)
+                set_floors(grow_c)
+                pr.phi_k = grow_c
+                grow_hist = []
+                print(f"[확정 길이] {grow_c * PS.DT:.1f} s로 늘림 (u{upd}, 바퀴 {grow_ref:.2f}/분 기준)" if grow_ref is not None else
+                      f"[확정 길이] {grow_c * PS.DT:.1f} s로 늘림 (u{upd})", flush=True)
+            if fin_:
+                grow_done = upd
+                print(f"[확정 길이] 0.9 s에서 회복 (u{upd}): 전진 보상을 {args.roll_grow_fade} update에 걸쳐 끔", flush=True)
         if drv.opp is not None and upd >= max(args.self_opp_from, 1) and (upd - args.self_opp_from) % args.self_opp_every == 0:
             drv.opp.add(actor, upd)
 

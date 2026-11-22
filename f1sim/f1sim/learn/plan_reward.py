@@ -201,10 +201,11 @@ class PlanReward:
         #: (the user: "왜 그따구로 설계한거지? 랩타임 보상으로 갈아끼우기로 하지않았나" -- the shaping fixed the line on the shortest
         #: path while the car was slow, and PPO never left it)
         self.shaping_w = 1.0
-        # (11-22) --plan-roll: Phi at the plan's last point, the one a rolling decision draws -- over the mean of ten, nine of
-        # them committed earlier, a decision moved Phi by a tenth of its own point's progress (gradient noise scale 38-45k vs
-        # 3-8k for re-drawn plans; roll29c's speed output stayed at its start, 94 % of cars standing). Still exact shaping
-        self.phi_end = False
+        # (11-22) the plan point Phi reads (None = the mean of the ten): --plan-roll the last, the one a rolling decision draws;
+        # --roll-grow the step a decision commits. Over the mean, nine of them committed earlier, a rolling decision moved Phi
+        # by a tenth of its own point's progress. (That was not why roll29c stood still: roll29d with the last point did too,
+        # gradient noise scale 52-69k against 38-49k.) Still exact shaping
+        self.phi_k = None
         # (11-13) the stall price of 11-06 ("--stall-mode progress"): each second the car's progress over the last
         # `stall_window_s` falls short of `stall_vmin` [m/s] costs `stall_s` seconds x the shortfall's share; 0 = off.
         # Progress = the drop of the walls-only distance left, so standing, rocking and going the wrong way all pay, and a
@@ -230,8 +231,8 @@ class PlanReward:
         for k in range(d.shape[1]):
             cur = torch.where(torch.isfinite(d[:, k]), d[:, k], prev)
             cols.append(cur); prev = cur
-        if self.phi_end:                                       # --plan-roll: the point the decision draws
-            return -cols[-1] / L
+        if self.phi_k is not None:                             # --plan-roll / --roll-grow: the point the decision commits
+            return -cols[self.phi_k] / L
         return -torch.stack(cols, 1).mean(1) / L
 
     def begin(self, rows: torch.Tensor) -> None:

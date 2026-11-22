@@ -194,6 +194,31 @@ def roll_shift(u_prev: torch.Tensor, u_new: torch.Tensor) -> torch.Tensor:
     N = PS.N_STEP
     return torch.cat([u_prev[:, 1:N], u_new[:, N - 1:N], u_prev[:, N + 1:], u_new[:, 2 * N - 1:]], 1)
 
+
+# (11-22, plan_rl --roll-grow) the committed part grown a step at a time: roll29a-e learnt to stand still (a decision moved
+# the car 0.9 s later; resumed from a driving policy it drove 10 m and stopped in every exam session), so the commitment
+# starts at 0 steps (every decision a whole new plan, the policy it resumes) and grows to 9 (the rolling plan above)
+def roll_shift_c(u_prev: torch.Tensor, u_new: torch.Tensor, c: int) -> torch.Tensor:
+    """the committed plan's next `c` steps kept (its steps 2..c+1), `u_new`'s steps c+1..10 after them (pre-tanh): c = 9 is
+    `roll_shift`, c = 0 `u_new`"""
+    N = PS.N_STEP
+    return torch.cat([u_prev[:, 1:1 + c], u_new[:, c:N], u_prev[:, N + 1:N + 1 + c], u_new[:, N + c:]], 1)
+
+
+def commit_masks(c: int, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """--roll-grow with `c` steps carried over: the outputs a whole new plan commits (steps 1..c+1, turn and speed) and the
+    ones a rolling decision commits (step c+1); the steps after them are a forecast, drawn again next decision"""
+    N = PS.N_STEP
+    m_all = torch.zeros(PS.ACT_DIM, dtype=torch.bool, device=device); m_all[:c + 1] = True; m_all[N:N + c + 1] = True
+    m_new = torch.zeros(PS.ACT_DIM, dtype=torch.bool, device=device); m_new[c] = True; m_new[N + c] = True
+    return m_all, m_new
+
+
+def tanh_logp_m(u: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """`tanh_logp` over the outputs in the mask `m` ((B, ACT_DIM) or (ACT_DIM,)) only"""
+    lp = torch.distributions.Normal(mean, log_std.exp()).log_prob(u)
+    return ((lp - 2.0 * (math.log(2.0) - u - nn.functional.softplus(-2.0 * u))) * m).sum(-1)
+
 def _priv_drop() -> list:
     """the centerline columns of `GymEnv.privileged_v2` (the columns after its keys -- props -- are kept)"""
     from ..gym_env import PRIV_V2_KEYS
@@ -263,7 +288,10 @@ class PlanRunner:
         # (11-22) a rolling-plan checkpoint (plan_rl --plan-roll) is driven the way it was trained: each decision the committed
         # plan keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or
         # when something out of view when its part was added now blocks the committed path (`plan_rl.roll_blocked`)
-        self.roll = bool(self.v2 and not self.v3 and (ck.get("args") or {}).get("plan_roll", False))
+        _ca = ck.get("args") or {}
+        self.roll = bool(self.v2 and not self.v3 and (_ca.get("plan_roll", False) or _ca.get("roll_grow", False)))
+        # --roll-grow: the steps kept when this checkpoint was saved (--plan-roll: 9)
+        self.r_c = int(ck.get("roll_c", PS.N_STEP - 1)) if _ca.get("roll_grow", False) else PS.N_STEP - 1
         if self.roll:
             from .plan_reward import PlanReward
             self.r_pr = PlanReward(env, float((ck.get("args") or {}).get("gamma", 0.995)), device)
@@ -347,8 +375,9 @@ class PlanRunner:
         self.r_seenb[k, ar] = torch.where(d2, self.r_seen, self.r_seenb[k, ar])
         chk = due & ~self.r_full
         if self.r_p is not None and bool(chk.any()):
-            ix = self.r_t % 11
-            bw, bb = roll_blocked(env, lid, self.r_pr, self.r_w, self.r_seenb[ix, ar[:, None]] & ~moved[:, None, :],
+            K = self.r_c + 1                                      # the committed points only
+            ix = self.r_t[:, :K] % 11
+            bw, bb = roll_blocked(env, lid, self.r_pr, self.r_w[:, :K], self.r_seenb[ix, ar[:, None]] & ~moved[:, None, :],
                                   self.r_scanb[ix, ar[:, None]], view, self.r_mx, self.r_rmax)
             self.r_full |= chk & (bw | bb)
 
@@ -356,13 +385,14 @@ class PlanRunner:
         """--plan-roll, deciding rows: the committed 0.9 s rolled on from its own state, the policy's last step appended (a
         whole new plan: from the speed estimate and the last command)"""
         env, lid = self.env, self.lid
-        u_x = u if self.r_p is None else torch.where(self.r_full[:, None], u, roll_shift(self.r_u, u))
+        u_x = u if self.r_p is None else torch.where(self.r_full[:, None], u, roll_shift_c(self.r_u, u, self.r_c))
         v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = self.obs.cmd_d
         if self.r_p is not None:
             v_s = torch.where(self.r_full, v_s, self.r_p["v"][:, PS.SUB]); d_s = torch.where(self.r_full, d_s, self.r_p["delta"][:, PS.SUB])
         p = PS.roll(torch.tanh(u_x), v_s, d_s, self.lim)
         t_now = self.r_dec[:, None]
-        t_new = torch.where(self.r_full[:, None], t_now.expand_as(self.r_t), torch.cat([self.r_t[:, 1:], t_now], 1))
+        t_new = torch.where(self.r_full[:, None], t_now.expand_as(self.r_t),
+                            torch.cat([self.r_t[:, 1:self.r_c + 1], t_now.expand(-1, PS.N_STEP - self.r_c)], 1))
         d2 = due[:, None]
         self.r_t = torch.where(d2, t_new, self.r_t)
         self.r_u = torch.where(d2, u_x, self.r_u)
@@ -371,7 +401,7 @@ class PlanRunner:
                                                     else p[k_]) for k_ in p}
         xr, yr, pr_ = plan_world(p, env.sim.state[lid]); ir = PT_IDX.to(self.device)
         self.r_w = torch.where(d2[..., None], torch.stack([xr[:, ir], yr[:, ir], pr_[:, ir]], -1), self.r_w)
-        self.r_full = self.r_full & ~due
+        self.r_full = self.r_full & ~due if self.r_c > 0 else torch.ones_like(self.r_full)   # 0 kept: always a whole plan
         self.r_dec = self.r_dec + due.long()
         return p
 

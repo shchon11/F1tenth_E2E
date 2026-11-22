@@ -239,10 +239,13 @@ if getattr(actor, "pace_levels", 0):                         # (11-21) a pace po
 # (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
 # keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or when something
 # out of view (a box: nor passed) when a part was added now blocks the committed path (`plan_rl.roll_blocked`)
-ROLL = bool(ck["args"].get("plan_roll", False)) or os.environ.get("F1SIM_EXAM_ROLL") == "1"   # =1: any v2 checkpoint, rolled
+ROLL = (bool(ck["args"].get("plan_roll", False)) or bool(ck["args"].get("roll_grow", False))
+        or os.environ.get("F1SIM_EXAM_ROLL") == "1")   # =1: any v2 checkpoint, rolled
+# (11-22) --roll-grow: the steps a rolling decision kept when this checkpoint was saved (--plan-roll: 9)
+ROLL_C = int(ck.get("roll_c", PS.N_STEP - 1)) if ck["args"].get("roll_grow", False) else PS.N_STEP - 1
 if ROLL:
     from f1sim.learn.plan_rl import roll_blocked, boxes_in_view, box_along
-    from f1sim.learn.plan_policy import roll_shift
+    from f1sim.learn.plan_policy import roll_shift_c
     r_u = torch.zeros(Bl, PS.ACT_DIM, device=dev); r_p = None; r_full = torch.ones(Bl, dtype=torch.bool, device=dev)
     r_w = torch.zeros(Bl, PS.N_STEP, 3, device=dev); r_t = torch.zeros(Bl, PS.N_STEP, dtype=torch.long, device=dev)
     SEENB = None; SCANB = torch.zeros(11, Bl, 3, device=dev); t_dec = 0
@@ -486,20 +489,22 @@ for kd in range(T):
         SEENB[t_dec % 11] = sb_seen
         _blk = torch.zeros(Bl, dtype=torch.bool, device=dev)
         if r_p is not None and bool((~r_full).any()):
-            _ix = r_t % 11; _ar = torch.arange(Bl, device=dev)[:, None]
-            _bw, _bb = roll_blocked(env, lid, pr, r_w, SEENB[_ix, _ar] & ~_moved[:, None, :], SCANB[_ix, _ar], _view, h_mx, h_rmax)
+            _ix = r_t[:, :ROLL_C + 1] % 11; _ar = torch.arange(Bl, device=dev)[:, None]     # the committed points only
+            _bw, _bb = roll_blocked(env, lid, pr, r_w[:, :ROLL_C + 1], SEENB[_ix, _ar] & ~_moved[:, None, :], SCANB[_ix, _ar],
+                                    _view, h_mx, h_rmax)
             _blk = (_bw | _bb) & ~r_full
             r_full = r_full | _blk
         R.setdefault("newp", []).append(r_full.to(torch.int8).cpu()); R.setdefault("blocked", []).append(_blk.to(torch.int8).cpu())
     u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                              else plan_v2(actor, obs, lim, sample=SAMPLE))
     if ROLL:                                                    # the committed 0.9 s rolled on, the policy's last step appended
-        u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift(r_u, u_))
+        u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift_c(r_u, u_, ROLL_C))
         v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = cmd_d0
         if r_p is not None:
             v_s = torch.where(r_full, v_s, r_p["v"][:, PS.SUB]); d_s = torch.where(r_full, d_s, r_p["delta"][:, PS.SUB])
         p = PS.roll(torch.tanh(u_x), v_s, d_s, lim)
-        r_t = torch.where(r_full[:, None], torch.full_like(r_t, t_dec), torch.cat([r_t[:, 1:], torch.full_like(r_t[:, :1], t_dec)], 1))
+        r_t = torch.where(r_full[:, None], torch.full_like(r_t, t_dec),
+                          torch.cat([r_t[:, 1:ROLL_C + 1], torch.full_like(r_t[:, ROLL_C:], t_dec)], 1))
         r_u, r_p = u_x, p
         if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) what a rolling policy appends: the plan's speeds
             R.setdefault("plv", []).append(p["pv"].float().cpu()); R.setdefault("ulast", []).append(u_[:, [PS.N_STEP - 1, 2 * PS.N_STEP - 1]].float().cpu())
@@ -522,6 +527,12 @@ for kd in range(T):
         R["br"].append(br.to(torch.int8).cpu()); R["logit"].append(actor.logits_out.float().cpu())
         R["pl_other"].append(torch.stack([xo[:, ii], yo[:, ii]], -1).cpu())
     pc = pr.plan_cost(x, y, psi, p["v"])
+    if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) where the plan driven first meets a wall / anything
+        c_, s_ = torch.cos(psi)[..., None], torch.sin(psi)[..., None]; P_ = pr.corners
+        pw_ = torch.stack([x[..., None] + P_[:, 0] * c_ - P_[:, 1] * s_, y[..., None] + P_[:, 0] * s_ + P_[:, 1] * c_], -1)
+        wh_ = (env.sim.track.sample_edt(pw_, env.sim.tid[lid][:, None, None].expand(pw_.shape[:-1])) <= 0.0).any(-1); wh_[:, 0] = False
+        R.setdefault("pwall", []).append(torch.where(wh_.any(1), wh_.float().argmax(1), torch.full_like(wh_[:, 0], -1, dtype=torch.long)).to(torch.int16).cpu())
+        R.setdefault("pany", []).append(torch.where(pc["hit"], pc["first"], torch.full_like(pc["first"], -1)).to(torch.int16).cpu())
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
     if mode == "map":
         k_, v_ = plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
@@ -543,6 +554,8 @@ for kd in range(T):
     out = pr.decision(pts, pc["price"], restarted)
     if ROLL:                                                    # off the plan (held / pushed), a restart or a contact: a whole plan
         r_full = restarted | ((env.sim.state[lid, :2].float() - r_w[:, 0, :2]).norm(dim=-1) > 0.01) | (out["contact"] < 0)
+        if ROLL_C == 0:                                         # --roll-grow at 0 kept: every decision a whole new plan
+            r_full = torch.ones_like(r_full)
         t_dec += 1
     if KNOWN:
         _tid = env.sim.tid[lid]
