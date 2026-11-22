@@ -497,6 +497,8 @@ for kd in range(T):
         R.setdefault("newp", []).append(r_full.to(torch.int8).cpu()); R.setdefault("blocked", []).append(_blk.to(torch.int8).cpu())
     u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                              else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) every output the policy gave (pre-tanh), driven or not
+        R.setdefault("uall", []).append(u_.float().cpu())
     if ROLL:                                                    # the committed 0.9 s rolled on, the policy's last step appended
         u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift_c(r_u, u_, ROLL_C))
         v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = cmd_d0

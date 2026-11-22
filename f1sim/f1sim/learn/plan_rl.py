@@ -756,7 +756,9 @@ def main(argv=None):
                          "price: a hit in the part committed now. The distance shaping stays on until c = 9 is passed, then "
                          "fades over --roll-grow-fade updates. Why: roll29a-e (c = 9 from the start or from qual28f u100) all "
                          "learnt to stand still. Needs --tail-consistency > 0, --plan-hit-seen")
-    ap.add_argument("--roll-grow-start", type=int, default=0)
+    ap.add_argument("--roll-grow-start", type=int, default=0,
+                    help="the steps kept at the start: 0 from a policy trained without --roll-grow (the step committed at each "
+                         "growth starts as a copy of the last one's output row); a --roll-grow checkpoint's own roll_c to resume it")
     ap.add_argument("--roll-grow-dwell", type=int, default=3)
     ap.add_argument("--roll-grow-keep", type=float, default=0.95)
     ap.add_argument("--roll-grow-fade", type=int, default=50)
@@ -2581,9 +2583,17 @@ def main(argv=None):
             if adv_:
                 if len(grow_hist) >= 3:
                     grow_ref = sum(grow_hist[-3:]) / 3.0
-                with torch.no_grad():                               # the step decided now starts with the last one's noise
-                    actor.log_std[grow_c + 1] = actor.log_std[grow_c]
-                    actor.log_std[PS.N_STEP + grow_c + 1] = actor.log_std[PS.N_STEP + grow_c]
+                # the step committed now starts as the last one -- its output row and its noise (and their Adam moments): the
+                # forecast row is not the action the policy takes then (qual28f u100: its 2nd-step turn is 0.18 (median) off
+                # the turn it gives 0.1 s later, two decisions' turns 0.11 apart; committing 0.1 s as forecast made 322 wall
+                # contacts in 64 cars x 30 s against 3, the copied row 3)
+                with torch.no_grad():
+                    for a_, b_ in ((grow_c, grow_c + 1), (PS.N_STEP + grow_c, PS.N_STEP + grow_c + 1)):
+                        for p_ in (actor.pi.weight, actor.pi.bias, actor.log_std):
+                            p_[b_] = p_[a_]
+                            for k_, m_ in opt.state.get(p_, {}).items():
+                                if torch.is_tensor(m_) and m_.dim() and m_.shape[0] == p_.shape[0]:
+                                    m_[b_] = m_[a_]
                 grow_c += 1
                 gm_all, gm_new = commit_masks(grow_c, dev)
                 set_floors(grow_c)
