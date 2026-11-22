@@ -1053,6 +1053,7 @@ def main(argv=None):
         env.opp_every = int(args.opp_every)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
+    pr.phi_end = bool(args.plan_roll)                              # --plan-roll: the shaping reads the point a decision draws
     pr.plan_hit_share = float(args.plan_hit_share)
     pr.contact_scale = float(args.contact_scale)
     pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)

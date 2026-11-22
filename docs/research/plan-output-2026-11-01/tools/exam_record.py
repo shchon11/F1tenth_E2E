@@ -501,6 +501,8 @@ for kd in range(T):
         p = PS.roll(torch.tanh(u_x), v_s, d_s, lim)
         r_t = torch.where(r_full[:, None], torch.full_like(r_t, t_dec), torch.cat([r_t[:, 1:], torch.full_like(r_t[:, :1], t_dec)], 1))
         r_u, r_p = u_x, p
+        if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) what a rolling policy appends: the plan's speeds
+            R.setdefault("plv", []).append(p["pv"].float().cpu()); R.setdefault("ulast", []).append(u_[:, [PS.N_STEP - 1, 2 * PS.N_STEP - 1]].float().cpu())
         _xr, _yr, _pr = plan_world(p, env.sim.state[lid]); _ir = PT_IDX.to(dev)
         r_w = torch.stack([_xr[:, _ir], _yr[:, _ir], _pr[:, _ir]], -1)
     if LINE_LEVEL != "" and getattr(obs, "pace_idx", None) is not None:   # F1SIM_EXAM_LINE_LEVEL: the level held fixed
