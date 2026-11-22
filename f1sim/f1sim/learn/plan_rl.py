@@ -1950,7 +1950,10 @@ def main(argv=None):
                                           torch.zeros_like(lp))
                 if line_on:
                     # --line-follow: a level's plan ends its offset across the level-0 plan's heading at the 1 s end
-                    nz_ = bPI[mb] != 0
+                    # the level the plan was drawn under is the one in the state it read: a level picked at a decision enters
+                    # the state at the next one (its logits come from this decision's features), so bPI there is one ahead
+                    lv_ = bS[mb][:, -(actor.pace_levels + 1):-1].argmax(1)
+                    nz_ = lv_ != 0
                     if bool(nz_.any()):
                         m0_ = actor.pi(aux_box["fc0"][nz_]).detach()
                         pz_ = PS.roll(torch.tanh(mean[nz_]), bV0[mb][nz_], bD0[mb][nz_], lim)
@@ -1960,7 +1963,7 @@ def main(argv=None):
                                + (pz_["y"][:, -1] - p0_["y"][:, -1]) * torch.cos(ps0_))
                         # a car that barely moves cannot end 0.6 m aside: the offset in full from 2 m of path in the second
                         L1_ = torch.hypot(p0_["x"][:, 1:] - p0_["x"][:, :-1], p0_["y"][:, 1:] - p0_["y"][:, :-1]).sum(1)
-                        tg_ = actor.line_dy[bPI[mb][nz_]] * (L1_ / 2.0).clamp(max=1.0)
+                        tg_ = actor.line_dy[lv_[nz_]] * (L1_ / 2.0).clamp(max=1.0)
                         lf_ = nn.functional.smooth_l1_loss(dl_, tg_, beta=0.1)
                         loss_line = args.line_follow * lf_
                         with torch.no_grad():

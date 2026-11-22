@@ -87,6 +87,9 @@ CAP = [float(x) for x in os.environ.get("F1SIM_EXAM_CAP", "").split(",") if x.st
 # scan); the walls, the contacts and the boxes themselves are untouched. Measures whether the avoid-when-visible skill, fed
 # what a memory knows, takes a different line before the box shows. Passing = the car's distance to go crosses the box's
 VIRT = os.environ.get("F1SIM_EXAM_VIRTUAL_BOXES", "")
+# (11-22, plan_rl --line-shifts) "K": a line-level policy drives level K the whole session (0 = its own line) -- run once with
+# 0 and once with K on the same sessions; how far apart the two driven lines are is how much a picked level moves the car
+LINE_LEVEL = os.environ.get("F1SIM_EXAM_LINE_LEVEL", "")
 # (11-21, measurement for "미리 라인 다르게": does trying a different line before a KNOWN box avoid it at speed?) "RHO,STD,D0,D1"
 # with SAMPLE: only while a box the car has passed once this session lies D0..D1 m ahead along the track, the first step's
 # turn gets noise held as AR(1) (RHO) at least STD wide; everywhere else, and the speed always, the policy's mean
@@ -456,6 +459,8 @@ for kd in range(T):
         _cap = torch.where(_ok.any(1), torch.full_like(_dc, CAP[0]), torch.full_like(_dc, float("inf")))
     _, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                             else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if LINE_LEVEL != "" and getattr(obs, "pace_idx", None) is not None:   # F1SIM_EXAM_LINE_LEVEL: the level held fixed
+        obs.pace_idx[:] = int(LINE_LEVEL)
     if getattr(obs, "pace_idx", None) is not None:              # (11-21) a pace policy: the level in force each decision
         R.setdefault("pace", []).append(obs.pace_idx.to(torch.int8).cpu())
     if FREEZE and h_prev is not None:
