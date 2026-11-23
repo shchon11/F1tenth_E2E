@@ -530,6 +530,11 @@ class ProceduralObstacles:
         #: first (`b_online`, set by `set_driven_line`), the layout and its count drawn as always. qual26e u100's exam: all 23
         #: hard box hits were boxes within 0.40 m of the line the policy drives on an empty track, 0 of 857 passes beyond it
         self.online_p = 0.0
+        #: (11-23, the user: "박는 장면을 흔하게" -> "ㅇㅋㅇㅋ") `late_m` [m]: among the pieces on the policy's own line, those it can see
+        #: for less than this along its own line before reaching them (behind a corner: a tall wall cuts the sight line) are kept
+        #: first of all in the `online_p` draws (`b_late`, set with the line). 0 = off
+        self.late_m = 0.0
+        self.b_late = None
         #: (11-21, plan_rl --session-groups) (B,) per row: -1 = `fraction` decides as before, 0 = never props, 1 = always
         self.force_use = None
         self.b_online = None
@@ -604,10 +609,46 @@ class ProceduralObstacles:
             d = torch.cdist(xy, pts).amin(1)
             out[ti] = (d <= near).reshape(K, C) & (self.b_sid[ti] >= 0)
         self.b_online = out
+        if self.late_m > 0:
+            self.b_late = self._late_pieces(line, ok, out, bin_m)
         if self.line3:
             self._line3_tables(line, ok, near, bin_m)
         real = self.b_sid >= 0
         return float(out.sum()) / max(1, int(real.sum()))
+
+    def _late_pieces(self, line: torch.Tensor, ok: torch.Tensor, on: torch.Tensor, bin_m: float,
+                     back_m: float = 10.0, n_samp: int = 64) -> torch.Tensor:
+        """(T, K, C) bool: the pieces on the line (`on`) that the car driving that line sees for less than `late_m` [m] of its line
+        before it reaches them. Sight = the straight segment from a line point to the piece's nearest line point clear of every
+        wall cell, duct hoses included (the exam's 'seen' test, exam_boxes.py, and the plan cost's `boxes_in_view`), within the
+        scanner's 10 m, counted back from the piece until the first blocked point."""
+        T, K, C = self.b_sid.shape
+        late = torch.zeros(T, K, C, dtype=torch.bool, device=self.device)
+        nb = max(1, int(round(back_m / bin_m)))
+        f = np.linspace(0.0, 1.0, n_samp)[None, None, :, None]
+        for ti, track in enumerate(self.tr.tracks):
+            edt = getattr(track, "edt", None)
+            m = ok[ti].cpu().numpy()
+            if edt is None or m.sum() < 8:
+                continue
+            P = line[ti].cpu().numpy().astype(float)
+            n = P.shape[0]
+            j = np.arange(n)
+            src = P[(j[:, None] - np.arange(1, nb + 1)[None, :]) % n]                     # (n, nb, 2) points behind
+            seg = src[:, :, None, :] * (1.0 - f) + P[:, None, None, :] * f              # (n, nb, S, 2)
+            o = np.asarray(track.origin, float); r = float(track.resolution)
+            ii = np.clip(((seg[..., 1] - o[1]) / r).astype(int), 0, edt.shape[0] - 1)
+            jj = np.clip(((seg[..., 0] - o[0]) / r).astype(int), 0, edt.shape[1] - 1)
+            clear = (edt[ii, jj] > 0.0).all(-1)                                          # (n, nb)
+            clear &= m[(j[:, None] - np.arange(1, nb + 1)[None, :]) % n]                # only measured line points
+            first_block = np.where(clear.all(1), nb, np.argmin(clear, 1))               # contiguous clear count
+            sight = first_block * bin_m                                                  # [m] along the line
+            pts = line[ti].float().to(self.device)
+            xy = self.b_pose[ti, :, :, :2].reshape(-1, 2)
+            near_j = torch.cdist(xy, pts).argmin(1)
+            short = torch.as_tensor(sight < self.late_m, device=self.device) & torch.as_tensor(m, device=self.device)
+            late[ti] = short[near_j].reshape(K, C) & on[ti]
+        return late
 
     def _line3_tables(self, line: torch.Tensor, ok: torch.Tensor, near: float, bin_m: float, M: int = 64) -> None:
         """`line3`'s candidates: for each track and 0.5 m stretch of its measured line, up to M bank pieces (a random subset when
@@ -705,6 +746,8 @@ class ProceduralObstacles:
             # (11-18) this share of the draws: the pieces on the policy's own line are the first kept (ranked below the rest)
             on_ = (self._rand((D, 1)) < self.online_p) & self.b_online[t, k_idx] & live
             r = torch.where(on_, r - 1.0, r)
+            if self.b_late is not None:                    # (11-23) of those, the ones seen late (behind a corner) first of all
+                r = torch.where(on_ & self.b_late[t, k_idx], r - 1.0, r)
         live = live & (r.argsort(1).argsort(1) < k) & self._use(D, dst, src)
         sid = sid.clamp_min(0)
         if self.has_raceline:

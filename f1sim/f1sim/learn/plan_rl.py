@@ -701,6 +701,10 @@ def main(argv=None):
                          "(11-16: a stalled car's speed noise drawn afresh every 0.1 s moves it cm and the advantage slope on it was "
                          "0 +- 0.005 over 4838 stalled decisions; cloned stalled cars backed 1 m/s x 1.5 s were driving on 4 s later "
                          "91 %% vs 21 %% left as they were)")
+    ap.add_argument("--online-late", type=float, default=0.0,
+                    help="M [m] (11-23, the user: \"박는 장면을 흔하게\" -> \"ㅇㅋㅇㅋ\"): with --online-boxes, the pieces on the own line that the "
+                         "car sees for less than M m of its line before reaching them (a tall wall cuts the sight line: behind a corner) "
+                         "are kept first of all; 0 = off")
     ap.add_argument("--online-boxes", type=float, default=0.0,
                     help="P: that share of box draws keeps the bank layout's pieces on the policy's own empty-track line first "
                          "(the line: where the learner cars drive with no box on the track, per 0.25 m of lap, fading 0.8 an update); "
@@ -1284,6 +1288,7 @@ def main(argv=None):
         onl_w = torch.zeros(T_tr * ONL_NB, device=dev)
         onl_xy = torch.zeros(T_tr * ONL_NB, 2, device=dev)
         env.procedural.online_p = float(args.online_boxes)
+        env.procedural.late_m = float(args.online_late)
     cool = torch.full((Bl,), 10 ** 6, dtype=torch.long, device=dev)   # ... since a scene was last taken from the row
     rep_hit = torch.zeros(Bl, dtype=torch.bool, device=dev)        # the scene episode in progress has had a hard contact
     # the rows the regular statistics are taken from: every race that never restarts from a scene
@@ -2504,6 +2509,8 @@ def main(argv=None):
                "noise_rho_steer": float(noise_rho[0]), "noise_box_share": nc_near / max(T, 1) if (args.noise_corr_box or args.noise_corr_car) else None,
                "noise_stall_share": nc_stall / max(T, 1) if stall_on else None,
                "online_piece_share": online_share,
+               "online_late_share": (None if getattr(env.procedural, "b_late", None) is None or env.procedural.b_online is None
+                                     else float(env.procedural.b_late.sum()) / max(1, int(env.procedural.b_online.sum()))),
                "line3_ready": (int((env.procedural.l3_nw > 0).sum()) if (online_on and env.procedural.l3_nw is not None) else None),
                "dist_world": args.dist_world, "decisions_all": n_all if dist is not None else None,
                "actor_checksum": float(torch.cat([p_.detach().reshape(-1) for p_ in actor.parameters()]).double().abs().sum()),
