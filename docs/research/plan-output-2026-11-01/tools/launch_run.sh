@@ -61,6 +61,11 @@ if [ "${EVAL:-exam}" = lab ]; then
   # (11-17) both GPUs here train; the frozen exam runs on the lab PC every 25 updates
   setsid nohup bash tools/lab_exam_loop.sh $N $U0 25 $U1 > out/lab_exam_loop_$N.out 2>&1 < /dev/null &
   setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
+elif [ "${EVAL:-exam}" = lab3 ]; then
+  # (11-23) the bag-scan world's line exam (exam3: 3 real-size boxes on the empty-track line) on the lab PC every 25 updates,
+  # with the box table by visibility time per checkpoint
+  EXAM=exam3 setsid nohup bash tools/lab_exam2m_loop.sh $N $U0 25 $U1 > out/lab_exam3_loop_$N.out 2>&1 < /dev/null &
+  setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
 elif [ "${EVAL:-exam}" = core ]; then
   CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
 else
@@ -77,8 +82,9 @@ mapn = mapn.split(",")[0].replace("+smooth", "")          # the console's map id
 p = "/home/shchon11/f1sim_runs/console_picks.json"
 shutil.copy(p, p + time.strftime(".bak_%m%d_%H%M"))
 d = json.load(open(p))
-slug = {"real:korea_2025_iccas": "real/iccas25", "real:korea_2026_competition": "real/korea26"}.get(mapn, mapn.replace("real:", "real/"))
-name = {"real/iccas25": "Korea 2025", "real/korea26": "Korea 2026"}.get(slug, slug)
+slug = {"real:korea_2025_iccas": "real/iccas25", "real:korea_2026_competition": "real/korea26",
+        "real:korea26_scan+duct": "real/korea26-scan"}.get(mapn, mapn.replace("real:", "real/"))   # (11-23) the bag-scan venue
+name = {"real/iccas25": "Korea 2025", "real/korea26": "Korea 2026", "real/korea26-scan": "Korea 2026 (bag 스캔)"}.get(slug, slug)
 src = init.rstrip("/").split("/")[-2] + " " + init.split("_u")[-1].replace(".pt", "") if init else "처음부터"
 e = {"run": f"watch_{n}", "label": f"학습 중 · {n} · {name} · {src}", "map": slug,
      "note": time.strftime("%m-%d %H:%M 시작"),
