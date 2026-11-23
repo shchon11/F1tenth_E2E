@@ -37,7 +37,6 @@ act0 = torch.zeros(env.B, env.act_dim, device=dev)
 T = int(round(secs / PS.DT))
 best = []                                                 # (score, decision, race, saved snapshot of the moment)
 from f1sim.viewer import sim_worker as SW
-from f1sim.viewer import protocol as P
 stub = types.SimpleNamespace(_overlay={"plan": True, "saliency": False, "internals": False}, gen=0, seq=0, _sim_rate=1.0,
                              _sal_cache=None)
 stub._viz_failure = lambda *a_: None
