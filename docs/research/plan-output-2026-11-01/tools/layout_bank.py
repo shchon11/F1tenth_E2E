@@ -50,11 +50,14 @@ env = SR.build_env(a, dev)
 proc = env.procedural
 names = getattr(env, "_track_names", None) or [SR.KOREA]
 tracks = env.sim.track.tracks
-if os.environ.get("BANK_LINE", "") == "centerline":
-    # 11-23 (the user: "레이싱라인은 왜만들지?"): the judge's line search only reads its start line's points, so it starts from
-    # the lane's centerline -- no racing line is built for a map that races solo
+if os.environ.get("BANK_LINE", "") in ("centerline", "smooth"):
+    # 11-23 (the user: "레이싱라인은 왜만들지?", "레이싱라인을 왜 쳐 계산하는데"): the judge's line search starts from the lane's own
+    # centerline, no racing line. Measured: the raw traced centerline wrongly failed on-line layouts (exam3: stuck at 58/64 after 1,900
+    # judgements; a racing-line start passed 64/64 in 99) -> "smooth" = that centerline smoothed along its length (`smooth_line`)
     from types import SimpleNamespace
-    rls = [SimpleNamespace(xy=np.asarray(t_.centerline, float)) for t_ in tracks]
+    from f1sim.layout_line import smooth_line
+    rls = [SimpleNamespace(xy=smooth_line(np.asarray(t_.centerline, float)) if os.environ["BANK_LINE"] == "smooth"
+                           else np.asarray(t_.centerline, float)) for t_ in tracks]
 else:
     _, rls = SR.common.load_tracks(names, racelines=True, **dict(SR.common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
 T = len(tracks)

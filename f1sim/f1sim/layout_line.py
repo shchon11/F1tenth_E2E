@@ -152,6 +152,14 @@ def _smooth_closed(p: np.ndarray, sigma_pts: float) -> np.ndarray:
     return np.stack([gaussian_filter1d(p[:, k], sigma_pts, mode="wrap") for k in range(2)], 1)
 
 
+def smooth_line(xy: np.ndarray, sigma_m: float = 0.5, step: float = 0.05) -> np.ndarray:
+    """A closed line (the lane's traced centerline) resampled every `step` m and smoothed along its length with a Gaussian of
+    `sigma_m` -- the judge's start line without a racing line (11-23): the traced centerline's cell-scale kinks, not its course"""
+    L = float(np.linalg.norm(np.roll(xy, -1, 0) - xy, axis=1).sum())
+    q = resample_closed(np.asarray(xy, float), max(16, int(round(L / step))))
+    return _smooth_closed(q, sigma_m / step)
+
+
 class LayoutLines:
     """Builds minimum-time lines round obstacle layouts on one track, many layouts per call."""
 

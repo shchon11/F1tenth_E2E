@@ -30,10 +30,20 @@ a = argparse.Namespace(**json.load(open(WJ)))
 a.envs, a.seed, a.device = 2, SEED, "cpu"
 a.prop_place, a.prop_count, a.prop_fraction, a.prop_bank = "uniform", "fixed", 1.0, ""
 a.warps, a.track_scales = 0, None
+if os.environ.get("BANK_TRACKS"):
+    # (11-23) the map on its own grid instead of the world's +smooth one (same name = same bank key, 16x fewer cells to judge on)
+    a.tracks = os.environ["BANK_TRACKS"]
 env = SR.build_env(a, dev)
 names = getattr(env, "_track_names", None) or [SR.KOREA]
-_, rls = SR.common.load_tracks(names[:1], racelines=True, **dict(SR.common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
 track = env.sim.track.tracks[0]
+if os.environ.get("BANK_LINE", "") in ("centerline", "smooth"):
+    # (11-23) as layout_bank.py: the judge's line search starts from the lane's centerline ("smooth": smoothed), no racing line
+    from types import SimpleNamespace
+    from f1sim.layout_line import smooth_line
+    rls = [SimpleNamespace(xy=smooth_line(np.asarray(track.centerline, float)) if os.environ["BANK_LINE"] == "smooth"
+                           else np.asarray(track.centerline, float))]
+else:
+    _, rls = SR.common.load_tracks(names[:1], racelines=True, **dict(SR.common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
 builder = LL.LayoutLines(track, rls[0], dev, veh_width=float(env.cfg.vehicle.width), vehicle=env.cfg.vehicle, iters=ITERS)
 kmax = builder.kmax
 C = env.procedural.C
@@ -42,9 +52,18 @@ R0 = Rec(RREC)
 ref = np.load(REFL); refp, refs, L = ref["xy"], ref["s"], float(ref["L"])
 tan = np.roll(refp, -1, 0) - np.roll(refp, 1, 0); tan /= np.linalg.norm(tan, axis=1, keepdims=True)
 nrm = np.stack([-tan[:, 1], tan[:, 0]], 1)                                   # + = left of the direction of travel
-b1 = torch.load(EXAM1, map_location="cpu", weights_only=False)["per_track"]["korea_2026_competition"]
-pool = b1["sid"].numpy(); pool = pool[pool >= 0]                             # the exam bank's shapes, at its own rates
-FP = {int(k): R0.z[f"fp_{int(k)}"].astype(float) for k in np.unique(pool)}
+if str(getattr(a, "prop_shapes", "all") or "all") == "real_boxes":
+    # (11-23) the bag-scan map's exam: the venue's measured box sizes (`REAL_BOX_SHAPES`), each equally likely, footprints from
+    # the catalogue itself (a record holds only the shapes its own sessions drew)
+    from f1sim import props as _props
+    po = env.procedural
+    pool = po.line_pool.cpu().numpy()
+    FP = {int(k): np.asarray(_props.build(po.shapes[k].style, seed=0, **dict(po.shapes[k].dims)).envelope.footprint, float)
+          for k in pool}
+else:
+    b1 = torch.load(EXAM1, map_location="cpu", weights_only=False)["per_track"]["korea_2026_competition"]
+    pool = b1["sid"].numpy(); pool = pool[pool >= 0]                         # the exam bank's shapes, at its own rates
+    FP = {int(k): R0.z[f"fp_{int(k)}"].astype(float) for k in np.unique(pool)}
 
 
 def poly(k, x, y, yaw):

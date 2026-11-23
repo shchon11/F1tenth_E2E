@@ -45,6 +45,10 @@ for fn, ln in zip(RECS, lines):
     m = np.isfinite(ln).all(1) & ok
     d = np.linalg.norm(ln[m] - ref[m], axis=1)
     print(f"{fn.split('exam1_')[-1].split('_ideal')[0]}: 기준 길과의 거리 중앙 {100 * np.median(d):.0f} cm, 90 % {100 * np.percentile(d, 90):.0f} cm, 최대 {100 * d.max():.0f} cm")
+import os
+if os.environ.get("EXAM_LINE_ONLY"):
+    # (11-23) the reference line only (another map's exam): the preview below reads the Korea 2026 exam1 bank
+    raise SystemExit(0)
 
 
 def to_line(xy):

@@ -9,7 +9,9 @@
 # there (exam_judge.sh's command; the world json is found by name in the lab's code, tools/world_of.py), fetch the record,
 # write the analysis (.txt + .done) here. The remote exam runs under setsid and is polled, so a dropped tunnel does not kill it.
 # Args: RUN U0 STEP U1
-RUN=$1; U0=$2; STEP=${3:-25}; U1=$4
+# (11-23) EXAM=exam3: a run trained in the bag-scan world (its world json names the exam: exam_name "exam3", the exam3 bank) --
+# records exam3_..._line3_n256, analysis <run>_u<N>_exam3.txt/.done; default exam2 as before
+RUN=$1; U0=$2; STEP=${3:-25}; U1=$4; EX=${EXAM:-exam2}
 H=${LAB_H:-shchon11@10.100.0.2};   # (11-20) WireGuard (lab side: interface 'home'); LAB_H=lab = Tailscale. When both were up
 # Tailscale rode over the WireGuard path and crawled at ~3 KB/s; the WireGuard address itself did 6 MB/s
  SSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
@@ -20,7 +22,7 @@ for UU in $(seq $U0 $STEP $U1); do
   until [ -e $C ] || [ -e $D/one_$RUN.done ]; do sleep 30; done
   [ -e $C ] || break
   sleep 20
-  B=exam2_${RUN}_u${UU}_ideal_line3_n256
+  B=${EX}_${RUN}_u${UU}_ideal_line3_n256
   [ -e $D/exam/$B.npz ] && continue
   for try in 1 2 3; do
     tar -cf - -C $RUNS $RUN/args.json $RUN/plan_u$UU.pt | $SSH $H 'mkdir -p ~/f1sim_runs && tar -x -C ~/f1sim_runs' || { sleep 30; continue; }
@@ -35,8 +37,8 @@ for UU in $(seq $U0 $STEP $U1); do
   done
   if [ -e $D/exam/$B.npz ]; then
     (source /home/shchon11/F1tenth_E2E/.venv/bin/activate; cd /home/shchon11/F1tenth_E2E/f1sim
-     { python3 -W ignore $T/exam_table.py $D/exam/$B.npz; python3 -W ignore $T/side_flip.py $D/exam/$B.npz; } > $D/analysis/${RUN}_u${UU}_exam2.txt 2>&1)
-    echo done > $D/analysis/${RUN}_u${UU}_exam2.done
+     { python3 -W ignore $T/exam_table.py $D/exam/$B.npz; python3 -W ignore $T/side_flip.py $D/exam/$B.npz; } > $D/analysis/${RUN}_u${UU}_${EX}.txt 2>&1)
+    echo done > $D/analysis/${RUN}_u${UU}_${EX}.done
   fi
-  echo "$(date +%T) $RUN u$UU 시험2 $([ -e $D/exam/$B.npz ] && echo 끝 || echo 실패)"
+  echo "$(date +%T) $RUN u$UU $EX $([ -e $D/exam/$B.npz ] && echo 끝 || echo 실패)"
 done
