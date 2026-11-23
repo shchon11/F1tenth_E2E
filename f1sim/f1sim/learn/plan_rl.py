@@ -1888,7 +1888,8 @@ def main(argv=None):
         sc_end_kind = torch.zeros(NK, dtype=torch.long, device=dev); sc_hit_kind = torch.zeros(NK, dtype=torch.long, device=dev)
         AX = []                                                # --mem-aux: the boxes ahead at each decision
         PRP, PRO, PROK, PRV = [], [], [], []                   # --pred-opp: our pose, the other car's xy, there, 'visible'
-        n_near = 0; n_fault = 0.0; opp_pres = 0.0              # near misses, contacts charged to us, races with the other car
+        n_near = 0; n_near_gap = 0; n_fault = 0.0; opp_pres = 0.0   # near misses (of them: bodies < 10 cm), contacts charged to us,
+                                                                    # races with the other car
         DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
         n_removed = 0
         n_restarted = 0
@@ -2241,6 +2242,7 @@ def main(argv=None):
                         near_ev = (((drv.near_gap < 0.10) | ((v_drop >= 0.35) & near_ahead))
                                    & ((env.sim.contact_counts[lid, 2] - c_car0) <= 0) & ~out["restarted"] & ~hit)
                         n_near += int(near_ev[ordm].sum())
+                        n_near_gap += int((near_ev & (drv.near_gap < 0.10))[ordm].sum())
                         hit_take = hit_take | near_ev
                     # 3. a scene from every one outside a scene episode: the state `lag` decisions earlier in the same episode
                     take = hit_take & ~in_rep0 & (since >= lag_lo) & (cool >= lag_hi) & (upd >= args.scene_from)
@@ -2893,6 +2895,7 @@ def main(argv=None):
             row["opp_present_share"] = opp_pres / max(T, 1)        # decisions of the ordinary races with the other car there
         if near_on:
             row["near_miss_per_min"] = n_near / mins
+            row["near_miss_gap_per_min"] = n_near_gap / mins          # of them: the bodies within 10 cm (the rest: hard brakes)
         if args.car_fault:
             row["car_fault_per_min"] = n_fault / mins
         if g_split["policy"]:
@@ -2970,7 +2973,7 @@ def main(argv=None):
               + (f"선 상대 차 다시 출발 {n_restarted}번 | " if restarter is not None else "")
               + (f"상대 차 있는 판 {row['opp_present_share'] * 100:.0f} % | " if others is not None else "")
               + (f"우리 책임 차 접촉 {row['car_fault_per_min']:.2f}/분 | " if args.car_fault else "")
-              + (f"아슬아슬 스침 {row['near_miss_per_min']:.2f}/분 | " if near_on else "")
+              + (f"아슬아슬 스침 {row['near_miss_per_min']:.2f}/분 (10 cm 안 {row['near_miss_gap_per_min']:.2f}, 나머지는 바짝 뒤 급제동) | " if near_on else "")
               + (f"상대 차 예측: 0.5 s 뒤 오차 {(row['pred_err_05'] if row['pred_err_05'] is not None else float('nan')):.2f} m, 1.0 s 뒤 "
                  f"{(row['pred_err_10'] if row['pred_err_10'] is not None else float('nan')):.2f} m, 보이나 맞히기 AUC "
                  f"{(row['pred_vis_auc'] if row['pred_vis_auc'] is not None else float('nan')):.2f} (보이는 결정 "

@@ -74,6 +74,11 @@ elif [ "${EVAL:-exam}" = lab3 ]; then
   # with the box table by visibility time per checkpoint
   EXAM=exam3 setsid nohup bash tools/lab_exam2m_loop.sh $N $U0 25 $U1 > out/lab_exam3_loop_$N.out 2>&1 < /dev/null &
   setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
+elif [ "${EVAL:-exam}" = lab34 ]; then
+  # (11-24) a race run: exam3 (the line exam) and exam4 (the race exam) per checkpoint on the lab PC, in a row; every
+  # EVAL_STEP updates (default 25)
+  setsid nohup bash tools/lab_race_exam_loop.sh $N $U0 ${EVAL_STEP:-25} $U1 > out/lab_race_exam_loop_$N.out 2>&1 < /dev/null &
+  setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
 elif [ "${EVAL:-exam}" = none ]; then
   :   # (11-24) no exam loop (the console's training page: "시험 없음")
 elif [ "${EVAL:-exam}" = core ]; then

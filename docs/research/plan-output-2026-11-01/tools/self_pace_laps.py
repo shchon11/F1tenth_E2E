@@ -74,13 +74,13 @@ for g in range(G):
     c = cross[g]
     lap.append(float(np.mean(np.diff(c))) * PS.DT if len(c) >= 2 else float("nan"))
 lap = np.array(lap)
-ref = np.nanmean(lap[np.array([abs(f - 1.0) < 1e-9 for f in fac.tolist()])])
+ref = np.nanmean(lap[np.array([abs(f - 1.0) < 1e-4 for f in fac.tolist()])])
 print(f"\n[복사본 속도 배율 측정] {os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)} · Korea 2026 (bag 스캔) 원래 지도, "
       f"상자 없음, 혼자, {secs:.0f} s, 배율당 {per}판 (plan대로 정확히 실행)")
 print(f"{'배율':>6} | {'바퀴 시간 s':>10} | {'실제 페이스 비율':>14} | {'평균 속도 m/s':>12} | {'벽 접촉/분':>9} | 잰 바퀴")
 out = {}
 for f in facs:
-    m = np.array([abs(x - f) < 1e-9 for x in fac.tolist()])
+    m = np.array([abs(x - f) < 1e-4 for x in fac.tolist()])
     lt = np.nanmean(lap[m]); n_l = int(sum(max(0, len(cross[g]) - 1) for g in np.nonzero(m)[0]))
     vs = float(v_sum[torch.as_tensor(m, device=dev)].mean()) / T
     wm = float(walls[torch.as_tensor(m, device=dev)].sum()) / (secs / 60.0) / max(int(m.sum()), 1)
