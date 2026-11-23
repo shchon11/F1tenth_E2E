@@ -10,8 +10,63 @@
 인자: 기록npz"""
 import os, sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from exam_table import progress, runs, pct, mean, HYST, STALL_S, STUCK_M
+# (exam_table.py's helpers, copied: importing that script runs its whole table on argv)
+RNG = np.random.default_rng(0)
+HYST = 1.0          # [m] a pass counts once the gap has changed sign by this much (exam_table.py's)
+STALL_S = 2.0
+STUCK_M = 1.0
+
+
+def ci(v, stat=np.mean, n=2000):
+    v = np.asarray(v, float); v = v[np.isfinite(v)]
+    if len(v) < 2:
+        return (float("nan"), float("nan"))
+    idx = RNG.integers(0, len(v), (n, len(v)))
+    s = np.array([stat(v[i]) for i in idx]) if stat is not np.mean else v[idx].mean(1)
+    return tuple(np.percentile(s, [2.5, 97.5]))
+
+
+def pct(v):
+    v = np.asarray(v, float)
+    if len(v) == 0:
+        return "  -"
+    lo, hi = ci(v)
+    return f"{100 * v.mean():3.0f} % [{100 * lo:.0f}-{100 * hi:.0f}]"
+
+
+def mean(v, f="{:.2f}"):
+    v = np.asarray(v, float)
+    if len(v) == 0:
+        return "-"
+    lo, hi = ci(v)
+    return (f + " [" + f + "-" + f + "]").format(v.mean(), lo, hi)
+
+
+def progress(rem, L, skip=None):
+    """(T+1, B) distance to go -> (T+1, B) cumulative distance driven along the track (a wall / off-grid sample holds the last value;
+    `skip` (T, B): decisions whose step is not driving, e.g. a re-placed car)"""
+    r = rem.astype(float).copy()
+    for t in range(1, r.shape[0]):                       # carry the last valid value forward
+        bad = ~np.isfinite(r[t]); r[t, bad] = r[t - 1, bad]
+    r[~np.isfinite(r)] = 0.0
+    d = r[:-1] - r[1:]
+    d = np.mod(d + 0.5 * L, L) - 0.5 * L
+    if skip is not None:
+        d[skip] = 0.0
+    return np.concatenate([np.zeros((1, r.shape[1])), np.cumsum(d, 0)], 0), r
+
+
+def runs(mask, n_min):
+    """per column: the number of runs of True at least n_min long, and the longest run"""
+    T, B = mask.shape
+    cnt = np.zeros(B, int); longest = np.zeros(B, int); cur = np.zeros(B, int)
+    for t in range(T):
+        cur = np.where(mask[t], cur + 1, 0)
+        cnt += (cur == n_min)
+        longest = np.maximum(longest, cur)
+    return cnt, longest
+
+
 
 fn = sys.argv[1]
 z = np.load(fn, allow_pickle=False)
