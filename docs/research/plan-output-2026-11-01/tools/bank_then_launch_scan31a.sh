@@ -3,7 +3,7 @@
 # itself out -- and the scenes that teach not ramming are made common) the bag-scan world's training bank (2,000 layouts a
 # track, judge from the smoothed centerline) -> merge the two PCs' parts -> check -> launch scan31a from scratch, 40 s
 # episodes: half the box draws keep the boxes on the car's own line first, the ones it sees late (< 4 m of its line, behind a
-# corner) first of all; boxes taken away at 10-30 s in half the box races; distance shaping only until the car drives
+# corner) first of all; boxes stay the whole race (the user: "장애물을 피하는게 일단 우선"); distance shaping only until the car drives
 # (u100-150), then lap time and contact costs only; exam3 on the lab PC every 25 updates
 RT=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01; D=$RT/out; P=/home/shchon11/f1sim_runs/_bank_parts
 BK=/home/shchon11/f1sim_runs/prop_banks_box2_korea26scan
@@ -36,7 +36,7 @@ PY
 tar -cf - -C /home/shchon11/f1sim_runs prop_banks_box2_korea26scan | $SSH $H 'tar -x -C ~/f1sim_runs'
 cd $RT
 EVAL=lab3 bash tools/launch_run.sh scan31a /home/shchon11/F1tenth_E2E/f1sim/f1sim/learn/configs/plan_world_korea26scan_qual.json 1500 "" 0 \
-  --mem-keep-s 30 --mem-keep-log --scene-replay 0.25 --scene-keep-unsolved --scene-episode-s 13 --scene-from 100 --removal-p 0.5 \
+  --mem-keep-s 30 --mem-keep-log --scene-replay 0.25 --scene-keep-unsolved --scene-episode-s 13 --scene-from 100 --removal-p 0 \
   --online-boxes 0.5 --online-late 4 --shaping-fade 100,150 --horizon 64 --minibatches 8 --horizon-auto 4 --horizon-auto-min 2 \
   --horizon-auto-mult 2 --horizon-auto-down --mem-chunk-rollout --mem-prev 80
 echo "$(date +%T) scan31a 띄움"
