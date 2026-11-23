@@ -23,7 +23,7 @@ send_one() {                                   # one item: "code" | "cache" | a 
   echo "$(date +%T) $1 끝내 실패"; return 1
 }
 export -f send_one
-printf "%s\n" code cache $PICKS prop_banks_box2 prop_banks_box2_korea_2026_competition | xargs -P 5 -I{} bash -c 'send_one {}'
+printf "%s\n" code cache $PICKS prop_banks_box2 prop_banks_box2_korea_2026_competition prop_banks_box2_korea26scan prop_banks_exam3_korea26scan | xargs -P 5 -I{} bash -c 'send_one {}'
 python3 - "$PICKS" <<'PY' | $SSH $H 'cat > ~/f1sim_runs/console_picks.json'
 import json, sys
 keep = sys.argv[1].split()
