@@ -606,6 +606,69 @@ def mem_prefix(gru, pF: torch.Tensor, pHM: torch.Tensor, pD: torch.Tensor, cars:
     return torch.where(pD[-1][cars][:, None] > 0, h_now, h)
 
 
+def _arg_problem(args) -> str:
+    """(11-24, --check-args) the refusals below in main() that need only the arguments (and the world / checkpoint
+    files), in one place, so the console's training queue can say why before it stops anything or starts a GPU job.
+    '' = none found. main() keeps its own checks; this list mirrors them."""
+    v3 = args.format == "v3"
+    v2 = args.format == "v2" or v3
+    if not os.path.isfile(args.world):
+        return f"--world {args.world}: no such file"
+    try:
+        json.load(open(args.world))
+    except ValueError as e:
+        return f"--world {args.world}: not JSON ({e})"
+    if args.init:
+        if not os.path.isfile(args.init):
+            return f"--init {args.init}: no such file"
+        ck = torch.load(args.init, map_location="cpu", weights_only=False)
+        if bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
+            return "--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch"
+    rules = (
+        (args.dist_world > 1 and (args.dump_rollout or args.track_steps or args.level_replay > 0 or args.self_opp > 0
+                                  or args.branches == 2 or args.accum > 1),
+         "--dist-world: not with --dump-rollout / --track-steps / --level-replay / --self-opp / --branches 2 / --accum"),
+        (args.branches == 2 and (not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0
+                                 or bool(args.init)),
+         "--branches 2 needs --format v2 with --tail-consistency, from scratch, without --hold-p / --self-opp"),
+        (args.branches == 2 and not 0.0 <= args.branch_floor < 0.5, "--branch-floor: in [0, 0.5)"),
+        (args.hold_p > 0 and not v2, "--hold-p needs --format v2 or v3"),
+        (args.hold_new_block and not (args.hold_p > 0 and args.plan_hit_seen),
+         "--hold-new-block needs --hold-p and --plan-hit-seen"),
+        (args.scene_replay > 0 and (not v2 or v3 or args.level_replay > 0),
+         "--scene-replay needs --format v2, without --level-replay"),
+        (bool(args.noise_corr_box) and not args.box_range > 0, "--noise-corr-box reads the critic's box column: needs --box-range"),
+        (args.noise_corr_free > 0 and not (args.noise_corr_box or args.noise_corr_car),
+         "--noise-corr-free is for the rows away from --noise-corr-box/-car"),
+        (args.stuck_noise > 0 and bool(args.noise_corr_stall), "--stuck-noise or --noise-corr-stall, not both"),
+        (args.memory and (not v2 or v3), "--memory needs --format v2"),
+        (args.mem_front and not args.memory, "--mem-front needs --memory"),
+        (args.mem_aux > 0 and not args.memory, "--mem-aux needs --memory"),
+        (args.mem_aux_seen and not (args.mem_aux > 0 and args.box_range > 0), "--mem-aux-seen needs --mem-aux and --box-range"),
+        (args.plan_hit_known and not (args.mem_aux_seen and args.plan_hit_share > 0),
+         "--plan-hit-known needs --mem-aux-seen and --plan-hit-share > 0"),
+        (args.plan_hit_seen and (args.plan_hit_known or not args.plan_hit_share > 0),
+         "--plan-hit-seen: --plan-hit-share > 0, not with --plan-hit-known"),
+        (args.plan_hit_seen and args.plan_hit_wall_s is None, "--plan-hit-seen: give --plan-hit-wall-s"),
+        (bool(args.noise_corr_known) and not args.mem_aux_seen, "--noise-corr-known needs --mem-aux-seen"),
+        ((args.mem_value > 0 or args.mem_keep_s > 0) and not args.memory, "--mem-value / --mem-keep-s need --memory"),
+        (args.mem_keep_s > 0 and bool(args.init), "--mem-keep-s is a starting value: it has no meaning with --init"),
+        (args.mem_prev > 0 and not (args.memory and args.mem_chunk_rollout), "--mem-prev needs --memory and --mem-chunk-rollout"),
+        (args.tail_consistency > 0 and (not v2 or v3 or args.hold_p > 0), "--tail-consistency needs --format v2 and no holding"),
+        (bool(args.plan_roll) and bool(args.roll_grow), "--plan-roll or --roll-grow, not both"),
+        (args.plan_hit_wall_seen and not ((args.plan_roll or args.roll_grow) and args.plan_hit_seen),
+         "--plan-hit-wall-seen: with --plan-roll / --roll-grow and --plan-hit-seen"),
+        (args.box_memory and not (args.memory and args.mem_front and v2), "--box-memory needs --memory --mem-front (v2)"),
+        (args.mem_aux_in and not (args.box_memory and args.mem_aux > 0 and args.mem_aux_seen),
+         "--mem-aux-in needs --box-memory --mem-aux --mem-aux-seen"),
+        (bool(args.pace_caps) and bool(args.init), "--pace-caps: from scratch"),
+        (args.accum_actor > 1 and args.accum > 1, "--accum and --accum-actor: one or the other"),
+        (args.mem_aux_lr > 0 and not args.mem_aux > 0, "--mem-aux-lr needs --mem-aux"),
+        (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
+    )
+    return next((why for bad, why in rules if bad), "")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
@@ -1052,7 +1115,17 @@ def main(argv=None):
     ap.add_argument("--dist-backend", default="gloo", choices=("gloo", "nccl"))
     ap.add_argument("--dist-same-seed", action="store_true", help="test only: every process drives the same seed")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
+    ap.add_argument("--check-args", action="store_true",
+                    help="(11-24) the console's training queue: parse, run the checks that need no environment, print the "
+                         "parsed arguments as JSON and exit -- nothing is built, no GPU touched")
     args = ap.parse_args(argv)
+    if args.check_args:
+        why = _arg_problem(args)
+        if why:
+            raise SystemExit(why)
+        opt = {a.dest: max(a.option_strings, key=len) for a in ap._actions if a.option_strings}
+        print(json.dumps({"ok": True, "args": vars(args), "opt": opt}, default=str))
+        raise SystemExit(0)
     if args.contact_scale is None:                 # the map's own contact weight (11-15: one world json per map carries it)
         args.contact_scale = float(json.load(open(args.world)).get("contact_scale", 1.0))
     dist = None

@@ -1333,6 +1333,8 @@ class LineChart(QtWidgets.QWidget):
         self.placeholder = "데이터 없음"
         self._series: List[List[float]] = []
         self._hover: Optional[int] = None
+        #: the x of the first point (the read-out under the cursor counts from it): 1, or a continued run's first update
+        self.x_first = 1
 
     # -- data
     def set_series(self, *series: Sequence[float]):
@@ -1428,19 +1430,19 @@ class LineChart(QtWidgets.QWidget):
                    f"{text} {self.unit}".strip())
         p.setPen(QtGui.QColor(C["text.2"]))
         f.setPointSizeF(7.0); p.setFont(f)
-        foot = self.x_label if self._hover is None else f"{self.x_label.rstrip(' →')} {index + 1}"
+        foot = self.x_label if self._hover is None else f"{self.x_label.rstrip(' →')} {index + self.x_first}"
         p.drawText(QtCore.QRectF(x0, y1 + 2, x1 - x0, 14), QtCore.Qt.AlignLeft, foot)
         if self.lower_is_better:
             p.drawText(QtCore.QRectF(x0, y1 + 2, x1 - x0, 14), QtCore.Qt.AlignRight, "낮을수록 좋음")
         if len(self._series) > 1 and self.labels:
+            # (11-24) in the footer, between the axis name and "낮을수록 좋음": at the top-left the names sat on the lines
             mono.setPointSizeF(7.0); mono.setBold(False); p.setFont(mono)
-            slot = 0
-            for si, name in enumerate(self.labels[:len(self._series)]):
-                if not any(v == v for v in self._series[si]):
-                    continue                    # naming a line this run never drew
+            names = [(si, name) for si, name in enumerate(self.labels[:len(self._series)])
+                     if any(v == v for v in self._series[si])]          # naming a line this run never drew
+            xc = (x0 + x1) / 2 - 31 * len(names)
+            for slot, (si, name) in enumerate(names):
                 p.setPen(QtGui.QColor(self.colours[si % len(self.colours)]))
-                p.drawText(QtCore.QRectF(x0 + 4 + slot * 62, y0 + 2, 60, 12), QtCore.Qt.AlignLeft, name)
-                slot += 1
+                p.drawText(QtCore.QRectF(xc + slot * 62, y1 + 2, 60, 14), QtCore.Qt.AlignCenter, "— " + name)
 
 
 @dataclass(frozen=True)

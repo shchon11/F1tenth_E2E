@@ -33,6 +33,14 @@ else
   START="--noise-corr-ramp 200,250"; U0=25
 fi
 ARGS="$BASE --world $WJ --updates $U1 $START $*"
+if [ -n "${CHECK:-}" ]; then
+  # (11-24) the console's training queue (train_queue.py): would plan_rl take exactly these arguments? Parse + the checks
+  # that need no environment, the parsed arguments as JSON on stdout; nothing started, no GPU (CUDA_VISIBLE_DEVICES empty)
+  DW=""; [ "${LAUNCH_GPU:-both}" = both ] && DW="--dist-world 2"
+  cd /home/shchon11/F1tenth_E2E/f1sim
+  CUDA_VISIBLE_DEVICES= PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim exec /home/shchon11/F1tenth_E2E/.venv/bin/python3 \
+    -m f1sim.learn.plan_rl --name $N $ARGS $DW --check-args
+fi
 echo "$(date +%T) $N | 세계 $WJ ($MAPN, 접촉 무게 $CS) | ${INIT:-처음부터} | 끝 u$U1 | 덧붙임: $*" | tee -a $D/switch_$N.log
 cd $RT
 source /home/shchon11/F1tenth_E2E/.venv/bin/activate
@@ -66,6 +74,8 @@ elif [ "${EVAL:-exam}" = lab3 ]; then
   # with the box table by visibility time per checkpoint
   EXAM=exam3 setsid nohup bash tools/lab_exam2m_loop.sh $N $U0 25 $U1 > out/lab_exam3_loop_$N.out 2>&1 < /dev/null &
   setsid nohup bash tools/lab_watch_sync.sh $N > out/lab_watch_sync_$N.out 2>&1 < /dev/null &
+elif [ "${EVAL:-exam}" = none ]; then
+  :   # (11-24) no exam loop (the console's training page: "시험 없음")
 elif [ "${EVAL:-exam}" = core ]; then
   CORE_VAL_ENVS=512 setsid nohup bash tools/core_loop.sh $N $U0 25 $U1 > out/core_loop_$N.out 2>&1 < /dev/null &
 else

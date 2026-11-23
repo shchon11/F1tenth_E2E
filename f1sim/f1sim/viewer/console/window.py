@@ -199,7 +199,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._build_topbar())
-        outer.addWidget(self._build_condbar())
+        self._condbar = self._build_condbar()
+        outer.addWidget(self._condbar)
         body = QtWidgets.QWidget()
         body.setObjectName("Centre")
         bh = QtWidgets.QHBoxLayout(body)
@@ -229,6 +230,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.centre_stack = QtWidgets.QStackedWidget()
         self.centre_stack.setObjectName("Centre")
         self.centre_stack.addWidget(body)
+        # (11-24, the user: "≡ 버튼같은거 눌러서 메뉴 펼쳐서 선택하면 학습 패널로") index 1 = MODE_INDEX["train"]: the plan_rl
+        # training page -- requests to the two-GPU PC's queue, its status back; no GL, no torch
+        from .plan_train import PlanTrainPage
+        self.training = PlanTrainPage()
+        self.training.watch_requested.connect(self._watch_training_run)
+        self.centre_stack.addWidget(self.training)
         outer.addWidget(self.centre_stack, 1)
         outer.addWidget(status)
         self._legacy.setParent(root)
@@ -254,12 +261,39 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h = QtWidgets.QHBoxLayout(bar)
         h.setContentsMargins(16, 12, 16, 12)
         h.setSpacing(10)
+        # (11-24) ≡: the pages -- 주행 (this bar's pickers, the 3D view) and 학습 (`plan_train.PlanTrainPage`)
+        self.btn_menu = QtWidgets.QToolButton()
+        self.btn_menu.setObjectName("MenuButton")
+        self.btn_menu.setText("≡")
+        self.btn_menu.setToolTip("화면 바꾸기: 주행 · 학습")
+        self.btn_menu.setFixedSize(40, 40)
+        self.btn_menu.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_menu.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.btn_menu.setStyleSheet(f"QToolButton#MenuButton {{ font-size: 22px; color: {C['text.0']}; background: transparent;"
+                                    f" border: 1px solid {C['line']}; border-radius: 8px; }}"
+                                    f"QToolButton#MenuButton:hover {{ background: {C['bg.raised']}; }}"
+                                    f"QToolButton#MenuButton::menu-indicator {{ image: none; width: 0px; }}")
+        menu = QtWidgets.QMenu(self.btn_menu)
+        menu.setStyleSheet(f"QMenu {{ background: {C['bg.card']}; border: 1px solid {C['line.strong']}; padding: 4px; }}"
+                           f"QMenu::item {{ padding: 8px 28px 8px 14px; border-radius: 6px; font-size: 14px; }}"
+                           f"QMenu::item:selected {{ background: {C['accent.soft']}; }}")
+        grp = QtWidgets.QActionGroup(menu)
+        self._mode_actions: Dict[str, QtWidgets.QAction] = {}
+        for key, text in (("drive", "주행"), ("train", "학습")):
+            a = menu.addAction(text)
+            a.setCheckable(True)
+            a.setChecked(key == "drive")
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: self.set_mode(k))
+            self._mode_actions[key] = a
+        self.btn_menu.setMenu(menu)
+        h.addWidget(self.btn_menu)
         mark = QtWidgets.QLabel("◆")
         mark.setObjectName("BrandMark")
         h.addWidget(mark)
-        brand = QtWidgets.QLabel("주행 콘솔")
-        brand.setObjectName("Brand")
-        h.addWidget(brand)
+        self._brand = QtWidgets.QLabel("주행 콘솔")
+        self._brand.setObjectName("Brand")
+        h.addWidget(self._brand)
         h.addSpacing(8)
         self.pick_policy = RichPicker("정책", "정책을 고르세요", popup_width=780,
                                       search_hint="정책 검색 — 이름 · 맵 · 설명")
@@ -292,6 +326,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             h.addWidget(btn)
         h.addSpacing(6)
         h.addWidget(self.badge)
+        # what the 학습 page hides: the driving pickers and transport (they act on the driving session)
+        self._drive_bar = [self.pick_policy, self.pick_map, self.pick_cond, self.btn_start, self.btn_stop, self.btn_pause,
+                           self.btn_reset, self.btn_manual, self.badge]
+        self._bar_fill = QtWidgets.QWidget()
+        self._bar_fill.setVisible(False)
+        h.addWidget(self._bar_fill, 1)
         return bar
 
     def _fit_hud(self) -> None:
@@ -2869,7 +2909,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             key = "drive"                          # 11-02: the driving page is the console
         drive = key == "drive"
         self.mode_buttons.set_current(key)
+        if self.centre_stack.count() <= self.MODE_INDEX[key]:
+            key, drive = "drive", True              # a page that is not built (the editor) is the driving page
         self.centre_stack.setCurrentIndex(self.MODE_INDEX[key])
+        for w in getattr(self, "_drive_bar", []):
+            w.setVisible(drive)
+        if hasattr(self, "_bar_fill"):
+            self._bar_fill.setVisible(not drive)
+            self._condbar.setVisible(drive)
+            self._brand.setText("주행 콘솔" if drive else "학습")
+            self._mode_actions[key if key in self._mode_actions else "drive"].setChecked(True)
         self.left_panel.setVisible(drive and self.btn_left_panel.isChecked())
         self.right_panel.setVisible(drive and self.btn_right_panel.isChecked())
         if self.training is not None:
@@ -2880,7 +2929,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             if drive:
                 self._update_start_hint()
             elif key == "train":
-                self.status_text.setText("학습 — 설정을 고르고 '학습 시작'을 누르세요.")
+                self.status_text.setText("학습")
             else:
                 self.status_text.setText("환경 — 새로 만들거나 목록에서 고르세요.")
 
@@ -2944,6 +2993,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._on_map_selected(track_id)
         self.status_text.setText(f"{self.maps.display(track_id)} 을(를) 다음 시작에 사용합니다. "
                                  f"런을 고르고 '시작'을 누르세요.")
+
+    def _watch_training_run(self, run: str):
+        """학습 page -> 주행 화면에서 보기: the run's console entry (watch_<run>, the newest checkpoint the launcher keeps
+        there), else the run itself when this PC has its checkpoints"""
+        names = {r.name for r in (self.runs or [])}
+        pick = next((n for n in (f"watch_{run}", run) if n in names), None)
+        self.set_mode("drive")
+        if pick is None:
+            self.status_text.setText(f"{run}: 주행 목록에 아직 없음 (checkpoint가 이 PC에 오면 생김)")
+            return
+        self._on_policy_picked(pick)
 
     def _view_checkpoint_from_training(self, run_name: str, ckpt_path: str):
         """A checkpoint picked on the training page becomes the driving page's next start."""
