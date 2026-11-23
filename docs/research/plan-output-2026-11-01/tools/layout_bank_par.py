@@ -35,13 +35,14 @@ def free_workers() -> int:
 
 
 def world_tracks(world: str):
-    """state_rl.build_env 와 같은 트랙 목록 (원본마다 + warp0..warpN-1, 그다음 크기 바꾼 것)."""
+    """state_rl.build_env 와 같은 트랙 목록 (원본마다 + warp0..warpN-1 또는 hose0..hoseN-1, 그다음 크기 바꾼 것)."""
     sys.path.insert(0, F1SIM)
     from f1sim.learn import state_rl as SR
     a = json.load(open(world))
     bases = [t.strip() for t in str(a.get("tracks") or SR.KOREA).split(",") if t.strip()]
     warps = int(a.get("warps") or 0)
-    names = [x for b in bases for x in [b] + [f"{b}+warp{k}" for k in range(warps)]]
+    vk = "+hose" if str(a.get("variant") or "warp") == "hose" else "+warp"      # (11-23) the world's variant kind, as build_env
+    names = [x for b in bases for x in [b] + [f"{b}{vk}{k}" for k in range(warps)]]
     return names + list(SR.scale_variants(bases, warps, a.get("track_scales")))
 
 

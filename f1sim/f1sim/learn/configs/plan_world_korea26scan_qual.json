@@ -32,7 +32,7 @@
  "eval": "",
  "eval_noise": 0,
  "eval_steps": 2400,
- "exam_bank": "/home/shchon11/f1sim_runs/prop_banks_exam1_korea26scan",
+ "exam_bank": "/home/shchon11/f1sim_runs/prop_banks_exam3_korea26scan",
  "gamma": 0.995,
  "geo_shaping": 0.0,
  "grad_diag": 0,
@@ -120,5 +120,6 @@
  "lidar_tilt": 0.01,
  "_note_own3": "11-18 user: '이런 특정 라인에 장애물이 몰려있으니 그 라인을 피해버리네' -> boxes on the policy's OWN empty-track line (plan_rl --line3-boxes: 3 pieces of the judged box2 bank a draw, one per third of the lap, within 0.4 m, weighted to the line); max3 = 3 pieces of a layout until a track's line is measured; no removal",
  "variant": "hose",
- "_note_korea26scan": "11-23 user: base = the map rebuilt from the bag (korea26_scan: 0827 11:57 fastest bag's /scan+/odom, hoses drawn again as one 10 cm band, +duct), variants = the hoses laid another way (+hose<k>, Track.with_hoses: 1-4 m sections 8-25 cm in/out, 15-25 % of each hose, as measured between the competition bags), boxes at the venue's measured sizes (real_boxes: 0.22-0.36 x 0.18-0.30 m), no racing line (contact_scale = the venue's 0.82, the bank's judge starts from the centerline)"
+ "_note_korea26scan": "11-23 user: base = the map rebuilt from the bag (korea26_scan: 0827 11:57 fastest bag's /scan+/odom, hoses drawn again as one 10 cm band, +duct), variants = the hoses laid another way (+hose<k>, Track.with_hoses: 1-4 m sections 8-25 cm in/out, 15-25 % of each hose, as measured between the competition bags), boxes at the venue's measured sizes (real_boxes: 0.22-0.36 x 0.18-0.30 m), no racing line (contact_scale = the venue's 0.82, the bank's judge starts from the centerline)",
+ "exam_name": "exam3"
 }

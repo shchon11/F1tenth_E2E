@@ -135,6 +135,10 @@ from f1sim import props as _props
 
 from world_of import world_path, exam_bank, map_name
 WORLD = world_path(ck)                                     # the world the checkpoint was trained in (11-14)
+if os.environ.get("F1SIM_EXAM_WORLD"):
+    # (11-23) another map's exam for this checkpoint: the references (qual26r, ...) trained on the old map, examined on the new
+    # bag-scan map (`configs/plan_world_korea26scan_qual.json`) so a new run there has its baseline
+    WORLD = os.path.abspath(os.environ["F1SIM_EXAM_WORLD"])
 BANK = exam_bank(WORLD)
 # (11-18, the user: "시험에서는 막 쭈르륵 장애물 깔지 말고, 빈 트랙에서 가는 길에 장애물을 그 근처에서 뽑히게", "맵당 한 대략 3개 씩?",
 # "좀 더 균일하고 라인쪽에 밀집되게", then "ㄱㅊ네" to the preview) count "line3" = exam2: the exam2 bank (exam_line_bank.py: 3 boxes a
@@ -142,7 +146,9 @@ BANK = exam_bank(WORLD)
 # race its own layout, in order -- drawn at random, 56 races from 56 layouts would repeat some and miss others
 LINE3 = count == "line3"
 if LINE3:
-    EXAM = "exam2"
+    # (11-23) a world names its own line exam ("exam3" = exam2's design on the bag-scan map with real-size boxes; its
+    # "exam_bank" is that bank itself, so the exam1 -> exam2 rename below does nothing there)
+    EXAM = str(json.load(open(WORLD)).get("exam_name") or "exam2")
     BANK = BANK.replace("prop_banks_exam1", "prop_banks_exam2")
     assert os.path.isdir(BANK), BANK
 a = argparse.Namespace(**json.load(open(WORLD)))
