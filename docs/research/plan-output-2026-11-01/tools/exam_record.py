@@ -156,6 +156,9 @@ if getattr(a, "stage", "race") != "race":
     # (11-17) a single-seat world (the qualifier, stage "props"): this record reads every car's opponent seat, so the exam runs
     # the same world as two-seat races with the seat left empty -- the ego meets and sees exactly what it trained in
     a.stage, a.opp_present = "race", 0.0
+    if getattr(a, "empty_seat", None):
+        # (11-23) the world names the empty seat's kind: one that drives without a race line ("ftg"), so the exam builds none
+        a.opp_slot = json.dumps({"kind": str(a.empty_seat), "kind_mix": [], "reactive": {}, "events": [], "event_rate": 0.0})
 a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only

@@ -61,6 +61,11 @@ def scale_variants(bases, warps, scales):
     return out
 
 
+#: (11-23) opponent kinds that drive without a race line (reactive gap followers, learned drivers): a race seat holding only
+#: these needs no `Raceline` (aurorus follows one; every teacher kind does)
+LINE_FREE_KINDS = ("ftg", "disparity", "tinylidarnet", "end2race", "policy", "self")
+
+
 def build_env(a, device, extra=None):
     # `--tracks` (11-01): the base maps, each with its --warps variants -- Korea alone left the plan teacher unable to
     # drive ICRA 2022 (laps 20-22 s, 26 wall touches a minute) or ICCAS (19 a minute) in the console
@@ -72,9 +77,14 @@ def build_env(a, device, extra=None):
     if os.environ.get("F1SIM_WORLD_TRACKS"):
         # measurement tools: the same world on exactly these tracks (e.g. the size variants of one band), nothing else changed
         tracks = [t.strip() for t in os.environ["F1SIM_WORLD_TRACKS"].split(",") if t.strip()]
-    # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument)
+    # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument).
+    # (11-23) Not when the race seat only holds kinds that drive without one (`empty_seat`: an exam of a solo world, the user:
+    # "레이싱라인을 왜 쳐 계산하는데")
     limits = common.teacher_limits(7.0, 6.5, 4.0)
-    trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race" or bool(getattr(a, "path_plan", 0))),
+    _os = json.loads(getattr(a, "opp_slot", "") or "{}") if a.stage == "race" else {}
+    seat = list(_os.get("kind_mix") or ([_os["kind"]] if _os.get("kind") else []))
+    no_line = bool(seat) and all(k in LINE_FREE_KINDS for k in seat)
+    trs, rls = common.load_tracks(tracks, racelines=((a.stage == "race" and not no_line) or bool(getattr(a, "path_plan", 0))),
                                   **dict(limits, objective="min_time"))
     cfg = Config()
     cfg.sim.compile = False

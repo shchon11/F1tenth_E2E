@@ -37,7 +37,12 @@ for UU in $(seq $U0 $STEP $U1); do
   done
   if [ -e $D/exam/$B.npz ]; then
     (source /home/shchon11/F1tenth_E2E/.venv/bin/activate; cd /home/shchon11/F1tenth_E2E/f1sim
-     { python3 -W ignore $T/exam_table.py $D/exam/$B.npz; python3 -W ignore $T/side_flip.py $D/exam/$B.npz; } > $D/analysis/${RUN}_u${UU}_${EX}.txt 2>&1)
+     # (11-23, the user: "평가도 장애물이 몇초전부터 보이는지에 따라서 충돌률 보이도록해") every exam also gets the box table
+     # (exam_boxes.py: hard hits by how long before passing the box came into view, ...) -> analysis/RUN_uU_boxes.txt, which the site
+     # shows per checkpoint; its by-visibility rows also go into the exam's own text
+     python3 -W ignore $T/exam_boxes.py $D/exam/$B.npz > $D/analysis/${RUN}_u${UU}_boxes.txt 2>&1
+     { python3 -W ignore $T/exam_table.py $D/exam/$B.npz; python3 -W ignore $T/side_flip.py $D/exam/$B.npz;
+       sed -n '/(나)/,/(다)/p' $D/analysis/${RUN}_u${UU}_boxes.txt | grep -v '(다)'; } > $D/analysis/${RUN}_u${UU}_${EX}.txt 2>&1)
     echo done > $D/analysis/${RUN}_u${UU}_${EX}.done
   fi
   echo "$(date +%T) $RUN u$UU $EX $([ -e $D/exam/$B.npz ] && echo 끝 || echo 실패)"
