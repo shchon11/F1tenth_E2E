@@ -3,7 +3,7 @@
 fork를 만드는 길(plan_rl.init_actor: trunk 첫 층에 예측 입력 열을 0으로 붙이고, 예측 머리의 스캔 encoder는 policy 것을 복사) 그대로
 부모 checkpoint에서 fork actor를 만들고, 경주 세계(상대 차 = 복사본, 배율 여러 가지 -> 예측 값이 실제로 움직이는 상황)에서 부모가 모는
 대로 달리며 결정마다 같은 입력(스캔 3장, 상태, 기억)을 두 actor에 넣어 출력(plan 평균 20개, 표준편차, 속도 짐작, 새 기억 상태)을 비교.
-인자: checkpoint [경주 수 8] [결정 수 60]
+인자: checkpoint [경주 수 8] [결정 수 60] [장치 cuda]
 """
 import os, sys, json
 os.environ["F1SIM_NO_STAGGER"] = "1"
@@ -14,7 +14,7 @@ torch.set_grad_enabled(False)
 ck_path = sys.argv[1]
 G = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 N = int(sys.argv[3]) if len(sys.argv) > 3 else 60
-dev = torch.device("cpu")
+dev = torch.device(sys.argv[4] if len(sys.argv) > 4 else "cuda")
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 from f1sim.learn.plan_policy import lidar_mount_of, load_actor2, Actor2, PlanObs2, plan_world, PT_IDX
 os.environ["F1SIM_LIDAR_MOUNT_X"] = str(lidar_mount_of(ck))
@@ -53,14 +53,14 @@ for t in range(N):
     x, y, _ = plan_world(p, st)
     so.plan()
     env.sim.ideal_vcap[lid] = 1e3
-    rs = torch.zeros(lid.numel(), dtype=torch.bool)
+    rs = torch.zeros(lid.numel(), dtype=torch.bool, device=dev)
     for j in range(PS.SUB):
         env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
         so.command(j)
         _, _, te, trc, _ = env.step(act0)
         so.stepped(te | trc); rs |= (te | trc)[lid]
     so.after()
-    ii = PT_IDX
+    ii = PT_IDX.to(dev)
     obs.push_scan(); obs.set_plan(torch.stack([x[:, ii], y[:, ii]], -1), p["pv"]); obs.set_plan2(p)
     if bool(rs.any()):
         r_ = torch.nonzero(rs)[:, 0]; obs.reset_rows(r_); hb[r_] = 0.0; hf[r_] = 0.0
