@@ -1,4 +1,5 @@
-"""(11-24, 경주 단계) 콘솔 3D 화면에 상대 차 예측 선이 그려지나 -- 화면 캡처 (QT_QPA_PLATFORM=offscreen).
+"""(11-24, 경주 단계) 콘솔 3D 화면에 상대 차 예측 선이 그려지나 -- 화면 캡처 (QT_QPA_PLATFORM=offscreen; GL은 DISPLAY의 GLX로,
+창은 띄우지 않음).
 
 콘솔과 같은 길로: 우리 차는 콘솔의 plan 주행기(PlanRunner, plan대로 정확히)가 몰고, 상대 차는 기준 policy 복사본(배율 0.6)이 몲, 5-15 m
 뒤에서 출발. 결정마다 PlanRunner가 남긴 예측(pred_w)을 보고, 예측이 '보임'이고 상대가 가까운 순간들에서 화면 한 장씩: 프레임은 콘솔
@@ -102,7 +103,8 @@ for k, (vp_, t_, g_, fr) in enumerate(pick):
         vp.update(); app.processEvents(); time.sleep(0.05)
     img = vp.grabFramebuffer()
     fn = f"{out}_{k}.png"
-    img.save(fn)
+    saved = (not img.isNull()) and img.save(fn)
+    print(f"  GL: {vp._gl_error if getattr(vp, '_gl_error', None) else 'ok'}, 화면 {img.width()}x{img.height()}, 저장 {saved}", flush=True)
     line = fr.get("drv", {}).get("lines", [None])[-1]
     print(f"화면 {fn}: {t_ * PS.DT:.1f} s, 경주 {g_}, 예측 '보임' {vp_:.2f}, 프레임 받음 {ok}, 예측 선 점 "
           f"{None if line is None else np.round(line['xy'][[0, -1]], 2).tolist()}, 상대 차 지금 "
