@@ -299,6 +299,17 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
         t = _load_base(base, bare=bare, **kw).with_scale(int(spec) / 100.0)
         t.name = name
         return t
+    if "+hose" in name:                                    # x+hose<seed>: the venue's duct hoses laid another way (11-23)
+        base, _, spec = name.rpartition("+hose")
+        if not spec.isdigit():
+            raise ValueError(f"+hose takes a seed: {name!r}")
+        t = _load_base(base, bare=bare, **kw).with_hoses(int(spec))
+        t.name = name
+        return t
+    if name.endswith("+duct"):                             # x+duct: the hoses drawn again where they are (stray pockets gone)
+        t = _load_base(name[:-len("+duct")], bare=bare, **kw).with_hoses(None)
+        t.name = name
+        return t
     if "+warp" in name:                                    # x+warp<seed>: the venue as rebuilt another day
         base, _, spec = name.rpartition("+warp")
         if not spec.isdigit():

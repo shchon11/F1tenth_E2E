@@ -192,6 +192,16 @@ BOX_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
     + [("wooden_crate", dict(width=w, depth=0.34, height=0.36)) for w in (0.30, 0.36, 0.42)]
 )
 
+#: Real-size boxes (11-23): the venue's objects in four bag scan maps (0826 02:59 / 19:28, 0827 11:16 / 11:57) measured
+#: 0.25-0.33 x 0.20-0.30 m, median about 0.29 x 0.23 -- a little long rather than square, and smaller than `BOX_SHAPES`
+#: (median 0.33); the user: "장애물 크기는 조금 다양하게 두자". Long side 0.22-0.36 m, short side 0.18-0.30 m around that
+#: median, one square. `shapes="real_boxes"` draws only these. Appended last so every bank's stored shape ids keep their
+#: meaning.
+REAL_BOX_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
+    ("cardboard_box", dict(width=w, depth=d, height=0.30))
+    for w, d in ((0.22, 0.18), (0.25, 0.20), (0.27, 0.22), (0.29, 0.23), (0.31, 0.25), (0.34, 0.27), (0.36, 0.30), (0.28, 0.28))
+)
+
 
 @dataclass(frozen=True)
 class Shape:
@@ -236,14 +246,16 @@ STYLE_MASS = {
 PROP_GROUND_DECEL = 4.9
 
 
-def build_catalogue(k_pad: int, box_ids: Optional[List[int]] = None) -> Tuple[List[Shape], List[int], List[int]]:
-    """Every shape, plus the indices of the row ladder (sorted by extent) and the small set; `box_ids`, when given, is
-    filled with the indices of `BOX_SHAPES`."""
+def build_catalogue(k_pad: int, box_ids: Optional[List[int]] = None,
+                    real_ids: Optional[List[int]] = None) -> Tuple[List[Shape], List[int], List[int]]:
+    """Every shape, plus the indices of the row ladder (sorted by extent) and the small set; `box_ids` / `real_ids`, when
+    given, are filled with the indices of `BOX_SHAPES` / `REAL_BOX_SHAPES`."""
     shapes: List[Shape] = []
     row_ids: List[int] = []
     small_ids: List[int] = []
     box_sink: List[int] = box_ids if box_ids is not None else []
-    for group, sink in ((ROW_SHAPES, row_ids), (SMALL_SHAPES, small_ids), (BOX_SHAPES, box_sink)):
+    real_sink: List[int] = real_ids if real_ids is not None else []
+    for group, sink in ((ROW_SHAPES, row_ids), (SMALL_SHAPES, small_ids), (BOX_SHAPES, box_sink), (REAL_BOX_SHAPES, real_sink)):
         for style, dims in group:
             prop = _props.build(style, seed=0, **dims)
             env = prop.envelope
@@ -262,7 +274,7 @@ def build_catalogue(k_pad: int, box_ids: Optional[List[int]] = None) -> Tuple[Li
 def catalogue_k_pad() -> int:
     """Widest footprint in the catalogue -- the padded half-plane count every slot pays for."""
     k = 3
-    for group in (ROW_SHAPES, SMALL_SHAPES, BOX_SHAPES):
+    for group in (ROW_SHAPES, SMALL_SHAPES, BOX_SHAPES, REAL_BOX_SHAPES):
         for style, dims in group:
             k = max(k, len(_props.build(style, seed=0, **dims).envelope.footprint))
     return k
@@ -383,7 +395,8 @@ class ProceduralObstacles:
             raise ValueError(f"track prop slots are padded to {k_pad} half-planes, the procedural "
                              f"catalogue needs {need}")
         box_ids: List[int] = []
-        shapes, row_ids, small_ids = build_catalogue(k_pad, box_ids)
+        real_ids: List[int] = []
+        shapes, row_ids, small_ids = build_catalogue(k_pad, box_ids, real_ids)
         self.shapes = shapes
         self.sh_n = torch.tensor(np.stack([s.n for s in shapes]), dtype=torch.float32, device=dev)
         self.sh_d = torch.tensor(np.stack([s.d for s in shapes]), dtype=torch.float32, device=dev)
@@ -399,11 +412,13 @@ class ProceduralObstacles:
         self.line_pool = torch.cat([self.row_id, self.small_id]).unique()
         #: "all": the row and small pieces (every run before 11-06); "boxes": `BOX_SHAPES` only (`_redraw_uniform`, the line
         #: pieces and every layout a bank made with it)
-        if shape_set not in ("all", "boxes"):
-            raise ValueError(f"procedural shapes must be 'all' or 'boxes', got {shape_set!r}")
+        if shape_set not in ("all", "boxes", "real_boxes"):
+            raise ValueError(f"procedural shapes must be 'all', 'boxes' or 'real_boxes', got {shape_set!r}")
         self.shape_set = shape_set
         if shape_set == "boxes":
             self.line_pool = torch.tensor(box_ids, dtype=torch.long, device=dev)
+        elif shape_set == "real_boxes":                      # (11-23) the venue's measured sizes, varied
+            self.line_pool = torch.tensor(real_ids, dtype=torch.long, device=dev)
 
         self.N = int(tracks.n_cl)
         self._build_track_geometry()

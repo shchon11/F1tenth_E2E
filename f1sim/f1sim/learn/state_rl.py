@@ -65,7 +65,9 @@ def build_env(a, device, extra=None):
     # `--tracks` (11-01): the base maps, each with its --warps variants -- Korea alone left the plan teacher unable to
     # drive ICRA 2022 (laps 20-22 s, 26 wall touches a minute) or ICCAS (19 a minute) in the console
     bases = [t.strip() for t in str(getattr(a, "tracks", "") or KOREA).split(",") if t.strip()]
-    tracks = [x for b in bases for x in [b] + ([f"{b}+warp{k}" for k in range(int(a.warps))] if a.warps else [])]
+    # (11-23) `variant` "hose": the venue's duct hoses laid another way (`Track.with_hoses`) instead of the old `+warp` edits
+    vk = "+hose" if str(getattr(a, "variant", "") or "warp") == "hose" else "+warp"
+    tracks = [x for b in bases for x in [b] + ([f"{b}{vk}{k}" for k in range(int(a.warps))] if a.warps else [])]
     tracks += scale_variants(bases, int(a.warps or 0), getattr(a, "track_scales", None))
     if os.environ.get("F1SIM_WORLD_TRACKS"):
         # measurement tools: the same world on exactly these tracks (e.g. the size variants of one band), nothing else changed

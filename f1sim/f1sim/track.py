@@ -492,6 +492,125 @@ class Track:
         t.warp_parent, t.warp_scale, t.warp_center = self, sc, (cx, cy)
         return t
 
+    def with_hoses(self, seed: Optional[int] = 0, frac=(0.15, 0.25), run=(1.0, 4.0), amp=(0.08, 0.25),
+                   amp_max: float = 0.30, min_radius: float = 0.30, hose: Optional[float] = None,
+                   min_half: float = 0.55, tries: int = 20) -> "Track":
+        """The same venue with its duct hoses laid a little differently (2026-11-23, the user: "결국에는 덕트 파이프잖아.
+        덕트 파이프를 물리적으로 조금씩 변형한다는 생각을 좀 해봐바"). `seed` None: the hoses re-laid exactly where they are.
+
+        The lane's boundary IS the hose: each closed boundary loop of the drivable region (the outer hose, each infield
+        hose) is moved along its normal by a few smooth humps -- a 1-4 m section of hose lying 8-25 cm (at most 30 cm) in or
+        out, 15-25 % of its length per variant, measured between the competition bags (scan maps of 0826 02:59 / 19:28 and
+        0827 11:16 against 0827 11:57: sections of 0.8-4.1 m, 9-18 cm median, 12-36 cm peak, 14-26 % of the walls beyond the
+        maps' 4-5 cm noise). Each hump is a Tukey window long enough that the hose never bends tighter than `min_radius`.
+        The hose is then drawn again as a band `hose` m thick (default: the map's own, from its duct cells) right behind
+        the new boundary, and everything that was hose or a stray pocket behind it becomes the keep-out floor -- so there
+        is never a second wall or a notch, which the old `with_warp` left (its moved walls kept the old shell behind a
+        sliver of floor). Walls that are not hose (tall) never move. A variant whose lane gets narrower than `min_half`
+        per side at the centerline, or splits, is drawn again (`tries`). No change of size: a hose does not stretch."""
+        from skimage.measure import find_contours
+        from skimage.draw import polygon as draw_polygon
+        if self.centerline is None:
+            raise ValueError("a hose variant needs a centerline")
+        res = float(self.resolution)
+        P = int(np.ceil(1.0 / res))
+        occ0 = np.pad(np.asarray(self.occupancy, bool), P, constant_values=True)
+        duct0 = np.pad(self.duct, P, constant_values=False) if self.duct is not None else occ0.copy()
+        tall0 = np.pad(self.tall, P, constant_values=False) if self.tall is not None else np.zeros_like(occ0)
+        org0 = (self.origin[0] - P * res, self.origin[1] - P * res)
+        H, W = occ0.shape
+        cl = np.asarray(self.centerline, float)
+        cj = np.clip(((cl[:, 0] - org0[0]) / res).astype(int), 0, W - 1)
+        ci = np.clip(((cl[:, 1] - org0[1]) / res).astype(int), 0, H - 1)
+        lab, _ = ndimage.label(~occ0)
+        drive0 = np.isin(lab, np.unique(lab[ci, cj]))
+        if hose is None:                                       # the map's hose thickness: twice the depth at its skeleton
+            from skimage.morphology import skeletonize
+            sk = skeletonize(duct0)
+            hose = float(np.median(2.0 * ndimage.distance_transform_edt(duct0)[sk] * res)) if sk.any() else 0.10
+        hose = max(hose, res)
+        loops = []
+        for c in find_contours(drive0.astype(float), 0.5):
+            if len(c) < 8:
+                continue
+            xy = np.stack([org0[0] + (c[:, 1] + 0.5) * res, org0[1] + (c[:, 0] + 0.5) * res], 1)
+            seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+            if seg.sum() < 1.0:                                # a pocket of floor in the lane: noise
+                continue
+            loops.append(xy)
+        tallnear = ndimage.binary_dilation(tall0, iterations=2)
+        dpt = lambda q: (np.clip(((q[:, 1] - org0[1]) / res).astype(int), 0, H - 1),
+                         np.clip(((q[:, 0] - org0[0]) / res).astype(int), 0, W - 1))
+
+        def offsets(xy, rng):
+            """the hose's normal offset along one loop [m], > 0 = the lane gets wider there"""
+            seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+            s = np.concatenate([[0.0], np.cumsum(seg)]); L = s[-1]
+            off = np.zeros(len(xy))
+            if seed is None:
+                return off
+            want = rng.uniform(*frac) * L; used = 0.0; taken = []
+            for _ in range(200):
+                if used >= want:
+                    break
+                a = float(np.clip(rng.uniform(*amp), 0.0, amp_max)) * rng.choice([-1.0, 1.0])
+                taper = np.sqrt(np.pi ** 2 * abs(a) * min_radius / 2.0)   # the cosine taper bending no tighter than min_radius
+                ln = rng.uniform(max(run[0], 2.0 * taper), max(run[1], 2.0 * taper))
+                s0 = rng.uniform(0.0, L)
+                if any(abs(((s0 - t0 + L / 2) % L) - L / 2) < (ln + l0) / 2 + 0.3 for t0, l0 in taken):
+                    continue                                   # sections apart, so one hose moves one way per stretch
+                taken.append((s0, ln)); used += ln
+                u = ((s - s0 + L / 2) % L) - L / 2 + ln / 2    # 0 .. ln across the section
+                w = np.zeros_like(s)
+                inside = (u >= 0) & (u <= ln)
+                rise = np.clip(u / taper, 0, 1); fall = np.clip((ln - u) / taper, 0, 1)
+                w[inside] = (0.5 - 0.5 * np.cos(np.pi * np.minimum(rise, fall)))[inside]
+                off += a * w
+            return off
+
+        base = np.random.default_rng(0 if seed is None else int(seed) + 31337)
+        for attempt in range(max(1, int(tries))):
+            rng = np.random.default_rng(base.integers(1 << 31))
+            rings = []
+            for xy in loops:
+                tg = np.gradient(xy, axis=0); tg /= np.linalg.norm(tg, axis=1, keepdims=True) + 1e-12
+                nrm = np.stack([tg[:, 1], -tg[:, 0]], 1)
+                r_, c_ = dpt(xy + 0.75 * res * nrm)
+                if drive0[r_, c_].mean() > 0.5:                # point the normal away from the lane
+                    nrm = -nrm
+                off = offsets(xy, rng)
+                r_, c_ = dpt(xy + 2.0 * res * nrm)
+                off[tallnear[r_, c_]] = 0.0                     # a tall wall never moves
+                rings.append(xy + off[:, None] * nrm)
+            areas = [abs(0.5 * np.sum(q[:, 0] * np.roll(q[:, 1], -1) - np.roll(q[:, 0], -1) * q[:, 1])) for q in rings]
+            lane = np.zeros((H, W), bool)
+            for k in np.argsort(areas)[::-1]:                   # the outer loop first, the infields cut out of it
+                q = rings[k]
+                rr, cc = draw_polygon((q[:, 1] - org0[1]) / res - 0.5, (q[:, 0] - org0[0]) / res - 0.5, shape=(H, W))
+                if k == int(np.argmax(areas)):
+                    lane[rr, cc] = True
+                else:
+                    lane[rr, cc] = False
+            lab2, _ = ndimage.label(lane)
+            keep = np.unique(lab2[ci, cj]); keep = keep[keep > 0]
+            lane = np.isin(lab2, keep)
+            edt_l = ndimage.distance_transform_edt(lane) * res
+            ok = len(keep) == 1 and float(edt_l[ci, cj].min()) >= min_half
+            if ok or seed is None:
+                break
+        band = ndimage.distance_transform_edt(~lane) * res
+        hose_band = (~lane) & (band <= hose) & ~tall0
+        occ = ~lane
+        duct = hose_band
+        tall = tall0 & ~lane & ~hose_band
+        t = Track.from_occupancy(occ, res, org0, None, f"{self.name}_hose{seed}", duct=duct, tall=tall,
+                                 duct_height=self.duct_height)
+        area_cl = 0.5 * np.sum(cl[:, 0] * np.roll(cl[:, 1], -1) - np.roll(cl[:, 0], -1) * cl[:, 1])
+        t.centerline_from_free_space(min_clearance=0.35, seed_xy=tuple(cl[0]), direction="ccw" if area_cl > 0 else "cw")
+        t.hose_attempts = attempt + 1
+        t.warp_parent, t.warp_scale, t.warp_center = self, 1.0, (org0[0] + W * res / 2, org0[1] + H * res / 2)
+        return t
+
     def with_scale(self, sc: float) -> "Track":
         """The same venue built `sc` times as big (2026-11-12, the user: "트랙 변형도 스케일 자체가 변하는것도"): lane
         width, corner radius and lap length all times `sc`, about the grid's centre. `with_warp` moves the size by a few per

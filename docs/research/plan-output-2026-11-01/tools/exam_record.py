@@ -243,6 +243,7 @@ ROLL = (bool(ck["args"].get("plan_roll", False)) or bool(ck["args"].get("roll_gr
         or os.environ.get("F1SIM_EXAM_ROLL") == "1")   # =1: any v2 checkpoint, rolled
 # (11-22) --roll-grow: the steps a rolling decision kept when this checkpoint was saved (--plan-roll: 9)
 ROLL_C = int(ck.get("roll_c", PS.N_STEP - 1)) if ck["args"].get("roll_grow", False) else PS.N_STEP - 1
+ROLL_C = int(os.environ.get("F1SIM_EXAM_ROLL_C", ROLL_C))     # (11-23) drive a rolling checkpoint with another commitment
 # (11-23) --roll-replan-seen: a whole new plan also when the committed path runs into a wall / box in view or known now
 REPLAN_SEEN = bool(ck["args"].get("roll_replan_seen", False)) or os.environ.get("F1SIM_EXAM_REPLAN_SEEN") == "1"
 if ROLL:

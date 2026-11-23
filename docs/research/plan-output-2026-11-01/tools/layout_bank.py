@@ -49,8 +49,14 @@ if os.environ.get("BANK_TRACKS"):
 env = SR.build_env(a, dev)
 proc = env.procedural
 names = getattr(env, "_track_names", None) or [SR.KOREA]
-_, rls = SR.common.load_tracks(names, racelines=True, **dict(SR.common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
 tracks = env.sim.track.tracks
+if os.environ.get("BANK_LINE", "") == "centerline":
+    # 11-23 (the user: "레이싱라인은 왜만들지?"): the judge's line search only reads its start line's points, so it starts from
+    # the lane's centerline -- no racing line is built for a map that races solo
+    from types import SimpleNamespace
+    rls = [SimpleNamespace(xy=np.asarray(t_.centerline, float)) for t_ in tracks]
+else:
+    _, rls = SR.common.load_tracks(names, racelines=True, **dict(SR.common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
 T = len(tracks)
 assert len(rls) == T, (len(rls), T)
 builders = [LL.LayoutLines(tracks[i], rls[i], dev, veh_width=float(env.cfg.vehicle.width), vehicle=env.cfg.vehicle, iters=iters)
