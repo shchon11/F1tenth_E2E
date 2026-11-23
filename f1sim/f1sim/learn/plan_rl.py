@@ -811,6 +811,10 @@ def main(argv=None):
     ap.add_argument("--roll-grow-done", type=int, default=None,
                     help="resuming a --roll-grow run that already passed 9 (with --roll-grow-start 9): the update it did, so the "
                          "shaping stays faded out from there instead of coming back on")
+    ap.add_argument("--roll-grow-max", type=int, default=None,
+                    help="(11-23) the steps kept at most (default 9 = --plan-roll's 0.9 s); with --roll-grow-start the same "
+                         "number, a run resumed from a longer commitment stays at this one. Why: grow30c (0.9 s) crept through "
+                         "the bottom U-turn exit at 2.5 m/s (qual26r 7.15): 3.4-4.3 m of road in view there, 0.9 s at 7 m/s is 6.3 m")
     ap.add_argument("--roll-grow-dwell", type=int, default=3)
     ap.add_argument("--roll-grow-keep", type=float, default=0.95)
     ap.add_argument("--roll-grow-fade", type=int, default=50)
@@ -2632,7 +2636,7 @@ def main(argv=None):
             if args.dist_rank == 0 and len(grow_hist) >= max(3, args.roll_grow_dwell):
                 now_ = sum(grow_hist[-3:]) / 3.0
                 if grow_ref is None or now_ >= args.roll_grow_keep * grow_ref:
-                    if grow_c < PS.N_STEP - 1:
+                    if grow_c < (PS.N_STEP - 1 if args.roll_grow_max is None else args.roll_grow_max):
                         adv_ = 1
                     elif grow_done is None:
                         fin_ = 1
@@ -2663,7 +2667,7 @@ def main(argv=None):
                       f"[확정 길이] {grow_c * PS.DT:.1f} s로 늘림 (u{upd})", flush=True)
             if fin_:
                 grow_done = upd
-                print(f"[확정 길이] 0.9 s에서 회복 (u{upd}): 전진 보상을 {args.roll_grow_fade} update에 걸쳐 끔", flush=True)
+                print(f"[확정 길이] {grow_c * PS.DT:.1f} s에서 회복 (u{upd}): 전진 보상을 {args.roll_grow_fade} update에 걸쳐 끔", flush=True)
         if drv.opp is not None and upd >= max(args.self_opp_from, 1) and (upd - args.self_opp_from) % args.self_opp_every == 0:
             drv.opp.add(actor, upd)
 
