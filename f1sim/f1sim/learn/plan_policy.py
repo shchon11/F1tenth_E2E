@@ -313,6 +313,11 @@ class PlanRunner:
         self.last_ep = env.ep_step[self.lid].clone()
         self.session = None
         self.last_mean = None
+        # (11-24) a `pred_opp` policy's prediction of the other car, per learner row: the 10 points in the world (x, y
+        # interleaved) and P(visible) last -- the console draws it (`pred_row`); None for a policy without the head
+        self.pred_w = (torch.zeros(Bl, PRED_OUT, device=device)
+                       if getattr(getattr(self, "actor", None), "pred_opp", False) else None)
+        self._row_of = {int(r): k for k, r in enumerate(self.lid.tolist())}
         # mode "track" (11-09, the user: "얼추 여기에 맞는 제어기 좀 만들어놔"): full physics, `plan_follow.PlanFollower` follows
         # the plan in time (actuator lags inverted), its command goes in through the env's external-command path
         self.follower = None
@@ -340,6 +345,10 @@ class PlanRunner:
                                         **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"),
                                                    [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
             env.claim_external(self.lid)
+
+    def pred_row(self, env_row: int) -> int:
+        """the learner index of env row `env_row` (-1: not a learner car) -- the console's frame reads `pred_w[k]`"""
+        return self._row_of.get(int(env_row), -1)
 
     def _roll_check(self, due: torch.Tensor) -> None:
         """--plan-roll, deciding rows: the known boxes and the scanner now; a contact since the row's last decision or the
@@ -439,6 +448,14 @@ class PlanRunner:
                 if self.roll:
                     self._roll_check(due)
                 u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                if self.pred_w is not None and self.actor.pred_out is not None:
+                    # the other car's predicted next second, from the pose this decision is made at, in the world
+                    pts, pv = pred_points(self.actor.pred_out.float())
+                    c_, s_ = torch.cos(st[:, dyn.IYAW])[:, None], torch.sin(st[:, dyn.IYAW])[:, None]
+                    wx = st[:, 0:1] + pts[..., 0] * c_ - pts[..., 1] * s_
+                    wy = st[:, 1:2] + pts[..., 0] * s_ + pts[..., 1] * c_
+                    new = torch.cat([torch.stack([wx, wy], -1).reshape(-1, 2 * PRED_N), pv[:, None]], 1)
+                    self.pred_w = torch.where(due[:, None], new.to(self.pred_w.dtype), self.pred_w)
                 if self.roll:
                     p = self._roll_plan(due, u_, v_hat)
                 if h_old is not None and getattr(self.actor, "memory", 0):
@@ -509,6 +526,34 @@ class PlanRunner:
 STATE_DIM2 = 6 + 2 + 2 * (PS.N_STEP - 1) + PS.N_STEP
 FORMAT2 = "plan_steps2"
 
+# (11-24, the race phase agreed with the user) where the nearest other car will be: 10 points 0.1 .. 1.0 s ahead, in the
+# car's frame at the decision, [m] / PRED_SCALE, and a 'visible' logit -- from the policy's own inputs only
+PRED_N = PS.N_STEP
+PRED_SCALE = 5.0
+PRED_OUT = 2 * PRED_N + 1                 # x0, y0, ..., x9, y9, visible
+PRED_IN = 1 + 2 * PRED_N                  # what the trunk reads: P(visible), then the points x P(visible)
+
+
+class OppPredictor(nn.Module):
+    """`Actor2.pred` (plan_rl --pred-opp): the nearest other car's next 1 s from what the policy itself reads -- the LiDAR
+    stack (through an encoder of its own, started as a copy of the policy's), the normalised state and the memory's state
+    (both detached). Taught by a supervised loss with its own optimizer; nothing of the policy's loss reaches it, and the
+    policy reads its answer detached (`Actor2.pred_feed`)."""
+
+    def __init__(self, beams: int, state_dim: int, memory: int, hidden: int = 256):
+        super().__init__()
+        self.enc = ScanEncoder(beams)
+        self.mlp = nn.Sequential(nn.Linear(256 + state_dim + memory, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh(),
+                                 nn.Linear(hidden, PRED_OUT))
+
+    def forward(self, scans: torch.Tensor, state_n: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        return self.mlp(torch.cat([self.enc(scans), state_n.detach(), h.detach()], 1))
+
+
+def pred_points(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """a prediction (n, PRED_OUT) -> (points (n, PRED_N, 2) [m] in the car's frame at the decision, P(visible) (n,))"""
+    return q[:, :2 * PRED_N].reshape(-1, PRED_N, 2) * PRED_SCALE, torch.sigmoid(q[:, -1])
+
 
 class Actor2(nn.Module):
     """v2: a trunk, the plan's Gaussian mean (20) and a speed estimate [m/s].
@@ -568,7 +613,8 @@ class Actor2(nn.Module):
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
                  mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
-                 pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = ""):
+                 pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = "",
+                 pred_opp: bool = False):
         super().__init__()
         self.branches = int(branches)
         # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
@@ -605,8 +651,21 @@ class Actor2(nn.Module):
         if self.aux_in and not (self.box_memory and int(aux_dim) >= self.AUX_IN_SLOTS * self.AUX_IN_KEYS):
             raise ValueError("aux_in needs box_memory and the boxes' read-out (aux_dim)")
         n_ai = self.AUX_IN_SLOTS * self.AUX_IN_KEYS if self.aux_in else 0
-        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai) if self.mem_front else 0), hidden), nn.Tanh(),
+        # (11-24) `pred_opp`: the other car's predicted next second (`OppPredictor`), read by the trunk detached, its columns
+        # last and zero at the start -- a policy given the head drives exactly as it did without it
+        self.pred_opp = bool(pred_opp)
+        if self.pred_opp and not self.mem_front:
+            raise ValueError("pred_opp needs memory with mem_front")
+        n_pr = PRED_IN if self.pred_opp else 0
+        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai + n_pr) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
+        self.pred = None
+        self.pred_out = None
+        if self.pred_opp:
+            self.pred = OppPredictor(beams, sd, int(memory) + self.box_memory, hidden)
+            with torch.no_grad():
+                self.trunk[0].weight[:, -n_pr:] = 0.0
+                self.pred.enc.load_state_dict(self.enc.state_dict())
         self.pi = nn.Linear(hidden, self.branches * PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
         if self.branches == 2:
@@ -705,9 +764,28 @@ class Actor2(nn.Module):
         p = torch.sigmoid(a[..., :1])
         return torch.cat([p, a[..., 1:] * p], -1).reshape(-1, k * n)
 
-    def mem_trunk(self, f: torch.Tensor, hs: torch.Tensor) -> torch.Tensor:
-        """`mem_front`: the trunk on the inputs and the memory's state (and its answer with `aux_in`)"""
-        return self.trunk(torch.cat([f, hs, self.aux_feed(hs)] if self.aux_in else [f, hs], 1))
+    def mem_trunk(self, f: torch.Tensor, hs: torch.Tensor, pin: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`mem_front`: the trunk on the inputs and the memory's state (and its answer with `aux_in`; `pin`: the other car's
+        prediction as `pred_feed` gives it, with `pred_opp`)"""
+        x = [f, hs, self.aux_feed(hs)] if self.aux_in else [f, hs]
+        if self.pred_opp:
+            if pin is None:
+                raise ValueError("a pred_opp actor's trunk reads the prediction: pass pin (pred_feed(pred_q(...)))")
+            x = x + [pin]
+        return self.trunk(torch.cat(x, 1))
+
+    def pred_q(self, scans: torch.Tensor, f: torch.Tensor, hs: torch.Tensor) -> torch.Tensor:
+        """`pred_opp`: the raw prediction (n, PRED_OUT) from the scans, the features `f` (their normalised-state part) and
+        the memory's state `hs` -- the head's own weights only carry a gradient"""
+        return self.pred(scans, f[:, 256:], hs)
+
+    @staticmethod
+    def pred_feed(q: torch.Tensor) -> torch.Tensor:
+        """what the trunk reads of a prediction, detached: P(visible), then the points x P(visible) (a car not there reads
+        zeros)"""
+        q = q.detach()
+        p = torch.sigmoid(q[:, -1:])
+        return torch.cat([p, q[:, :-1] * p], 1)
 
     def vmem_read(self, hs: torch.Tensor) -> torch.Tensor:
         """the value read-out: of the first GRU's part"""
@@ -729,19 +807,30 @@ class Actor2(nn.Module):
             hs.append(h)
         return torch.cat(hs, 0)
 
-    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor]):
-        """one decision of the memory: (features with the memory added, the new state)"""
+    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor], scans: Optional[torch.Tensor] = None):
+        """one decision of the memory: (features with the memory added, the new state). A `pred_opp` actor also needs the
+        `scans` (its prediction, left in `pred_out`)"""
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
         h1 = self.mem_cell(f, h0)
         if self.mem_front:
-            return self.mem_trunk(f, h1), h1
+            pin = None
+            if self.pred_opp:
+                if scans is None:
+                    raise ValueError("a pred_opp actor's memory step needs the scans (its prediction reads them)")
+                self.pred_out = self.pred_q(scans, f, h1)
+                pin = self.pred_feed(self.pred_out)
+            return self.mem_trunk(f, h1, pin), h1
         return f + self.mem_out(h1), h1
 
     def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None):
         f = self.features(scans, state)
         if self.memory:
-            f, self.h_out = self.remember(f, h)
+            f, self.h_out = self.remember(f, h, scans)
         return self.heads(f)
+
+    def policy_parameters(self):
+        """every weight but the prediction head's (`pred_opp`: it has its own optimizer and no policy gradient)"""
+        return [p for n, p in self.named_parameters() if not n.startswith("pred.")]
 
 
 class PlanObs2(PlanObs):
@@ -841,7 +930,8 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    aux_in=bool(ck["args"].get("mem_aux_in", False)),
                    pace_caps=str(ck["args"].get("pace_caps", "") or ""), pace_hold=int(ck["args"].get("pace_hold", 10) or 10),
                    pace_floor=float(ck["args"].get("pace_floor", 0.05) or 0.05),
-                   line_shifts=str(ck["args"].get("line_shifts", "") or "")).to(device)
+                   line_shifts=str(ck["args"].get("line_shifts", "") or ""),
+                   pred_opp=any(k.startswith("pred.") for k in ck["actor"])).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

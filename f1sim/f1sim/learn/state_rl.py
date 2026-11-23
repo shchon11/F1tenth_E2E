@@ -136,6 +136,12 @@ def build_env(a, device, extra=None):
         slot.update(json.loads(getattr(a, "opp_slot", "") or "{}"))          # `--opp-slot`: a stage's opponents
         from .. import opponent_slots as opp_sl
         e.update(race_size=2, opponent="slots", opponent_slots=opp_sl.parse_slots(json.dumps([slot])))
+        # (11-24, the race phase) a world's own grid: the arc gap to the car ahead [m] and the share of races started half a
+        # lap apart (`EnvConfig.spawn_half_lap`); a world without them keeps the env's defaults
+        if getattr(a, "spawn_gap", None):
+            e["spawn_gap"] = tuple(float(x) for x in a.spawn_gap)
+        if float(getattr(a, "spawn_half_lap", 0.0) or 0.0) > 0:
+            e["spawn_half_lap"] = float(a.spawn_half_lap)
     e.update(plan_env_fields(a))
     e.update(extra or {})
     env = common.make_env(trs, int(a.envs), device, EnvConfig(**e), cfg=cfg, seed=int(a.seed), rls=rls,

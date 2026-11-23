@@ -2156,6 +2156,14 @@ class SimWorker:
             if env.tracker.last_pred is not None:
                 plan_pred = env.tracker.last_pred[focus]
                 pieces.append(plan_pred.reshape(-1))
+        # (11-24) a policy that predicts the other car (`Actor2.pred_opp`): its predicted next second, in the same single copy
+        opp_pred = None
+        _runner = session.get("act_fn")
+        if session["mode"] == "plan" and self._overlay.get("plan", True) and getattr(_runner, "pred_w", None) is not None:
+            _k = _runner.pred_row(focus)
+            if _k >= 0:
+                opp_pred = _runner.pred_w[_k]
+                pieces.append(opp_pred.reshape(-1).to(pack.dtype))
         proc = env.procedural
         if proc is not None:
             # The layout the focus car is driving through -- its race's set: the cars of a race share
@@ -2211,6 +2219,16 @@ class SimWorker:
             except Exception as exc:
                 self._viz_failure(session, exc)
                 plan_w = drv_fr = None
+        if opp_pred is not None:
+            nq = int(opp_pred.numel())
+            q_ = flat[i:i + nq]; i += nq
+            if float(q_[-1]) >= 0.5:
+                # drawn while the prediction says the car is there: magenta, apart from the plan's speed colours
+                pred_line = {"xy": _copy(q_[:-1]).reshape(-1, 2).astype(np.float32), "rgba": (1.0, 0.2, 0.85, 0.95), "w": 3.0}
+                pred_pts = {"xy": _copy(q_[:-1]).reshape(-1, 2).astype(np.float32), "rgba": (1.0, 0.2, 0.85, 1.0), "px": 5.0}
+                drv_fr = dict(drv_fr or {})
+                drv_fr["lines"] = list(drv_fr.get("lines") or []) + [pred_line]
+                drv_fr["points"] = list(drv_fr.get("points") or []) + [pred_pts]
         props_dyn = None
         if proc is not None:
             blk = flat[i:i + 4 * int(proc.C)].reshape(-1, 4); i += 4 * int(proc.C)

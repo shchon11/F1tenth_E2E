@@ -698,6 +698,10 @@ class EnvConfig:
     #: episodes), and in a 10-s drive 12 of 160 learner episodes began with a contact on step 0, all
     #: charged to the learner (0 of 158 laid out as one).
     spawn_as_race: bool = True
+    #: (11-24, the race phase; the user's 1v1 events started the two cars on opposite sides of the lap) the share of
+    #: slot-mode races laid out with the cars spread evenly round the lap -- half a lap apart in a 1v1 -- instead of
+    #: `spawn_gap`. Drawn per race at a whole-race reset (`F1VecEnv.half_lap_race`); 0 = never, and nothing is drawn
+    spawn_half_lap: float = 0.0
     spawn_alongside_gap: tuple = (0.0, 0.2)   # [m] arc stagger inside an alongside grid, drawn
                                      # independently per car. Small on purpose: the lateral offsets
                                      # of a grid are measured along the centerline normal at each
@@ -1138,6 +1142,11 @@ class F1VecEnv:
         self.spawn_order_race = torch.zeros(self.B, dtype=torch.long, device=self.device)
         #: (B,) whether each car was placed in an abreast row at its last reset (`_note_spawn_formation`).
         self.spawn_abreast = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: (G,) the race was laid out half a lap apart at its last whole reset (`EnvConfig.spawn_half_lap`)
+        self.half_lap_race = torch.zeros(self.B // max(self.M, 1), dtype=torch.bool, device=self.device)
+        #: (G,) [m] or None: a fixed arc gap between the leader and the car behind it per race, used instead of the
+        #: drawn one at the next whole-race reset (NaN = drawn as usual) -- a frozen exam's own conditions (exam4)
+        self.spawn_gap_race = None
         self._present_mask_gaps = getattr(self, "_present_p", None) is not None
         #: The observation the policy last saw, which is the one a pool opponent acts on: the pool
         #: is asked for its action at the top of `step()`, before any new observation exists.
@@ -1450,11 +1459,13 @@ class F1VecEnv:
                 self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device, grip=e.learner_plan == "tw5g")
             self._tw_amax = None                            # tw5g: (G, V) steady-state lateral acceleration of MAP's table
 
-    def enable_ideal(self, lag: bool = False, turn=None) -> None:
+    def enable_ideal(self, lag: bool = False, turn=None, learner: bool = True) -> None:
         """Ideal execution for the learner's rows (11-07 redesign): set `ideal_cmd` (B, 2) -- steering [rad], speed [m/s,
         signed] -- before every `step` and the rows drive exactly that (`Sim.ideal_rows`), contacts resolved as usual.
-        Before the first step / graph capture: the roll reads the flag when it is compiled."""
-        self.sim.ideal_rows = self.learner.clone()
+        Before the first step / graph capture: the roll reads the flag when it is compiled. `learner` False (11-24, an exam
+        whose learner MAP drives): only the `ideal_extra` rows drive exactly (a frozen copy of the policy as the other car)"""
+        self.ideal_learner = bool(learner)
+        self.sim.ideal_rows = self.learner.clone() if learner else torch.zeros_like(self.learner)
         self.ideal_cmd = torch.zeros(self.B, 2, device=self.device)
         # other cars that drive `ideal_cmd` too (B,) bool, e.g. the ones a frozen copy of the policy plans for
         # (`plan_rl.SelfOpponents`); their scripted driver's command is then not used. None = the learner's rows only
@@ -1867,6 +1878,14 @@ class F1VecEnv:
         gap_rank = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(
             G, M, device=self.device, generator=gen)
         gap_rank[:, 0] = 0.0                                             # the leader has nobody ahead
+        if e.spawn_half_lap > 0:
+            # (11-24) opposite sides of the lap, per race: every gap a lap / M (half a lap in a 1v1)
+            half = torch.rand(G, device=self.device, generator=gen) < e.spawn_half_lap
+            self.half_lap_race.copy_(torch.where(full, half, self.half_lap_race))
+            gap_rank[:, 1:] = torch.where(self.half_lap_race[:, None], (L_race / M)[:, None], gap_rank[:, 1:])
+        if self.spawn_gap_race is not None:
+            ov = self.spawn_gap_race.to(gap_rank.dtype)[:, None]
+            gap_rank[:, 1:] = torch.where(torch.isfinite(ov), ov.expand(-1, M - 1), gap_rank[:, 1:])
         stagger = e.spawn_alongside_gap[0] + (e.spawn_alongside_gap[1] - e.spawn_alongside_gap[0]) \
             * torch.rand(G, M, device=self.device, generator=gen)
         s_rank = base[:, None] * L_race[:, None] - gap_rank.cumsum(1)    # (G, M) arc of each rank
@@ -3347,6 +3366,8 @@ class F1VecEnv:
             # ideal execution (`enable_ideal`, 11-07 redesign): the learner's rows drive the command they were handed
             # exactly (`Sim.ideal_rows`); whatever the tracker made of their action is not used
             m_i = self.learner if getattr(self, "ideal_extra", None) is None else (self.learner | self.ideal_extra)
+            if not getattr(self, "ideal_learner", True):
+                m_i = (torch.zeros_like(self.learner) if getattr(self, "ideal_extra", None) is None else self.ideal_extra)
             self.sim.ideal_rows.copy_(m_i)
             cmd = torch.where(m_i[:, None], self.ideal_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max

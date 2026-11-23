@@ -33,7 +33,13 @@ F1SIM_EXAM_START_REST=1 (11-12, 대회 규칙의 출발을 따로 보는 기록)
 30 cm 떨어져 나란히 세움 -> `F1SIM_EXAM_OPP_SLOT='{"spawn": "alongside"}'`(상대 차 종류·속도는 그대로, 배치만 나란히)와 같이 씀.
 기록의 start_rest에 남김.
 F1SIM_EXAM_HALF_LAP=1 (11-12, 사용자가 나간 대회의 1대1 출발): 상대 차를 반 바퀴 떨어진 반대쪽에 세움(spawn_gap = 트랙 길이의 절반).
-`F1SIM_EXAM_OPP_SLOT='{"spawn": "ahead"}'` + F1SIM_EXAM_START_REST=1과 같이 씀. 기록의 half_lap에 남김."""
+`F1SIM_EXAM_OPP_SLOT='{"spawn": "ahead"}'` + F1SIM_EXAM_START_REST=1과 같이 씀. 기록의 half_lap에 남김.
+상자 개수 "race4" (11-24, exam4 = 경주 시험, 사용자와 정한 설계): 기준 policy(F1SIM_EXAM_REF, 기본 scan31b u500 -- 시험 보는 checkpoint가
+아님)의 얼린 복사본이 상대 차를 몲(학습의 SelfOpponents 그대로: plan대로 정확히, 느리게 하는 배율 = 참 속도/f에서 plan, 속도 x f).
+조건 = {반 바퀴 떨어져 출발, 5 m 뒤에서 출발} x {상대 페이스 0.6, 0.8, 0.95, 제 페이스} x {줄 위 상자 3개(exam3 은행), 상자 없음} = 16가지,
+조건마다 같은 수의 세션(F1SIM_EXAM4_PER, 기본 8 -> 128 세션 = 환경 256), 경주 i는 조건 i % 16. 90 s, 상자는 50 s에 치움.
+기록에 조건(c_start 0 반 바퀴/1 5 m 뒤, c_pace, c_box), 우리 책임 차 접촉(cfault: env 규칙 car_contact_charge -- 뒤 차, 또는 차 길이
+안에 나란히)을 더함; 표는 exam_race_table.py."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -151,7 +157,25 @@ if LINE3:
     EXAM = str(json.load(open(WORLD)).get("exam_name") or "exam2")
     BANK = BANK.replace("prop_banks_exam1", "prop_banks_exam2")
     assert os.path.isdir(BANK), BANK
+if LINE3 and json.load(open(WORLD)).get("solo_world"):
+    # (11-24) a race world's line exam (exam3) is its solo world's, exactly (the seat empty, the same grid and draws as the
+    # qualifier's exam3): the race world names it
+    WORLD = os.path.join(os.path.dirname(WORLD), str(json.load(open(WORLD))["solo_world"]))
+    assert os.path.isfile(WORLD), WORLD
+RACE4 = count == "race4"
+if RACE4:
+    # (11-24) exam4: the race exam on the world's own map; boxes = the world's line exam bank (exam3's), written per race below
+    EXAM = str(json.load(open(WORLD)).get("race_exam") or "exam4")
+    REF = os.path.expanduser(os.environ.get("F1SIM_EXAM_REF", "~/f1sim_runs/exam4_ref/plan_u500.pt"))
+    PER = int(os.environ.get("F1SIM_EXAM4_PER", "8"))
+    C_PACES = (0.6, 0.8, 0.95, 1.0)
+    assert os.path.isdir(BANK), BANK
 a = argparse.Namespace(**json.load(open(WORLD)))
+if RACE4:
+    # every session a 1v1: the seat filled, its scripted kind (ftg, no race line) only stands in -- the copy drives it
+    a.stage, a.opp_present, a.spawn_half_lap = "race", 1.0, 0.0
+    a.opp_slot = json.dumps({"kind": "ftg", "kind_mix": [], "reactive": {}, "events": [], "event_rate": 0.0,
+                             "speed_scale": [1.0, 1.0], "spawn": "ahead", "present": 1.0})
 if getattr(a, "stage", "race") != "race":
     # (11-17) a single-seat world (the qualifier, stage "props"): this record reads every car's opponent seat, so the exam runs
     # the same world as two-seat races with the seat left empty -- the ego meets and sees exactly what it trained in
@@ -162,7 +186,7 @@ if getattr(a, "stage", "race") != "race":
 a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
-a.prop_bank, a.prop_count = BANK, ("fixed" if LINE3 else count)
+a.prop_bank, a.prop_count = BANK, ("fixed" if (LINE3 or RACE4) else count)
 if OPP_SLOT:
     a.opp_slot = OPP_SLOT                                   # merged over the training world's slot (`state_rl.build_env`)
 if mode == "map":
@@ -173,6 +197,8 @@ env = SR.build_env(a, dev, extra=_extra or None)
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 if mode == "ideal":
     env.enable_ideal()
+elif RACE4:
+    env.enable_ideal(learner=False)                         # only the copy drives exactly; MAP / the follower drives ours
 if LEAD > 0:
     assert mode == "map", mode
     env.tracker.tw_speed_lead = LEAD
@@ -181,6 +207,15 @@ if HALF:
     env.ecfg.spawn_gap = (h, h)                                 # read when the reset lays the race out
     print(f"반 바퀴 출발: 트랙 길이 {[round(float(x), 1) for x in env.sim.track.length]} m -> 간격 {h:.1f} m", flush=True)
 prepare_graph_runtime(env, log=lambda _t: None)
+if RACE4:
+    # conditions per race (i % 16): start (0 half a lap apart, 1 we 5 m behind), the copy's pace, boxes on the line or none
+    G4 = env.B // env.M
+    ci = torch.arange(G4, device=dev) % 16
+    c_start, c_pace_i, c_box = ci % 2, (ci // 2) % 4, (ci // 8 == 0)
+    c_pace = torch.tensor(C_PACES, device=dev)[c_pace_i]
+    h4 = 0.5 * float(env.sim.track.length.min())
+    env.spawn_gap_race = torch.where(c_start == 0, torch.full((G4,), h4, device=dev), torch.full((G4,), 5.0, device=dev))
+    print(f"[exam4] 경주 {G4}개 = 조건 16가지 x {G4 // 16}: 출발(반 바퀴 {h4:.1f} m / 5 m 뒤) x 상대 페이스 {C_PACES} x 상자(줄 위 3개 / 없음)", flush=True)
 env.reset(seed=SEED)
 lid = env.learner_ids; Bl = int(lid.numel())
 follower = None
@@ -284,6 +319,23 @@ if LINE3:
     po._write(dst_, src_, pose_l[..., :2], pose_l[..., 2], sid_l.clamp_min(0), sid_l >= 0, P=po.C, Q=1)
     _nk = (po.p_sid[box_l] >= 0).sum(1)
     print(f"[exam2] 상자 경주 {box_l.numel()}개에 은행 배치 0..{box_l.numel() - 1}을 차례로: 경주마다 상자 {int(_nk.min())}-{int(_nk.max())}개", flush=True)
+if RACE4:
+    # the box races get the line bank's layouts in order, the others none; every car of a race the same
+    n_lay = int(po.b_n[0])
+    rl_ = torch.arange(G4, device=dev) * env.M                      # the learner row of each race
+    kb_ = torch.cumsum(c_box.long(), 0) - 1
+    k_l = torch.where(c_box, kb_ % n_lay, torch.zeros_like(kb_))
+    t_l = env.sim.tid[rl_]
+    sid_l, pose_l = po.b_sid[t_l, k_l], po.b_pose[t_l, k_l]
+    live_l = (sid_l >= 0) & c_box[:, None]
+    rows_ = torch.cat([rl_[:, None], env.sim.other_idx[rl_]], 1)
+    src_ = torch.arange(G4, device=dev)[:, None].expand_as(rows_)
+    dst_, src_ = rows_.reshape(-1), src_.reshape(-1)
+    po.last_live.index_copy_(0, dst_, torch.zeros(G4, po.P, dtype=torch.bool, device=dev)[src_])
+    po._write(dst_, src_, pose_l[..., :2], pose_l[..., 2], sid_l.clamp_min(0), live_l, P=po.C, Q=1)
+    _nk = (po.p_sid[rl_] >= 0).sum(1)
+    print(f"[exam4] 상자 경주 {int(c_box.sum())}개에 은행 배치 0..{int(c_box.sum()) - 1}: 경주마다 상자 {int(_nk[c_box].min())}-{int(_nk[c_box].max())}개, "
+          f"상자 없는 경주 {int((~c_box).sum())}개 (상자 {int(_nk[~c_box].max())}개)", flush=True)
 remover = SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if po is not None else None
 KNOWN = bool(VIRT) or bool(TARGET)
 if KNOWN:
@@ -333,6 +385,18 @@ if VIRT:
         return out_
     obs._scan = _virt_scan
 restarter = SR.OppRestart(env, OPP_RESTART_S, PS.DT) if env.M > 1 else None
+so = None
+if RACE4:
+    # the other car: a frozen copy of the FIXED reference policy, at the race's pace (plan_rl.SelfOpponents, as in training)
+    from f1sim.learn.plan_rl import SelfOpponents
+    ref_ck = torch.load(REF, map_location=dev, weights_only=False)
+    assert abs(lidar_mount_of(ref_ck) - _mx) < 1e-6, "the reference policy's LiDAR place differs from the examined one's"
+    so = SelfOpponents(env, lim, 1.0, seed=SEED, max_pool=1, p_newest=1.0, pace=(0.6, 0.95, 0.0))
+    so.add(load_actor2(ref_ck, dev), int(ref_ck.get("update") or 0))
+    so.pace[:] = c_pace
+    so.on[:] = True
+    R_c = {"c_start": c_start.cpu().numpy(), "c_pace": c_pace.cpu().numpy(), "c_box": c_box.cpu().numpy()}
+    print(f"[exam4] 상대 차 = {REF}의 얼린 복사본 (update {ref_ck.get('update')})", flush=True)
 others = env.sim.other_idx[lid][:, 0]
 eid = env.sim.eid[lid]
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
@@ -344,6 +408,8 @@ ii = PT_IDX.to(dev)
 T = int(round(secs / PS.DT))
 R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors",
                      "rem", "orem")}
+if RACE4:
+    R["cfault"] = []                                        # car contact onsets this decision that the env's rule puts on us
 TWO = getattr(actor, "branches", 1) == 2
 if TWO:
     # a two-plan policy (11-13): which plan was driven, both logits, and the plan NOT driven (world points, as "pl")
@@ -557,6 +623,9 @@ for kd in range(T):
     else:
         env.sim.ideal_vcap[lid] = 1e3
     restarted = torch.zeros(Bl, dtype=torch.bool, device=dev)
+    if so is not None:
+        so.plan()
+        cf_ = torch.zeros(Bl, device=dev)
     for j in range(PS.SUB):
         if mode == "ideal":
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
@@ -564,8 +633,15 @@ for kd in range(T):
             env.ext_cmd[lid] = to_car(env, lid, follower.command(env.sim.state[lid]))
         if SLIP:
             turn = slip_turn(p["delta"][:, PS.SUB]); env.sim.P["mount_yaw"][lid] = yaw0 + turn
+        if so is not None:
+            so.command(j)
         _, _, te, trc, _ = env.step(act0)
         restarted |= (te | trc)[lid]
+        if so is not None:
+            so.stepped(te | trc)
+            on_ = env.last_result.contact_onsets
+            if on_ is not None and bool(on_[lid, 2].any()):
+                cf_ += (on_[lid, 2] & pr.at_fault()).float()
         pr.control_step((env.last_result.scan_type[lid] == HIT_CAR).any(1))
     out = pr.decision(pts, pc["price"], restarted)
     if ROLL:                                                    # off the plan (held / pushed), a restart or a contact: a whole plan
@@ -586,6 +662,11 @@ for kd in range(T):
             v_zone = (v_seen & (po.p_sid[lid] >= 0) & (_ah >= TARGET[2]) & (_ah <= TARGET[3])).any(1)
             t_stat["zone"] += float(v_zone.float().sum()); t_stat["n"] += float(Bl)
     obs.push_scan(); obs.set_plan(pts, p["pv"]); obs.set_plan2(p)
+    if so is not None:
+        so.after()
+        so.on[:] = True                                     # a restarted race keeps its copy (and pace: not drawn again)
+        so.pace[:] = c_pace
+        R["cfault"].append(cf_.cpu())
     if bool(restarted.any()):
         rows = torch.nonzero(restarted)[:, 0]
         obs.reset_rows(rows)
@@ -618,6 +699,8 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(float(getattr(env.tracker, "tw_speed_lead", 0.0) or 0.0) if mode == "map" else LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
          map=np.array(map_name(WORLD)), bank=np.array(f"{BANK} ({', '.join(_bank)}; sha256 {_sha})"), opp_restart_s=np.array(OPP_RESTART_S),
          lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0), opp_slot=np.array(OPP_SLOT), start_rest=np.array(REST), half_lap=np.array(HALF))
+if RACE4:
+    D.update(R_c, ref=np.array(REF), per=np.array(PER))
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)

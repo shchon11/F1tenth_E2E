@@ -11,6 +11,8 @@
   next plan) and a time penalty on every contact, (CONTACT_S + CONTACT_S_PER_MPS x the impact's normal speed) seconds,
   in laps of T_REF seconds. Every contact is bad, a graze only less bad (the user, 11-07). A car contact is charged only
   if a LiDAR beam hit a car within SEEN_S before it (the user: "시야에서 아예 안보이는 상태였으면 그건 주면 안되는겨").
+  (11-24, the race phase, `car_fault_only`) ... and only when this car is the one responsible by the env's rule
+  (`GymEnv.car_contact_charge`: the car behind, or alongside within a car length): being hit from behind costs nothing.
 * The whole plan counts (the user agreed 11-07: the car drives only a plan's first 0.1 s, so without these the other
   nine points would touch nothing and come out anyhow again):
   - Phi is read at the PLAN's points: the mean distance left over its 10 points. The plan is part of the state (the
@@ -213,6 +215,13 @@ class PlanReward:
         self.stall_s, self.stall_vmin, self.stall_window_s = 0.0, 1.0, 2.0
         self._st_buf = None
         self.stall_time = torch.zeros(Bl, device=device)        # [s] the shortfall's share, summed (for the log)
+        #: (11-24, plan_rl --car-fault; the race phase agreed with the user) a car contact is charged only if this car is
+        #: responsible by the env's rule (`GymEnv.car_contact_charge`: the car behind, or alongside within a car length,
+        #: decided at the contact's first step); the 'not seen within SEEN_S -> no charge' rule stays. Off: every seen
+        #: car contact is charged, whoever ran into whom (as before)
+        self.car_fault_only = False
+        #: (B_l,) car contacts charged since the last decision (the trainer's scene / level bookkeeping reads it)
+        self.car_charged = torch.zeros(Bl, device=device)
         self.begin(torch.arange(Bl, device=device))
 
     def _d_car(self) -> torch.Tensor:
@@ -267,8 +276,22 @@ class PlanReward:
         imp = r.contact_impacts[self.lid].float().clamp_min(0.0)
         charge = on.clone()
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
+        if self.car_fault_only and bool(on[:, 2].any()):
+            charge[:, 2] = charge[:, 2] * self.at_fault().float()
         self.cost = self.cost + self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
+        self.car_charged = self.car_charged + charge[:, 2]
         self.n_contacts = self.n_contacts + on
+
+    def at_fault(self) -> torch.Tensor:
+        """(B_l,) bool: this car would be responsible for a car contact now, by the env's rule (`car_contact_charge`: the
+        nearest other car along the lane is ahead, or less than a car length behind)"""
+        env = self.env
+        if env.sim.other_idx is None:
+            return torch.zeros(self.lid.shape[0], dtype=torch.bool, device=self.phi.device)
+        s = getattr(env.last_result, "s", None)
+        s = env.sim.s if s is None else s
+        one = torch.ones(env.B, device=self.phi.device)
+        return env.car_contact_charge(s, env.sim.tid, one)[self.lid] > 0
 
     def _stall(self, dt: float, restarted: Optional[torch.Tensor]) -> None:
         """the stall price of one control step (see `__init__`)"""
@@ -362,6 +385,8 @@ class PlanReward:
                "reward": lap + shaping - self.cost - pp, "progress": adv}
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
+        out["car_charged"] = self.car_charged
+        self.car_charged = torch.zeros_like(self.car_charged)
         if restarted is not None and bool(restarted.any()):
             self.begin(torch.nonzero(restarted)[:, 0])
         return out
