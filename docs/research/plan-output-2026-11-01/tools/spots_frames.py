@@ -34,9 +34,11 @@ INK = "#e6edf3"
 
 
 def exams(run):
+    """{update: record} of the run's line exam -- exam2, or exam3 for a run trained on the bag-scan map (11-23: the site showed
+    no scan31a map because only exam2 records were looked for); a run trains in one world, so it has one of the two"""
     out = {}
-    for p in glob.glob(os.path.join(EX, f"exam2_{run}_u*_ideal_line3_n256.npz")):
-        m = re.search(rf"exam2_{re.escape(run)}_u(\d+)_ideal", p)
+    for p in glob.glob(os.path.join(EX, f"exam[23]_{run}_u*_ideal_line3_n256.npz")):
+        m = re.search(rf"exam[23]_{re.escape(run)}_u(\d+)_ideal", p)
         if m:
             out[int(m.group(1))] = p
     return out
@@ -236,8 +238,8 @@ if __name__ == "__main__":
     runs = sys.argv[1:]
     if not runs:
         seen = {}
-        for p in glob.glob(os.path.join(EX, "exam2_*_u*_ideal_line3_n256.npz")):
-            m = re.search(r"exam2_(.+)_u\d+_ideal", os.path.basename(p))
+        for p in glob.glob(os.path.join(EX, "exam[23]_*_u*_ideal_line3_n256.npz")):
+            m = re.search(r"exam[23]_(.+)_u\d+_ideal", os.path.basename(p))
             if m:
                 seen[m.group(1)] = max(seen.get(m.group(1), 0), os.path.getmtime(p))
         runs = sorted(seen, key=lambda r: -seen[r])
