@@ -5,7 +5,7 @@ scene_selftest.py와 같은 순서(학습의 재시작 경로: _reset_envs_core 
 배율 0.6-0.95 / 제 페이스)에서:
   1. W 결정 달린 뒤 모든 경주를 장면으로 저장
   2. 그대로 N 결정 (갈래 A)
-  3. 장면으로 되돌려 N 결정 (B1), 4. 한 번 더 되돌려 N 결정 (B2)
+  3. 장면으로 되돌려 N 결정 (B1), 4. 한 번 더 되돌려 N 결정 (B2), 5. 대조: 복사본의 기억만 0으로 두고 (B3)
 센서 잡음 0, 두 차 모두 평균 행동, 난수 생성기는 갈래마다 장면 때 상태로 맞춤. 우리 차와 상대 차의 자리 차이(최대)를 냄:
 B1 vs B2 (같은 장면 두 번 재생), A vs B1 (원래 이어 달린 것과 재생).
 인자: checkpoint [경주 수 16] [W 30] [N 40] [장치 cuda]
@@ -156,14 +156,20 @@ ok_id = bool(torch.equal(so.row_tag[oi], tags0) and torch.equal(so.pace[oi], pac
 meB1, opB1, rsB1 = drive_branch()
 restore()
 meB2, opB2, rsB2 = drive_branch()
-ok = ~(rsA | rsB1 | rsB2)
+restore()
+so.obs.mem_h[oi] = 0.0                                    # the control: the copy put back WITHOUT its memory
+meB3, opB3, rsB3 = drive_branch()
+ok = ~(rsA | rsB1 | rsB2 | rsB3)
 d = lambda a_, b_: float((a_ - b_).norm(dim=-1)[:, ok].max()) if bool(ok.any()) else float("nan")
 res = {"races": int(ok.sum()), "copy_identity_restored": ok_id,
        "B1_vs_B2_ego_m": d(meB1, meB2), "B1_vs_B2_opp_m": d(opB1, opB2),
        "A_vs_B1_ego_m": d(meA, meB1), "A_vs_B1_opp_m": d(opA, opB1),
+       "ctrl_no_copy_memory_opp_m": d(opB1, opB3), "ctrl_no_copy_memory_ego_m": d(meB1, meB3),
        "tags": sorted(set(tags0.tolist())), "paces": [round(float(x), 3) for x in pace0.tolist()]}
 print(f"[장면 재생 확인 · 복사본 상대 차] 경주 {int(ok.sum())}개 (재시작 없는 것), {W} 결정 뒤 장면, {N} 결정씩 ({N * PS.DT:.0f} s)")
 print(f"  복사본 정체(update 번호)·배율·켜짐 되살림: {'같음' if ok_id else '다름'} (update {res['tags']}, 배율 {res['paces']})")
 print(f"  같은 장면 두 번 재생(B1 vs B2) 최대 자리 차이: 우리 차 {res['B1_vs_B2_ego_m']:.4f} m · 상대 차 {res['B1_vs_B2_opp_m']:.4f} m")
 print(f"  원래 이어 달린 것과 재생(A vs B1): 우리 차 {res['A_vs_B1_ego_m']:.4f} m · 상대 차 {res['A_vs_B1_opp_m']:.4f} m")
+print(f"  대조: 복사본의 기억만 빼고 되살린 재생(B1 vs B3): 상대 차 {res['ctrl_no_copy_memory_opp_m']:.3f} m · 우리 차 "
+      f"{res['ctrl_no_copy_memory_ego_m']:.3f} m (0이 아니면 이 확인이 기억까지 가려냄)")
 print(json.dumps(res))
