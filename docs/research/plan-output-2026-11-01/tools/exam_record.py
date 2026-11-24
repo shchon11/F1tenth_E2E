@@ -24,6 +24,8 @@ F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반�
 F1SIM_EXAM_SAVE_SCAN=1 (11-13, policy가 상자를 보고도 왜 그대로 가는지 policy 안에서 보는 분석용): 결정마다 policy가 읽은 가장 새 스캔
 (range_max로 나눈 값, float16; 입력은 이것과 앞 두 결정의 스캔)과 빔마다 맞은 것(lidar.HIT_*)을 `출력_scan.npz`(scan, typ, range_max, angles)에 남김.
 주행·기록은 그대로.
+F1SIM_EXAM_SAVE_PLAN=1 (11-24, 제어기 튜닝 방 map_room.py용): 결정마다 차 상태 전부와 MAP이 읽는 plan(구간 곡률·속도), plan을 만든 행동·출발 속도·조향을
+`출력_plan.npz`에 따로 남김. 주행은 그대로.
 F1SIM_EXAM_SAVE_VALUE=1 (11-13, 상자에 닿기 전 critic은 언제부터 그 상자를 값에 치는지 보는 분석용): 결정마다 critic이 읽은
 참값 입력(학습과 같은 것: 상자 칸은 트랙을 따라 --box-range 안)과 critic의 값을 `출력_priv.npz`(priv, value, box_cols)에 남김.
 F1SIM_EXAM_OPP_SLOT=JSON (11-12, 시험 점수가 아니라 상대 차 하나를 따로 보는 기록): 상대 차 자리 설정에 덮어씀(state_rl.build_env의
@@ -57,6 +59,11 @@ LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
 SAVE_MEM = os.environ.get("F1SIM_EXAM_SAVE_MEM", "") == "1"
 SAVE_SCAN = os.environ.get("F1SIM_EXAM_SAVE_SCAN", "") == "1"   # the newest scan the policy read + what each beam hit
 SAVE_VALUE = os.environ.get("F1SIM_EXAM_SAVE_VALUE", "") == "1"  # the critic's privileged input and its value
+# (11-24, the controller tuning room: tools/map_room.py) "1": every decision's full car state (x, y, yaw, vx, vy, r, steering,
+# wheel speed), the plan as MAP reads it (10 segments' curvature and speed, plan_segments) and as it was drawn (the action in
+# [-1, 1] and the start speed / steering `plan_steps.roll` took) -> `<output>_plan.npz` (float32); driving unchanged
+SAVE_PLAN = os.environ.get("F1SIM_EXAM_SAVE_PLAN", "") == "1"
+PLN = {"state": [], "kap": [], "vseg": [], "act": [], "v0": [], "d0": []}
 OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
 REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
 HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent starts half a lap away (the user's events)
@@ -616,6 +623,10 @@ for kd in range(T):
         R.setdefault("pwall", []).append(torch.where(wh_.any(1), wh_.float().argmax(1), torch.full_like(wh_[:, 0], -1, dtype=torch.long)).to(torch.int16).cpu())
         R.setdefault("pany", []).append(torch.where(pc["hit"], pc["first"], torch.full_like(pc["first"], -1)).to(torch.int16).cpu())
     pts = torch.stack([x[:, ii], y[:, ii]], -1)
+    if SAVE_PLAN:
+        _k, _v = plan_segments(p, lim)
+        PLN["state"].append(st.float().cpu()); PLN["kap"].append(_k.float().cpu()); PLN["vseg"].append(_v.float().cpu())
+        PLN["act"].append(torch.tanh(u_).float().cpu()); PLN["v0"].append(p["v"][:, 0].float().cpu()); PLN["d0"].append(p["delta"][:, 0].float().cpu())
     if mode == "map":
         k_, v_ = plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
     elif mode == "track":
@@ -712,6 +723,8 @@ if SAVE_MEM:
 if SAVE_VALUE:
     np.savez_compressed(out_npz[:-4] + "_priv.npz", priv=torch.stack(VAL["priv"]).numpy(), value=torch.stack(VAL["value"]).numpy(),
                         box_cols=np.array([_P0, _w]), box_range=np.array(_br))
+if SAVE_PLAN:
+    np.savez_compressed(out_npz[:-4] + "_plan.npz", **{k: torch.stack(v).numpy() for k, v in PLN.items()})
 if SAVE_SCAN:
     np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
                         range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
