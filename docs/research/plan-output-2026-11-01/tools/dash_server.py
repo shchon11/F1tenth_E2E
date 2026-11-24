@@ -2,7 +2,7 @@
 Tailscale 주소에만 열림(공개 인터넷 X). 페이지는 30 s마다 스스로 새로 읽음.
   - 학습 진행: run의 progress.jsonl (rank 0) -- 바퀴/분, 속도, 접촉, 학습 보상, KL, update 시간; 비교 run을 겹쳐 그림
   - 학습 표: plan_table.py (칸 5개)
-  - checkpoint마다: frozen exam 결과(analysis/RUN_uU_exam.txt), 비교 run 같은 update와 세션끼리 짝지은 차(grad_step_table.py, 캐시),
+  - checkpoint마다: frozen exam 결과(analysis/RUN_uU_exam3.txt, 없으면 exam2/exam), 경주 시험(exam4, 시작 checkpoint와 함께), 비교 run 같은 update와 세션끼리 짝지은 차(grad_step_table.py, 캐시),
     네 경우 영상(videos/), 기억 비교 요약, 추세 그림
   - 그림 모음: out/netaudit, out/drift, out/edge*, out/rwexam, out/batchdump (최근 것부터)
   - 연구 기록: out/research_log.md (날짜별 분석·결정, 최근 것부터) · run 상태 메모: out/run_notes.json {run: 멈춘 이유 등}
@@ -23,7 +23,8 @@ os.makedirs(CACHE, exist_ok=True)
 FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts_wall_per_min", "contacts_prop_per_min",
           "contacts_car_per_min", "reward", "contact_cost", "kl", "clipfrac", "vloss", "accum_actor", "stopped", "noise_rho_steer",
           "plan_hit_share", "tail_next_05", "tail_driven_10", "vest_mae",      # (11-16, the user: "plan관련 지표는 못보여주나?")
-          "noise_scale", "aux_auc")       # (11-19, the user: "잡음 크기는 사이트에 plot 안되나?"; + the box memory's side task)
+          "noise_scale", "aux_auc",       # (11-19, the user: "잡음 크기는 사이트에 plot 안되나?"; + the box memory's side task)
+          "car_fault_per_min", "near_miss_per_min", "pred_err_05", "pred_err_10")   # (11-24) the race phase (1v1)
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()
@@ -202,31 +203,82 @@ def table(name):
     return {"rows": rows, "inherited": inh, "parent": par, "cut": cut}
 
 
+def exam_file(name, u):
+    """the checkpoint's solo exam text (out/-relative): exam3 (11-23 on), else exam2, else the first exam's"""
+    for k in ("exam3", "exam2", "exam"):
+        rel = f"analysis/{name}_u{u}_{k}.txt"
+        if os.path.exists(f"{OUT}/{rel}"):
+            return rel
+    return None
+
+
+RACE_ROWS = ("전체", "상대 0.60배", "상대 0.80배", "상대 0.95배", "상대 제 페이스")
+
+
+def race_rows(name, u):
+    """the 1v1 race exam (analysis/RUN_uU_exam4.txt, tools/exam_race_table.py), overall + by the opponent's pace:
+    {condition: {laps, opp_laps, pass, fault, hard_car, stall}} (per 90 s session; stall = % of sessions)"""
+    p = f"{OUT}/analysis/{name}_u{u}_exam4.txt"
+    if not os.path.exists(p):
+        return None
+    cols, out = None, {}
+    num = lambda s: [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", s)]
+    for line in open(p, errors="replace"):
+        c = [x.strip() for x in line.split("|")]
+        if len(c) < 6:
+            continue
+        if c[0] == "조건":
+            cols = {k: i for i, k in enumerate(c)}
+            continue
+        if not cols or c[0] not in RACE_ROWS or c[0] in out:
+            continue
+        try:
+            lp = num(c[cols["바퀴 (상대)"]]); hd = num(c[cols["세게 닿음 벽 · 상자 · 차"]])
+            out[c[0]] = {"laps": lp[0], "opp_laps": lp[1] if len(lp) > 1 else None,
+                         "pass": num(c[cols["앞지름"]])[0], "fault": num(c[cols["우리 책임 차 접촉"]])[0],
+                         "hard_car": hd[2] if len(hd) > 2 else None, "stall": num(c[cols["멈춘 세션"]])[0]}
+        except (KeyError, IndexError):
+            continue
+    return out or None
+
+
+def ckpt_entry(name, u):
+    e = exam_file(name, u); v = f"videos/{name}_u{u}_train_4cases.mp4"; t = f"analysis/{name}_u{u}_trend.png"
+    e4 = f"analysis/{name}_u{u}_exam4.txt"
+    lm = f"{OUT}/analysis/{name}_u{u}_lapmem.log"
+    summ = ""
+    if os.path.exists(lm):
+        s_ = [l for l in open(lm, errors="replace") if l.startswith("요약")]
+        summ = s_[-1].strip() if s_ else ""
+    return {"u": u, "run": name, "exam": e, "exam_kind": e.rsplit("_", 1)[-1][:-4] if e else None,
+            "exam4": e4 if os.path.exists(f"{OUT}/{e4}") else None, "race": race_rows(name, u),
+            "video": v if os.path.exists(f"{OUT}/{v}") and os.path.exists(f"{OUT}/videos/{name}_u{u}_train_4cases.done") else None,
+            "trend": t if os.path.exists(f"{OUT}/{t}") else None, "lapmem": summ,
+            "npz": os.path.exists(f"{OUT}/exam/exam1_{name}_u{u}_ideal_uniform_n256.npz")}
+
+
 def ckpts(name):
+    """the run's checkpoints, newest first; a run started from a checkpoint (--init RUN/plan_uN.pt) gets that start
+    checkpoint last, marked `start` (11-24: the race exam is read against it)"""
     us = set()
     for p in glob.glob(f"{OUT}/analysis/{name}_u*") + glob.glob(f"{OUT}/videos/{name}_u*") + glob.glob(f"{OUT}/exam/exam1_{name}_u*_ideal_uniform_n256.npz"):
         m = re.search(rf"{name}_u(\d+)", p)
         if m:
             us.add(int(m.group(1)))
-    out = []
-    for u in sorted(us, reverse=True):
-        e = f"analysis/{name}_u{u}_exam.txt"; v = f"videos/{name}_u{u}_train_4cases.mp4"; t = f"analysis/{name}_u{u}_trend.png"
-        lm = f"{OUT}/analysis/{name}_u{u}_lapmem.log"
-        summ = ""
-        if os.path.exists(lm):
-            s_ = [l for l in open(lm, errors="replace") if l.startswith("요약")]
-            summ = s_[-1].strip() if s_ else ""
-        out.append({"u": u, "exam": e if os.path.exists(f"{OUT}/{e}") else None,
-                    "video": v if os.path.exists(f"{OUT}/{v}") and os.path.exists(f"{OUT}/videos/{name}_u{u}_train_4cases.done") else None,
-                    "trend": t if os.path.exists(f"{OUT}/{t}") else None, "lapmem": summ,
-                    "npz": os.path.exists(f"{OUT}/exam/exam1_{name}_u{u}_ideal_uniform_n256.npz")})
+    out = [ckpt_entry(name, u) for u in sorted(us, reverse=True)]
+    par, cut = parent(name)
+    if par and re.fullmatch(r"[A-Za-z0-9_]+", par):
+        s = ckpt_entry(par, cut)
+        if s["exam"] or s["exam4"]:
+            out.append({**s, "start": True, "npz": False, "video": None, "trend": None, "lapmem": ""})
     return out
 
 
 def exam_summary(name, u):
-    p = f"{OUT}/analysis/{name}_u{u}_exam.txt"
-    if not os.path.exists(p):
+    e = exam_file(name, u)
+    if not e:
         return ""
+    p = f"{OUT}/{e}"
     keep, case = [], None
     for line in open(p, errors="replace"):
         if line.startswith("["):
@@ -272,8 +324,8 @@ def edge_one(name, u):
             m = re.search(r"^\s+" + re.escape(key) + r"\s+(\d+)번 \| 세게 닿음\s+([\d.]+) %", txt, re.M)
             if m:
                 out[lab] = [int(m.group(1)), float(m.group(2))]
-    e = f"{OUT}/analysis/{name}_u{u}_exam.txt"
-    if os.path.exists(e):
+    e = f"{OUT}/{exam_file(name, u)}" if exam_file(name, u) else ""
+    if e:
         case = None
         for line in open(e, errors="replace"):
             if line.startswith("["):
@@ -485,7 +537,7 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/ckpts":
                 cs = memo(("c", name), 30, lambda: ckpts(name))
                 for c in cs:
-                    c["summary"] = memo(("e", name, c["u"]), 60, lambda c=c: exam_summary(name, c["u"]))
+                    c["summary"] = memo(("e", c["run"], c["u"]), 60, lambda c=c: exam_summary(c["run"], c["u"]))
                 return self._json(cs)
             if u.path == "/api/compare":
                 ref = q.get("ref", "")

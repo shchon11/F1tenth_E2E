@@ -106,7 +106,7 @@ button.pill { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 
 .charts h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
 .charts h3 .sub { font-weight: 400; }
 .cbox { position: relative; height: 190px; }
-.trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .trio .cbox { height: 150px; }
 .trio h4 { font-size: 12px; margin: 0 0 2px; color: var(--ink2); font-weight: 600; }
 /* checkpoints */
@@ -116,6 +116,13 @@ button.pill { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 
 .ckhead b { font-size: 15px; }
 details.ckd { border-top: 1px solid var(--line); padding: 10px 0; }
 details.ckd:first-child { border-top: 0; padding-top: 0; }
+details.ckd.inh .ckhead b { color: var(--muted); }
+.rcap { font-size: 13px; font-weight: 600; margin: 2px 0 4px; } .rcap .dim { color: var(--muted); font-weight: 400; }
+table.race th { white-space: normal; word-break: keep-all; line-height: 1.25; vertical-align: bottom; }
+table.race td { line-height: 1.3; }
+table.race td:first-child { white-space: normal; word-break: keep-all; line-height: 1.25; }
+table.race td:nth-child(2) { font-weight: 600; }
+table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
 /* notes */
 .entry { padding: 2px 0; }
 .entry + .entry { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
@@ -140,9 +147,10 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
 .hide { display: none !important; }
 @media (max-width: 720px) {
   .hbar { padding: 8px 12px; gap: 8px; } .stamp { display: none; } main { padding: 10px 12px 48px; }
-  .ck { grid-template-columns: 1fr; } .trio { grid-template-columns: 1fr; } .mini { grid-template-columns: repeat(3, 1fr); }
+  .ck { grid-template-columns: minmax(0, 1fr); } .trio { grid-template-columns: minmax(0, 1fr); } .mini { grid-template-columns: repeat(3, 1fr); }
   .kpis { grid-template-columns: repeat(2, 1fr); } .kpi b { font-size: 17px; }
   th, td { padding: 5px 7px; font-size: 12px; }
+  table.race th, table.race td { padding-left: 5px; padding-right: 5px; }
 }
 </style>
 </head>
@@ -192,6 +200,10 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
       <div class="trio"><div><h4>벽</h4><div class="cbox"><canvas id="c_cw"></canvas></div></div>
         <div><h4>상자</h4><div class="cbox"><canvas id="c_cb"></canvas></div></div>
         <div><h4>상대 차</h4><div class="cbox"><canvas id="c_cc2"></canvas></div></div></div></div>
+    <div class="card hide" data-opt="car_fault_per_min"><h3>우리 책임 차 접촉 / 분</h3><div class="cbox"><canvas id="c_fault"></canvas></div></div>
+    <div class="card hide" data-opt="near_miss_per_min"><h3>아슬아슬 스침 / 분</h3><div class="cbox"><canvas id="c_near"></canvas></div></div>
+    <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
+    <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
     <div class="card"><h3>박는 plan 비율 <span class="sub">% · 벽·상자를 지나가는 plan (벌점 없음, 보기만)</span></h3><div class="cbox"><canvas id="c_phit"></canvas></div></div>
     <div class="card"><h3>plan ↔ 실제로 간 길 <span class="sub">cm · plan의 0.5초 점</span></h3><div class="cbox"><canvas id="c_t05"></canvas></div></div>
     <div class="card"><h3>plan ↔ 실제로 간 길 <span class="sub">cm · plan의 1.0초 점</span></h3><div class="cbox"><canvas id="c_t10"></canvas></div></div>
@@ -203,7 +215,7 @@ details.ckd:first-child { border-top: 0; padding-top: 0; }
     <div class="card"><h3>update 시간 <span class="sub">s</span></h3><div class="cbox"><canvas id="c_time"></canvas></div></div>
     <div class="card"><h3>한 걸음에 합친 minibatch 수</h3><div class="cbox"><canvas id="c_acc"></canvas></div></div>
     <div class="card"><h3>policy gradient 잡음 크기 <span class="sub">결정 수 · 로그 축 · 이만큼 모아야 gradient가 잡음보다 커짐</span></h3><div class="cbox"><canvas id="c_bnoise"></canvas></div></div>
-    <div class="card"><h3>상자 기억 가르기 AUC <span class="sub">지나친 상자가 앞에 있음/없음 · 학습 중 minibatch (보조 문제가 있는 run만)</span></h3><div class="cbox"><canvas id="c_aux"></canvas></div></div>
+    <div class="card hide" data-opt="aux_auc"><h3>상자 기억 가르기 AUC <span class="sub">지나친 상자가 앞에 있음/없음 · 학습 중 minibatch</span></h3><div class="cbox"><canvas id="c_aux"></canvas></div></div>
   </div>
 
   <div class="sec"><h2>checkpoint별 평가</h2><span class="sub">frozen exam: 같은 세계 128 세션 × 90 s · 최근 것부터</span></div>
@@ -432,6 +444,12 @@ async function refresh() {
   chart("c_cw", two((r) => r.contacts_wall_per_min));
   chart("c_cb", two((r) => r.contacts_prop_per_min));
   chart("c_cc2", two((r) => r.contacts_car_per_min));
+  // (11-24) the race phase's numbers: a chart only where the run (or the comparison run) writes them
+  for (const [id, k] of [["c_fault", "car_fault_per_min"], ["c_near", "near_miss_per_min"], ["c_pe05", "pred_err_05"], ["c_pe10", "pred_err_10"], ["c_aux", "aux_auc"]]) {
+    const has = own.some((r) => r[k] != null) || rrOwn.some((r) => r[k] != null);
+    document.querySelector(`[data-opt="${k}"]`).classList.toggle("hide", !has);
+    if (has) chart(id, two((r) => r[k]), k !== "aux_auc"); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+  }
   chart("c_phit", two((r) => r.plan_hit_share == null ? null : 100 * r.plan_hit_share));
   chart("c_t05", two((r) => r.tail_next_05 == null ? null : 100 * r.tail_next_05));
   chart("c_t10", two((r) => r.tail_driven_10 == null ? null : 100 * r.tail_driven_10));
@@ -442,7 +460,6 @@ async function refresh() {
   chart("c_time", two((r) => r.t_roll == null ? null : r.t_roll + (r.t_upd || 0)));
   chart("c_acc", two((r) => r.accum_actor));
   chart("c_bnoise", two((r) => r.noise_scale > 0 ? r.noise_scale : null), false, true);
-  chart("c_aux", two((r) => r.aux_auc), false);
   chart("c_noise", [ds(`${run} 이어지는 정도`, series(rows, (r) => r.noise_rho_steer ?? 0, OFF.run), css("--run"), false),
                     ds(`${run} 조향 std`, series(rows, (r) => r.std_steer, OFF.run), css("--run"), true)]);
   $("xnote").textContent = OFF.run || OFF.ref ? `가로축 = 이 지도에서 한 update 수 (${run}${OFF.run ? ` u${OFF.run}부터` : ""} · ${ref}${OFF.ref ? ` u${OFF.ref}부터` : " 처음부터"})` : "가로축 = update";
@@ -497,15 +514,27 @@ async function loadSlow() {
     $("edge_more").innerHTML = rowsE.length > 3 ? `<button class="lnk" id="emore">${edgeAll ? "최근 3개만" : `전체 ${rowsE.length}개 보기`}</button>` : "";
     if ($("emore")) $("emore").onclick = () => { edgeAll = !edgeAll; loadSlow(); };
   });
-  const cs = (await j(`/api/ckpts?run=${run}`)).sort((a, b) => b.u - a.u);
-  const key = run + ref + JSON.stringify(cs.map((c) => [c.u, !!c.exam, !!c.video, !!c.npz, !!c.summary]));
+  // the run's checkpoints newest first; the checkpoint it started from (`start`) last
+  const cs = (await j(`/api/ckpts?run=${run}`)).sort((a, b) => (!!a.start - !!b.start) || b.u - a.u);
+  const st = cs.find((c) => c.start && c.race);
+  const key = run + ref + JSON.stringify(cs.map((c) => [c.u, !!c.exam, !!c.exam4, !!c.video, !!c.npz, !!c.summary]));
+  // (11-24) the 1v1 race exam (exam4) per checkpoint: overall + by the opponent's pace; the start checkpoint's values under each
+  const RACE = [["전체", "전체"], ["상대 0.60배", "0.60배"], ["상대 0.80배", "0.80배"], ["상대 0.95배", "0.95배"], ["상대 제 페이스", "제 페이스"]];
+  const RCOL = [["pass", "앞지름", 2], ["fault", "우리 책임<br>차 접촉", 2], ["hard_car", "세게 닿음 차", 2], ["stall", "멈춘 세션 %", 0], ["laps", "바퀴", 2], ["opp_laps", "상대 바퀴", 2]];
+  const rv = (row, k, d) => row ? f1(row[k], d) : "–";
+  const raceTable = (c, base) => `<div class="rcap">경주 시험 <span class="sub">세션당</span>${base ? ` <span class="dim">· ${esc(base.run)} u${base.u}</span>` : ""}</div>
+    <div class="tw"><table class="race"><tr><th></th>${RACE.map(([, lab]) => `<th>${lab}</th>`).join("")}</tr>` +
+    RCOL.map(([f, h, d]) => `<tr><td>${h}</td>` + RACE.map(([k]) => `<td class="num">${rv(c.race[k], f, d)}${base ? `<span class="cmp">${rv(base.race[k], f, d)}</span>` : ""}</td>`).join("") + "</tr>").join("") + "</table></div>";
+  const frame = (p) => `<iframe src="/file?path=${encodeURIComponent(p)}" style="width:100%;height:340px;border:1px solid var(--line);border-radius:8px;background:#fff"></iframe>`;
   if (key !== lastCk) {
     lastCk = key;
-    $("ckpts").innerHTML = cs.length ? cs.map((c, i) => `<details class="ckd" ${i === 0 ? "open" : ""}><summary><span class="ckhead"><b>u${c.u}</b>
-        ${c.summary ? '<span class="chip">exam</span>' : ""}${c.video ? '<span class="chip">영상</span>' : ""}${c.lapmem ? '<span class="chip">기억 비교</span>' : ""}</span></summary>
+    $("ckpts").innerHTML = cs.length ? cs.map((c, i) => `<details class="ckd ${c.start ? "inh" : ""}" ${i === 0 ? "open" : ""}><summary><span class="ckhead"><b>u${c.u}</b>${c.start ? ` <span class="sub">${esc(c.run)}</span>` : ""}
+        ${c.race ? '<span class="chip">exam4</span>' : ""}${c.summary ? `<span class="chip">${esc(c.exam_kind || "exam")}</span>` : ""}${c.video ? '<span class="chip">영상</span>' : ""}${c.lapmem ? '<span class="chip">기억 비교</span>' : ""}</span></summary>
       <div class="ck"><div>
-        ${c.summary ? `<pre>${esc(c.summary)}</pre>` : '<span class="empty">frozen exam 아직 없음</span>'}
-        ${c.exam ? `<details style="margin-top:6px"><summary>exam 전체</summary><iframe src="/file?path=${encodeURIComponent(c.exam)}" style="width:100%;height:340px;border:1px solid var(--line);border-radius:8px;background:#fff"></iframe></details>` : ""}
+        ${c.race ? raceTable(c, c.start ? null : st) : ""}
+        ${c.summary ? `<pre>${esc(c.summary)}</pre>` : c.race ? "" : '<span class="empty">frozen exam 아직 없음</span>'}
+        ${c.exam4 ? `<details style="margin-top:6px"><summary>exam4 전체</summary>${frame(c.exam4)}</details>` : ""}
+        ${c.exam ? `<details style="margin-top:6px"><summary>${esc(c.exam_kind || "exam")} 전체</summary>${frame(c.exam)}</details>` : ""}
         ${c.npz && ref ? `<div style="margin-top:8px"><button class="pill" data-u="${c.u}">${esc(ref)} u${c.u - shiftE}와 세션끼리 비교</button><pre id="cmp_${c.u}"></pre></div>` : ""}
         ${c.lapmem ? `<div class="note">기억 비교: ${esc(c.lapmem)}</div>` : ""}
       </div><div>
