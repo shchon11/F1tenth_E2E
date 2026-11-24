@@ -898,12 +898,22 @@ def table(out_dir):
         if "bev10" in R and "pred_noisy_in" in R["bev10"].files:
             rows.append(("위에서 본 격자 10장, 참 자세로 학습 -> 잡음 자세로 평가", R["bev10"]["pred_noisy_in"], None))
         pr(f"(1) 상대 차 위치 예측 오차 [m] -- 따로 둔 세션의 '있음' 결정만 (0.5 s: {int((th & msk[:, 4]).sum())}개, 1.0 s: {int((th & msk[:, 9]).sum())}개)")
-        pr(f"{'입력 / 모형':<52} | 0.5 s 중앙 / p90 | 1.0 s 중앙 / p90 | '있음' AUC")
+        pr(f"{'입력 / 모형':<52} | 0.1 s 중앙 / p90 | 0.5 s 중앙 / p90 | 1.0 s 중앙 / p90 | '있음' AUC")
         for n, P, sc in rows:
-            e5 = q(err_at(P, tgt, msk, 4)[th]); e10 = q(err_at(P, tgt, msk, 9)[th])
+            e1 = q(err_at(P, tgt, msk, 0)[th]); e5 = q(err_at(P, tgt, msk, 4)[th]); e10 = q(err_at(P, tgt, msk, 9)[th])
             a = auc(np.asarray(sc, np.float64), th) if sc is not None else float("nan")
-            pr(f"{n:<52} | {e5[0]:5.2f} / {e5[1]:5.2f}    | {e10[0]:5.2f} / {e10[1]:5.2f}    | {a:.3f}" if np.isfinite(a) else
-               f"{n:<52} | {e5[0]:5.2f} / {e5[1]:5.2f}    | {e10[0]:5.2f} / {e10[1]:5.2f}    |   -")
+            pr(f"{n:<52} | {e1[0]:5.2f} / {e1[1]:5.2f}    | {e5[0]:5.2f} / {e5[1]:5.2f}    | {e10[0]:5.2f} / {e10[1]:5.2f}    | "
+               + (f"{a:.3f}" if np.isfinite(a) else "  -"))
+        pr("")
+        pr("움직임만: 0.1 s 점에서 1.0 s 점까지 예측한 이동(벡터)과 실제 이동의 차 [m] (지금 위치를 잘못 잡은 만큼은 빠짐), 같은 결정")
+        mm = th & msk[:, 0] & msk[:, 9]
+        dT = tgt[:, 9] - tgt[:, 0]
+        pr(f"{'':<52} | 전체 중앙 / p90 | 페이스<0.7 | 0.7-0.9 | ≥0.9 (중앙)  | 실제 이동 중앙 {np.median(np.linalg.norm(dT[mm], axis=-1)):.2f} m")
+        for n, P, _ in rows:
+            em = np.linalg.norm((P[:, 9] - P[:, 0]) - dT, axis=-1)
+            a_ = q(em[mm])
+            pc = [np.median(em[mm & m]) for m in (pace < 0.7, (pace >= 0.7) & (pace < 0.9), pace >= 0.9)]
+            pr(f"{n:<52} | {a_[0]:5.2f} / {a_[1]:5.2f}  | " + " | ".join(f"{x:5.2f}" for x in pc))
         for k_, kn in ((9, "1.0 s"), (4, "0.5 s")):
             pr("")
             pr(f"{kn} 뒤 오차 중앙 / p90 [m], 상대 페이스별과 지금 거리별")
