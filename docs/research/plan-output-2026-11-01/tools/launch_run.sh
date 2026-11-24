@@ -108,5 +108,7 @@ d["picks"] = [e] + [x for x in d["picks"] if x["run"] != e["run"]]
 json.dump(d, open(p, "w"), ensure_ascii=False, indent=1)
 PY
 setsid nohup bash tools/watch_latest_plan.sh watch_$N $N $D/one_$N.done > out/watch_$N.log 2>&1 < /dev/null &
+# (11-24) the lab console's list follows this one within a minute (it had missed race32c); one copy runs (flock)
+setsid nohup bash tools/lab_picks_sync.sh >> out/lab_picks_sync.log 2>&1 < /dev/null &
 sleep 2
 ps -eo pid,cmd | grep -E "plan_rl --name $N |core_loop.sh $N|gpu_guard3.sh .*$N" | grep -v grep | cut -c1-120
