@@ -94,7 +94,12 @@ for lab, m in GROUPS:
         cells.append(f"{mu:+.2f} [{lo:+.2f} {hi:+.2f}]")
     print(f"{lab:<14} | {int(m.sum()):>3} | " + " | ".join(f"{c:>22}" for c in cells))
 n_same = int(sum(np.array_equal(gn["made"][i:i + 1], go["made"][i:i + 1]) for i in range(B)))
-print(f"  (앞지름 수가 같은 세션 {n_same}/{B})")
+gap = np.linalg.norm(zo["st"][:, :, :2].astype(float) - zn["st"][:, :, :2].astype(float), axis=-1)      # (T+1, B)
+dt_ = float(zn["dt"])
+first = lambda thr: np.where((gap > thr).any(0), (gap > thr).argmax(0) * dt_, np.inf)
+f1, f50 = first(0.01), first(0.5)
+print(f"  (앞지름 수가 같은 세션 {n_same}/{B}; 우리 차 자리가 보통 주행과 1 cm 넘게 갈라진 첫 시각 중앙 {np.median(f1):.1f} s, "
+      f"0.5 m 넘게 {np.median(f50):.1f} s (안 갈라진 세션 {int(np.isinf(f50).sum())}개); 90 s 끝 두 주행의 차 중앙 {np.median(gap[-1]):.1f} m)")
 
 # ---------------------------------------------------------------- (나) realised error
 def realised(z):
