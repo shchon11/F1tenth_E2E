@@ -461,9 +461,10 @@ function drawMap(f, carP, oppP, T, trail) {
   // ---- the other car: its own plan (thin), and our prediction of its next second (points fading with time, its body at
   // 0.5 s and 1.0 s), as strong as the policy is sure it sees a car
   if (oppP && okPts(f.opp_plan)) line([[oppP[0], oppP[1]], ...f.opp_plan], C.opp, 1.5, 0.55);
-  const pr = f.pred && okPts(f.pred.pts) ? f.pred : null;
+  // (11-25, the user: faint pink with no car around) only when a car is in this race and the head says it sees one
+  const pr = f.pred && okPts(f.pred.pts) && f.opp && (f.pred.p == null || +f.pred.p >= 0.5) ? f.pred : null;
   if (pr) {
-    const Q = pr.pts, pv = Math.max(0, Math.min(1, pr.p == null ? 1 : +pr.p)), pa = 0.15 + 0.85 * pv;
+    const Q = pr.pts, pv = Math.max(0, Math.min(1, pr.p == null ? 1 : +pr.p)), pa = pv;
     line(oppP ? [[oppP[0], oppP[1]], ...Q] : Q, C.opp, 1.5, 0.3 * pa);
     for (const [k, a] of [[4, 0.75], [9, 0.5]]) {
       if (k >= Q.length) continue;
