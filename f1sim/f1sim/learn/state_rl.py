@@ -1496,6 +1496,13 @@ def plan_env_fields(ar) -> dict:
     # 11-16 (the user: the console car slides, "존나 미끌미끌"): steering x1.0 instead of 1.47 looked better in 30 s sessions
     # (walls 0.43 -> 0.27, slip p90 12.9 -> 11.1 deg; tools/map_slip_sweep.sh) but the paired 90 s exam said walls 0.17 -> 0.57
     # per session (+0.40 +- 0.12) -> kept at 1.47. A longer lookahead slid less (8.6 deg) but hit walls 2.8 per 30 s
+    # 11-24 (the user on the new map korea26_scan, scan31b2 u600: "존나 흔들리네") re-checked, kept as it is: on exam3 the
+    # current setting wobbles 0.59 rad/s (exact execution 0.19) with slip p90 13.4 deg, and every setting that wobbles less hit
+    # more walls in the narrow S-chicane between the island and the right wall (paired 90 s exam3, 128 sessions): steering
+    # x1.3 + speed lead 0.25 s 0.52 rad/s, solo walls 0.22 -> 0.64; x1.2 + lead 0.3 0.47, -> 1.11; the controller room's tail
+    # optimum (tools/map_room.py: L1 = max(1.23, 0.26 v + 0.22), no extra gain, delay_comp 0.055, lead 0.27) 0.38, -> 7.4
+    # (it straightens the S); PlanMPC (defaults) tracked best (0.5 s lateral 13.5 cm vs 16.2) but hit walls 7.9 per session.
+    # tools/map_tune_scan.py, map_room.py, wall_sides.py
     TW_MAP = dict(t_clip_min=0.78, m_l1=0.37, q_l1=-0.49, lut_interp="linear", v_steer_gain_max=1.47, acc_scaler_for_steer=1.0,
                   dec_scaler_for_steer=1.0, delay_comp=0.009, speed_lookahead_for_steer=0.133, tw_speed_lead=0.141)
     if os.environ.get("F1SIM_MAP_OLD") == "1":
