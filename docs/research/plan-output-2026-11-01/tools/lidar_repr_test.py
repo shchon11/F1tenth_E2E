@@ -260,7 +260,9 @@ class OppData:
     """everything on the GPU; `batch(rows)` builds a model's inputs"""
 
     def __init__(self, D, angles, tgt, msk, meta):
-        self.scan = torch.as_tensor(D["scan"], device=DEV)                           # (T, B, beams) f16
+        # the scans stay in (pinned) host memory, gathered per batch: the lab GPU is shared with the race exams
+        self.scan = torch.as_tensor(D["scan"]).pin_memory() if DEV.type == "cuda" else torch.as_tensor(D["scan"])
+        self.t_c = torch.as_tensor(meta["t"]).long(); self.b_c = torch.as_tensor(meta["b"]).long()
         self.st = torch.as_tensor(D["st"], dtype=torch.float32, device=DEV)         # (T+1, B, 3)
         ego = D["ego"][..., [0, 2]].astype(np.float32) / np.array([5.0, 2.0], np.float32)
         self.ego = torch.as_tensor(ego, device=DEV)                                  # (T, B, 2)
@@ -270,8 +272,14 @@ class OppData:
         self.there = torch.as_tensor(meta["there"], device=DEV)
         self.geo = Geo(angles)
 
+    def gather(self, t_c, b_c, ages):
+        """scans at decisions t - age of sessions b (host gather, then to the GPU): (n, *ages.shape, beams)"""
+        sh = (-1,) + (1,) * ages.dim()
+        return self.scan[t_c.view(sh) - ages[None], b_c.view(sh)].to(DEV, non_blocking=True)
+
     def batch(self, net: OppNet, rows, mirror=None, gen=None):
         t, b = self.t[rows], self.b[rows]
+        rc = rows.cpu(); t_c, b_c = self.t_c[rc], self.b_c[rc]
         n = rows.numel()
         if mirror is None:
             mirror = torch.zeros(n, dtype=torch.bool, device=DEV)
@@ -281,15 +289,15 @@ class OppData:
         k = net.kind
         if k == "polar_gru":
             # step s (oldest first) = the decision 9 - s back; its 3-scan stack as the policy reads it (newest channel first)
-            a = torch.arange(9, -1, -1, device=DEV)[:, None] + torch.arange(3, device=DEV)[None]       # (10, 3)
-            x = self.scan[t[:, None, None] - a[None], b[:, None, None]]                               # (n, 10, 3, beams)
+            a = torch.arange(9, -1, -1)[:, None] + torch.arange(3)[None]                               # (10, 3)
+            x = self.gather(t_c, b_c, a)                                                              # (n, 10, 3, beams)
             x = torch.where(mirror[:, None, None, None], x.flip(-1), x)
         elif k.startswith("polar"):
-            x = self.scan[(t[:, None] - torch.arange(net.N, device=DEV)[None]), b[:, None]]       # (n, N, beams)
+            x = self.gather(t_c, b_c, torch.arange(net.N))                                       # (n, N, beams)
             x = torch.where(mirror[:, None, None], x.flip(-1), x)
         else:
             N = net.N
-            sc = self.scan[(t[:, None] - torch.arange(N, device=DEV)[None]), b[:, None]]          # (n, N, beams)
+            sc = self.gather(t_c, b_c, torch.arange(N))                                          # (n, N, beams)
             poses = self.st[(t[:, None] - torch.arange(N, device=DEV)[None]), b[:, None]]         # (n, N, 3) world
             rel = rel_chain(poses, net.noise, gen)                                               # (n, N, 3) in frame now
             px, py, ok = self.geo.points(sc, self.mount[b])
@@ -635,7 +643,7 @@ def stream(net, data, sess, train, noise=0.0, opt=None, sch=None, gen=None, keep
     out_rows, losses = [], []
     for t0 in range(0, T, CHUNK):
         ts = list(range(t0, min(t0 + CHUNK, T)))
-        with torch.set_grad_enabled(train and kind == "box_gru"):
+        with torch.set_grad_enabled(train):
             if kind == "box_gru":
                 x = torch.stack([data.stack3(t, sess) for t in ts], 1)                     # (n, L, 3, beams)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -753,7 +761,7 @@ def run_box(kind, out_dir, bases):
     if os.environ.get("REPR_VAL_MOD"):
         val = (D["idx"].astype(int) % int(os.environ["REPR_VAL_MOD"])) == 0
     log(f"[{kind}] 세션 {B} (검증 = 배치 {sorted(set(lay[val].tolist()))[:20]}.. {val.sum()}개), 타깃(숨은·본 적 있는 8 m 안 상자) "
-        f"결정당 {tgt.sum() / tgt.shape[0] / B:.3f}개, 나이 중앙 {np.median(age[tgt]):.1f} s")
+        f"결정당 {tgt.sum() / tgt.shape[0] / B:.3f}개, 나이 중앙 {np.median(age[tgt]) if tgt.any() else float('nan'):.1f} s")
     data = BoxData(D, angles, tgt, age, neutral, rel)
     del D
     net = BoxNet(base_kind, data.scan.shape[-1]).to(DEV)
@@ -844,7 +852,7 @@ def run_box(kind, out_dir, bases):
     json.dump(dict(kind=kind, params=n_par, flops=fl, ms=ms, thr=thr, curves=curves, res=res, epochs=BOX_EPOCHS,
                    n_train_sess=int(len(tr_s)), n_val_sess=int(len(va_s)), noise_train=noise_tr,
                    peak_gpu_mb=torch.cuda.max_memory_allocated() / 2 ** 20,
-                   age_all_targets=np.percentile(age[tgt], [10, 25, 50, 75, 90]).tolist()),
+                   age_all_targets=np.percentile(age[tgt], [10, 25, 50, 75, 90]).tolist() if tgt.any() else []),
               open(os.path.join(out_dir, f"box_{kind}.json"), "w"), indent=1)
     log(f"[{kind}] 끝: FLOPs {fl / 1e6:.1f} M, batch 1 {ms:.2f} ms, GPU 최고 {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MB")
 
@@ -871,6 +879,8 @@ def table(out_dir):
     have = [(k, n) for k, n in OPP_NAMES if os.path.exists(os.path.join(out_dir, f"opp_{k}.npz"))]
     if have:
         R = {k: np.load(os.path.join(out_dir, f"opp_{k}.npz")) for k, _ in have}
+        r0 = R[have[0][0]]["rows"]
+        have = [(k, n) for k, n in have if np.array_equal(R[k]["rows"], r0)]       # the same held-out decisions only
         J = {k: json.load(open(os.path.join(out_dir, f"opp_{k}.json"))) for k, _ in have}
         z = R[have[0][0]]
         tgt, msk, th = z["tgt"], z["msk"], z["meta_there"].astype(bool)
