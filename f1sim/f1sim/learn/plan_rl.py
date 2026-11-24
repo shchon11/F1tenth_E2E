@@ -720,8 +720,10 @@ def init_actor(actor, sd0: dict) -> str:
     (`OppPredictor.kin_reset`, as built), and the trunk's 20 columns that read the predicted points start at zero (the
     column of P(visible) kept) -- the plan learns to read the new paths from scratch. The fork then drives as its parent
     except for what the parent's plan took from its old points (those weights are gone; race32c u800: rms 0.007 against
-    0.04 for the trunk's other inputs -- `tools/pred_zero_init_check.py ... smooth` measures the plans' difference);
-    "" otherwise"""
+    0.04 for the trunk's other inputs). Measured (`tools/pred_zero_init_check.py <ck> 8 100 cuda smooth`, race32c u800,
+    800 decisions in races against copies): the plan's 1.0 s point moved 5.3 cm median / 19 cm p90 / 33 cm max where the
+    parent's head said the car was there (22 %), 0.2 / 0.9 cm elsewhere; against the parent with its point columns zeroed
+    the fork is bit-identical (cuda). "" otherwise"""
     sd = dict(sd0)
     w = sd["trunk.0.weight"]
     sd["trunk.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], actor.trunk[0].in_features - w.shape[1], device=w.device)], 1)
