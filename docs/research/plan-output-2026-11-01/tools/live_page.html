@@ -6,40 +6,66 @@
 <title>학습 차 실시간</title>
 <style>
   /* Layout after the robotics/telemetry viewers it borrows from: one dominant top-down view whose camera follows the
-     car (Foxglove 3D panel, Rerun's follow camera), a small whole-track inset with the car on it (F1 live-timing track
-     maps), and beside it time-series strips on ONE shared time axis with the events marked across all of them
-     (Rerun timeline, Foxglove plot panel, Apollo Dreamview's PnC monitor). Colours: the dataviz reference palette's dark
-     steps (validated: tools/../ dataviz validate_palette, dark, all checks pass). */
+     car (Foxglove 3D panel, Rerun's follow camera), beside it the reward's parts and the memory.
+     (11-24, the user: "예측하는거나 좀 시각화도 더 예쁘게", "보상 항목도 좀 너무 별로", "일어난일은 왜있는거야") colour by
+     entity, so the map needs no key: our car, its trail and its plan in one blue; the other car, its own plan and our
+     prediction of it in one magenta; boxes amber; a plan that touches something in the critical red. Light and dark are
+     each their own steps of the dataviz reference palette (validate_palette: blue / magenta / amber pass all-pairs on the
+     lane colour in both modes). */
   :root {
+    color-scheme: light;
+    --page: #f3f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --line: #e1e0d9; --grid: #ebeae5;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --lane: #fbfaf8; --wall: #d9d8d1; --band: #f2e4e1; --scan: #9ba2ac;
+    --ego: #2a78d6; --opp: #cf4a86; --box: #c98500; --mem: #a66d00; --aqua: #1baf7a;
+    --critical: #d03b3b; --warning: #fab219; --good: #0ca30c;
+    --pos: #256abf; --neg: #c93b3a;
+    --wall-hit: #e34948; --box-hit: #eda100; --wall-ink: #c93b3a; --box-ink: #8f6000;
+    --veil: rgba(243, 243, 240, 0.55); --veil-box: rgba(252, 252, 251, 0.94);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0f12; --surface: #15181d; --surface-2: #1b1f25; --line: #2a2f37; --grid: #23272e;
+      --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+      --lane: #20242b; --wall: #0b0c0e; --band: #3b2b2f; --scan: #6b7480;
+      --ego: #3987e5; --opp: #d55181; --box: #c98500; --mem: #fab219; --aqua: #199e70;
+      --pos: #5598e7; --neg: #e66767;
+      --wall-hit: #e66767; --box-hit: #fab219; --wall-ink: #e66767; --box-ink: #fab219;
+      --veil: rgba(13, 15, 18, 0.55); --veil-box: rgba(21, 24, 29, 0.92);
+    }
+  }
+  :root[data-theme="dark"] {
     color-scheme: dark;
     --page: #0d0f12; --surface: #15181d; --surface-2: #1b1f25; --line: #2a2f37; --grid: #23272e;
     --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
-    --lane: #22272e; --wall: #0b0c0e; --scan: #6b7480;
-    --s-car: #3987e5; --s-plan: #d95926; --s-mean: #199e70; --s-box: #c98500; --s-copy: #9085e9; --s-opp: #e66767;
-    --critical: #d03b3b; --warning: #fab219;
-    --band: #50332c;   /* the car's half-width band along walls and boxes: lane mixed 25 % toward the plan's orange */
+    --lane: #20242b; --wall: #0b0c0e; --band: #3b2b2f; --scan: #6b7480;
+    --ego: #3987e5; --opp: #d55181; --box: #c98500; --mem: #fab219; --aqua: #199e70;
+    --pos: #5598e7; --neg: #e66767;
+    --wall-hit: #e66767; --box-hit: #fab219; --wall-ink: #e66767; --box-ink: #fab219;
+    --veil: rgba(13, 15, 18, 0.55); --veil-box: rgba(21, 24, 29, 0.92);
   }
   * { box-sizing: border-box; }
   /* 11-17 (the user: "지도 스크롤해야하는거 좆같음. 화면도 맞춰놓고. 그래프도 짤려서"): the page is exactly the window -- no page scroll;
-     the map takes what is left of the height, the four strips share the side column, every canvas is drawn at its own pixel size */
+     the map takes what is left of the height, every canvas is drawn at its own pixel size */
   html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
   body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
   header { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
   header .title { font-size: 15px; font-weight: 600; margin-right: 4px; }
   select, button { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; font: inherit; }
   button { cursor: pointer; color: var(--ink-2); }
-  button.on { color: var(--ink); border-color: var(--s-car); }
+  button.on { color: var(--ink); border-color: var(--ego); }
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); white-space: nowrap; }
   .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .pill.live .dot { background: #0ca30c; }
+  .pill.live .dot { background: var(--good); }
   .pill.wait .dot { background: var(--warning); }
   .pill.scene { border-color: var(--warning); color: var(--ink); }
   .grow { flex: 1; }
   /* (11-17, the user: "update에 필요한 결정 수 비율이랑 현재 에피소드 진행 비율만 상단에") two progress pills */
   .prog { display: inline-flex; align-items: center; gap: 8px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .prog .bar { width: 120px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
-  .prog .bar i { display: block; height: 100%; width: 0; background: var(--s-car); border-radius: 3px; }
-  .prog.ep .bar i { background: var(--s-mean); }
+  .prog .bar i { display: block; height: 100%; width: 0; background: var(--ego); border-radius: 3px; }
+  .prog.ep .bar i { background: var(--aqua); }
   main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(300px, 27vw, 440px); gap: 10px; padding: 10px 14px 12px; }
   .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
   .mapwrap { position: relative; padding: 0; overflow: hidden; min-height: 0; }
@@ -48,55 +74,42 @@
   .hud { position: absolute; left: 14px; top: 12px; pointer-events: none; }
   .hud .v { font-size: 34px; font-weight: 600; line-height: 1; }
   .hud .u { font-size: 13px; color: var(--ink-2); margin-left: 4px; }
-  .hud .sub { color: var(--ink-2); margin-top: 6px; }
-  .key { position: absolute; left: 14px; bottom: 10px; right: 230px; display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--ink-2); font-size: 12px; pointer-events: none; }
-  .key i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
-  .key i.box { width: 9px; height: 9px; border-radius: 2px; }
+  .hud .sub { color: var(--ink-2); margin-top: 6px; font-variant-numeric: tabular-nums; }
   .viewbar { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; align-items: center; }
   /* (11-17, the user: "update 반영중을 좀 지도 뿌옇게 하고 문구를 박아놔. 렉걸린줄 알잖아") between rollouts the car stands still on
-     purpose: the map goes hazy and says so */
+     purpose: the map goes hazy and says so, with the seconds it has waited (no spinner: nothing on this page animates on its own) */
   #veil { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: none;
-          background: rgba(13, 15, 18, 0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+          background: var(--veil); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
   #veil.on { display: flex; }
-  #veil div { padding: 14px 22px; border-radius: 10px; background: rgba(21, 24, 29, 0.92); border: 1px solid var(--line);
-              font-size: 20px; font-weight: 600; color: var(--ink); text-align: center; line-height: 1.35; }
-  #veil .spin { display: inline-block; width: 18px; height: 18px; margin-right: 10px; vertical-align: -2px; border-radius: 50%;
-                border: 3px solid rgba(240, 239, 236, 0.22); border-top-color: var(--ink); animation: spin 0.9s linear infinite; }
-  #veil.stopped .spin { display: none; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .side { min-height: 0; display: flex; flex-direction: column; gap: 8px; }
-  .strip { flex: 1 1 0; min-height: 96px; display: flex; flex-direction: column; padding: 8px 10px 6px; }
-  .strip h3 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; overflow: hidden; }
-  .strip h3 .now { margin-left: auto; font-weight: 600; font-size: 15px; }
-  .strip h3 .note { color: var(--muted); font-weight: 400; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
-  .strip .legend { display: flex; gap: 14px; color: var(--ink-2); font-size: 12px; margin-top: 1px; }
-  .strip .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; }
-  .strip .cv { position: relative; flex: 1; min-height: 56px; margin-top: 4px; }
-  .strip canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  #events { flex: 0 0 132px; display: flex; flex-direction: column; padding: 8px 10px; }
+  #veil div { padding: 14px 22px; border-radius: 10px; background: var(--veil-box); border: 1px solid var(--line);
+              font-size: 20px; font-weight: 600; color: var(--ink); text-align: center; line-height: 1.35; font-variant-numeric: tabular-nums; }
+  .side { min-height: 0; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
   /* (11-22, the user: "항목별 보상값들이라던지 아니면 좀 기억관련 좀 직관적이게") the reward's parts and what the memory thinks */
-  #rwp, #memp { padding: 8px 10px; }
-  #rwp h3, #memp h3 { margin: 0 0 4px; font-size: 13px; }
+  #rwp, #memp { padding: 10px 12px 10px; }
+  #rwp h3, #memp h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
   .rwt { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
-  .rwt th { font-weight: 400; color: var(--muted); text-align: right; padding: 1px 6px; }
-  .rwt td { text-align: right; padding: 1px 6px; color: var(--ink); }
-  .rwt td:first-child { text-align: left; color: var(--ink-2); }
-  .rwt tr.tot td { border-top: 1px solid var(--line); font-weight: 600; }
-  .laps, .memrow { font-size: 13px; color: var(--ink-2); margin-top: 4px; font-variant-numeric: tabular-nums; }
-  #events h3 { margin: 0 0 4px; font-size: 13px; }
-  #evlist { flex: 1; min-height: 0; overflow: auto; font-size: 12px; }
-  #evlist div { display: flex; gap: 10px; padding: 3px 0; border-top: 1px solid var(--grid); color: var(--ink-2); }
-  #evlist .t { color: var(--muted); width: 64px; flex: none; font-variant-numeric: tabular-nums; }
-  #evlist .crit { color: var(--ink); }
-  #evlist .crit::before { content: "⚠"; color: var(--critical); margin-right: 4px; }
+  .rwt th { font-weight: 400; font-size: 12px; color: var(--muted); text-align: right; padding: 0 6px 4px; white-space: nowrap; }
+  .rwt td { text-align: right; padding: 3px 6px; color: var(--ink); white-space: nowrap; border-top: 1px solid var(--grid); }
+  .rwt tbody tr:first-child td { border-top: 0; }
+  .rwt td.n { text-align: left; color: var(--ink-2); padding-left: 0; white-space: normal; }
+  .rwt td.p { color: var(--pos); } .rwt td.m { color: var(--neg); } .rwt td.z { color: var(--muted); }
+  .rwt td.b { width: 72px; padding: 0 0 0 6px; }
+  .rwt th:last-child { padding-right: 0; }
+  /* one quiet bar per part: this episode's sum, from the zero line (right = adds, left = takes away) */
+  .rwt .bar { position: relative; display: block; height: 26px; }
+  .rwt .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .rwt .bar i { position: absolute; top: 10px; height: 6px; border-radius: 2px; }
+  .rwt .bar i.p { background: var(--pos); } .rwt .bar i.m { background: var(--neg); }
+  .rwt tr.tot td { border-top: 1px solid var(--ink-2); padding-top: 5px; font-weight: 600; font-size: 14px; }
+  .rwt tr.tot td.n { color: var(--ink); }
+  .laps, .memrow { font-size: 13px; color: var(--ink-2); margin-top: 6px; font-variant-numeric: tabular-nums; }
   .empty { padding: 40px; color: var(--muted); text-align: center; }
-  /* narrow screens: map on top (most of the height), strips under it, the page scrolls there only */
+  /* narrow screens: map on top (most of the height), the panels under it, the page scrolls there only */
   @media (max-width: 900px) {
     body { height: auto; overflow: auto; }
     main { grid-template-columns: 1fr; }
     .mapwrap { height: 62vh; }
-    .strip { flex: none; height: 150px; }
-    .key { right: 14px; bottom: 44px; }
+    .side { overflow: visible; }
   }
   /* (11-20, the user: "저 이미지 추이들을 ... 실시간에다가 계속 업로드 ... 쭈르르륵 드래그하면 어디박았는지 볼 수 있게") the exam's
      collision map per checkpoint: the header button swaps the live view for it; one slider over the checkpoints (the runs it was
@@ -118,13 +131,13 @@
   .sp_top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
   .sp_info { font-size: 14px; color: var(--ink); }
   .sp_info .m { color: var(--ink-2); }
-  .sp_info .w { color: var(--s-opp); } .sp_info .b { color: var(--warning); }
+  .sp_info .w { color: var(--wall-ink); } .sp_info .b { color: var(--box-ink); }
   .sp_body { flex: 1; min-height: 0; display: flex; justify-content: center; }
   .sp_body img { height: 100%; width: auto; max-width: 100%; object-fit: contain; border-radius: 6px; }
   #sp_strip { width: 100%; height: 92px; display: block; cursor: pointer; flex: none; }
   #sp_lap { width: 100%; height: 64px; display: block; cursor: pointer; flex: none; }
   #sp_slider { flex: none; }
-  #sp_slider { width: 100%; accent-color: var(--s-car); }
+  #sp_slider { width: 100%; accent-color: var(--ego); }
   .sp_ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -147,26 +160,15 @@
     <canvas id="map"></canvas>
     <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span></div>
       <div class="sub" id="hud_sub">-</div></div>
-    <div class="key">
-      <span><i style="background:var(--s-car)"></i>우리 차 · 자취</span>
-      <span><i style="background:var(--s-plan)"></i>실제로 몬 plan</span>
-      <span><i style="background:var(--s-mean);height:2px"></i>평균 행동의 plan (잡음 없음)</span>
-      <span class="k-opp"><i style="background:var(--s-opp)"></i>상대 차</span>
-      <span class="k-opp"><i style="background:var(--s-copy)"></i>상대 = 우리 복제본</span>
-      <span><i class="box" style="background:var(--s-box)"></i>상자</span>
-      <span><i class="box" style="background:var(--band);width:14px;box-shadow:0 0 0 1px #7a5246"></i>차 반폭 띠</span>
-      <span><i class="box" style="background:transparent;border:2px solid var(--critical)"></i>plan이 닿는 자리</span>
-    </div>
-    <div id="veil"><div><span class="spin"></span><span id="veil_t">update 반영 중</span></div></div>
+    <div id="veil"><div id="veil_t">update 반영 중</div></div>
     <div class="viewbar"><button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
   </section>
   <section class="side">
     <!-- (11-22, the user: "필요한것만 넣어", "속도이런건 plot할 필요가 없자나", "항목별 보상값들 ... 기억관련 ... 직관적이게") -->
     <div class="panel" id="rwp" hidden><h3>보상 항목</h3>
-      <table class="rwt"><thead><tr><th></th><th>최근 10초</th><th>이번 에피소드</th></tr></thead><tbody id="rw_b"></tbody></table>
+      <table class="rwt"><thead><tr><th></th><th>최근 10초</th><th>이번 에피소드</th><th></th></tr></thead><tbody id="rw_b"></tbody></table>
       <div class="laps" id="laps"></div></div>
-    <div class="panel" id="memp" hidden><h3>기억 <span class="note">앞에 있다고 보는 상자 · 지도의 점선 원</span></h3><div id="mem_b"></div></div>
-    <div class="panel" id="events"><h3>일어난 일</h3><div id="evlist"></div></div>
+    <div class="panel" id="memp" hidden><h3>기억</h3><div id="mem_b"></div></div>
   </section>
   <section class="panel" id="spots">
     <div class="sp_top">
@@ -183,15 +185,15 @@
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-const tok = (k) => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const setText = (el, s) => { if (el.textContent !== s) el.textContent = s; };     // no re-layout when nothing changed
 const C = {};
-for (const k of ["page","surface","line","grid","ink","ink-2","muted","lane","wall","scan","s-car","s-plan","s-mean","s-box","s-copy","s-opp","critical","warning","band"]) C[k] = tok("--" + k);
+const TOKENS = ["page", "surface", "line", "grid", "ink", "ink-2", "muted", "lane", "wall", "band", "scan", "ego", "opp", "box", "mem",
+                "critical", "warning", "wall-hit", "box-hit"];
+function readTokens() { const cs = getComputedStyle(document.documentElement); for (const k of TOKENS) C[k] = cs.getPropertyValue("--" + k).trim(); }
+readTokens();
 
-const SPAN_S = 20;                                  // the strips show the last 20 s of decisions
 let RUN = new URLSearchParams(location.search).get("run") || "", TRACK = {}, lastKey = null, CAR = "0";
 let F0 = null, F1 = null, t1 = 0, dtF = 0.15;        // the two newest frames, for a smooth car between them
-const S = [];                                       // history: {t, v, vp, val, pc, mc}
-const EV = [];                                      // events on the time axis: {t, kind}
 const PR = { H: 0, maxK: -1, prevK: null, epDec: null, trailLen: null };   // rollout length, this episode's decisions (null: unknown yet)
 
 // ---------------------------------------------------------------- canvas at its own pixel size (no stretched text)
@@ -203,12 +205,23 @@ function fit(c) {
   return { g, W: w, H: h };
 }
 
+// ---------------------------------------------------------------- drawing only when something changed
+// (11-18) a map redrawn on every animation frame took 72 % of the display GPU, which also trains. (11-24) Now the map is drawn
+// when a new decision arrives, then for the ~0.2 s that eases the car from the last pose to the new one (at most ~15 times a
+// second), and on a zoom, drag or resize -- and not at all while the training is between rollouts.
+let drawPending = false, lastDraw = 0;
+function requestDraw() {
+  if (drawPending) return;
+  drawPending = true;
+  setTimeout(() => requestAnimationFrame(() => { drawPending = false; frame().catch(() => {}); }), Math.max(0, 66 - (performance.now() - lastDraw)));
+}
+
 // ---------------------------------------------------------------- the map's camera: follow the car (default), or free
 // wheel = zoom about the pointer, drag = move (leaves follow), double click = back to following, 전체 트랙 = the whole track
 const VIEW = { mode: "follow", span: 9, cx: 0, cy: 0, ox: 0, oy: 0 };   // span: metres across the map's width; ox/oy: offset while following
 let LAST = null;                                             // the last drawn camera {cx, cy, s, W, H, T}
 const CAM = { x: 0, y: 0, t: 0 };                            // the following camera, eased toward the car
-function setMode(m) { VIEW.mode = m; $("v_follow").className = m === "follow" ? "on" : ""; $("v_track").className = m === "track" ? "on" : ""; }
+function setMode(m) { VIEW.mode = m; $("v_follow").className = m === "follow" ? "on" : ""; $("v_track").className = m === "track" ? "on" : ""; requestDraw(); }
 function toggleFollow() {
   if (VIEW.mode === "follow") { if (LAST) { VIEW.cx = LAST.cx; VIEW.cy = LAST.cy; VIEW.span = LAST.W / LAST.s; } setMode("free"); }
   else { VIEW.ox = VIEW.oy = 0; VIEW.span = Math.min(VIEW.span, 14); setMode("follow"); }
@@ -223,6 +236,7 @@ $("v_track").onclick = () => setMode("track");
     const r = c.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
     const T = LAST.T, maxSpan = Math.max(T.W, T.H) * T.res * 1.6;
     const s0 = LAST.s, span1 = Math.max(1.2, Math.min(maxSpan, LAST.W / s0 * k)), s1 = LAST.W / span1;
+    requestDraw();
     if (VIEW.mode === "follow") { VIEW.span = span1; return; }          // following: zoom only, the car stays in the middle
     // free / track: keep the point under the pointer where it is
     const wx = LAST.cx + (px - LAST.W / 2) / s0, wy = LAST.cy - (py - LAST.H / 2) / s0;
@@ -234,7 +248,7 @@ $("v_track").onclick = () => setMode("track");
     if (!drag) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     if (!drag.moved && Math.hypot(dx, dy) < 3) return;
-    drag.moved = true;
+    drag.moved = true; requestDraw();
     if (VIEW.mode === "follow") { VIEW.ox = drag.ox - dx / drag.s; VIEW.oy = drag.oy + dy / drag.s; return; }   // still following, just offset
     if (VIEW.mode === "track") { VIEW.span = LAST.W / drag.s; setMode("free"); }
     VIEW.cx = drag.cx - dx / drag.s; VIEW.cy = drag.cy + dy / drag.s;
@@ -244,7 +258,7 @@ $("v_track").onclick = () => setMode("track");
   c.addEventListener("dblclick", toggleFollow);
 })();
 
-function resetCar() { S.length = 0; EV.length = 0; F0 = F1 = null; lastKey = null; $("evlist").innerHTML = ""; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; PR.trailLen = null; }
+function resetCar() { F0 = F1 = null; lastKey = null; PR.H = 0; PR.maxK = -1; PR.prevK = null; PR.epDec = null; PR.trailLen = null; }
 // (11-22, the user: "이차밖에 못보나? 다른 차들을 볼 수 없나") the cars this run writes (plan_rl --live-taps), one picked at a time
 async function loadCars() {
   if (!RUN) return;
@@ -262,30 +276,37 @@ async function loadCars() {
 }
 async function loadRuns() {
   const r = await (await fetch("/api/live_runs")).json();
-  const sel = $("run"); const cur = sel.value || RUN; sel.innerHTML = "";
-  for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = x.name; sel.appendChild(o); }
+  const sel = $("run"); const cur = sel.value || RUN;
+  const want = r.map((x) => x.name).join(",");
+  if (sel.dataset.runs !== want) {                     // the list only when it changed (an open picker is not reset)
+    sel.dataset.runs = want; sel.innerHTML = "";
+    for (const x of r) { const o = document.createElement("option"); o.value = x.name; o.textContent = x.name; sel.appendChild(o); }
+  }
   if (!r.length) return;
   RUN = r.some((x) => x.name === cur) ? cur : r[0].name; sel.value = RUN;
   sel.onchange = () => { RUN = sel.value; history.replaceState(null, "", "?run=" + RUN); CAR = "0"; resetCar(); loadCars().catch(() => {}); };
 }
 
+// the walls/lane image in the page's colours: the server sends three grey levels (lane, the car's half-width band along the
+// walls, wall); the classes are kept to re-tint on a theme change and to test the plan's footprint against
+function tint(t) {
+  const cv = t.img || document.createElement("canvas"); cv.width = t.W; cv.height = t.H;
+  const g = cv.getContext("2d"), d = g.createImageData(t.W, t.H), cols = [hex(C.lane), hex(C.band), hex(C.wall)];
+  for (let i = 0, j = 0; j < t.mask.length; i += 4, j++) { const c = cols[t.mask[j]]; d.data[i] = c[0]; d.data[i + 1] = c[1]; d.data[i + 2] = c[2]; d.data[i + 3] = 255; }
+  g.putImageData(d, 0, 0); t.img = cv;
+}
 async function track(tid) {
   const k = RUN + ":" + tid;
   if (!TRACK[k]) {
     const t = await (await fetch(`/api/live_track?run=${encodeURIComponent(RUN)}&tid=${tid}`)).json();
-    // re-tint the walls/lane image to the page's colours once
     const im = new Image(); im.src = t.png; await im.decode();
     const cv = document.createElement("canvas"); cv.width = t.W; cv.height = t.H;
     const g = cv.getContext("2d"); g.drawImage(im, 0, 0);
-    const d = g.getImageData(0, 0, t.W, t.H), L = hex(C.lane), Wl = hex(C.wall), Bd = hex(C.band);
-    // (11-18) three grey levels from the server: lane, the car's half-width band along the walls, wall; the wall cells are
-    // kept to test the plan's footprint corners against, as the plan-hit cost does
+    const d = g.getImageData(0, 0, t.W, t.H);
+    // (11-18) lane 246, band 160, wall 70; the wall cells are what the plan's footprint is tested against, as the plan-hit cost does
     t.mask = new Uint8Array(t.W * t.H);
-    for (let i = 0, j = 0; i < d.data.length; i += 4, j++) {
-      const v = d.data[i], m = v > 200 ? 0 : v > 110 ? 1 : 2, c = m === 0 ? L : m === 1 ? Bd : Wl;
-      t.mask[j] = m; d.data[i] = c[0]; d.data[i + 1] = c[1]; d.data[i + 2] = c[2]; d.data[i + 3] = 255;
-    }
-    g.putImageData(d, 0, 0); t.img = cv;
+    for (let i = 0, j = 0; i < d.data.length; i += 4, j++) { const v = d.data[i]; t.mask[j] = v > 200 ? 0 : v > 110 ? 1 : 2; }
+    t.img = cv; tint(t);
     t.car = t.car || [0.58, 0.31]; t.hit_s = t.hit_s || 1.0; t.hit_wall_s = t.hit_wall_s || t.hit_s;
     t.ext = {};                                       // each box shape's extent in its own frame
     for (const [id, fp] of Object.entries(t.fp || {})) {
@@ -297,31 +318,30 @@ async function track(tid) {
   return TRACK[k];
 }
 function hex(h) { const n = parseInt(h.replace("#", ""), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
-
-function addEvent(text, crit) {
-  const d = document.createElement("div");
-  d.innerHTML = `<span class="t">${new Date().toLocaleTimeString("ko-KR", { hour12: false })}</span><span class="${crit ? "crit" : ""}">${text}</span>`;
-  $("evlist").prepend(d); while ($("evlist").children.length > 80) $("evlist").lastChild.remove();
-}
+// light / dark follow the device; a switch re-reads the colours, re-tints the tracks and redraws
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  readTokens(); for (const t of Object.values(TRACK)) tint(t); requestDraw(); if (SP.open) spStrip();
+});
 
 // ---------------------------------------------------------------- map
 const lerp = (a, b, u) => a + (b - a) * u;
 const lerpAng = (a, b, u) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * u; };
 function pose(A, B, u) { return B ? [lerp(A[0], B[0], u), lerp(A[1], B[1], u), lerpAng(A[2], B[2], u), lerp(A[3], B[3], u)] : A; }
+const okPts = (q) => Array.isArray(q) && q.length >= 2 && q.every((p) => Array.isArray(p) && isFinite(p[0]) && isFinite(p[1]));
 
 // (11-18, the user: "plan이 ... 안붙이히게 그려도 ... 차 폭 고려할 때 부딧할 수 있는거잖아", "plan이 닿는걸 좀 보게") the driven
 // plan's car body at every 0.025 s between its 0.1 s points, heading along the plan; the first pose whose body overlaps a wall
 // (within the run's wall look-ahead) or a box (within its box look-ahead). The whole body, not only its corners: the
 // training's plan-hit cost tests the four corners, which a box narrower than the car can pass between (dead centre) --
 // measured on qual26b u300: it missed 12 of 680 on-path passes and none of the 24 hard hits
-function planTouch(f, T) {
+function planTouch(f, T, dims) {
   const Q = f.plan, n = Q.length; if (n < 2 || !T.mask) return { poses: [], hit: null };
-  const hl = T.car[0] / 2, hw = T.car[1] / 2, SUB = 4;
-  if (!T.outline) {                                   // the body's outline, a point every <= 5 cm
+  const hl = dims[0] / 2, hw = dims[1] / 2, SUB = 4;
+  if (T.outlineKey !== dims.join()) {                 // the body's outline, a point every <= 5 cm
     const o = [], step = (a, b, m) => { for (let i = 0; i < m; i++) o.push([lerp(a[0], b[0], i / m), lerp(a[1], b[1], i / m)]); };
     const nl = Math.ceil(2 * hl / 0.05), nw = Math.ceil(2 * hw / 0.05);
     step([hl, hw], [hl, -hw], nw); step([hl, -hw], [-hl, -hw], nl); step([-hl, -hw], [-hl, hw], nw); step([-hl, hw], [hl, hw], nl);
-    T.outline = o;
+    T.outline = o; T.outlineKey = dims.join();
   }
   const wallAt = (x, y) => {
     const ix = Math.floor((x - T.x0) / T.res), iy = Math.floor((T.y0 + T.H * T.res - y) / T.res);
@@ -350,7 +370,7 @@ function planTouch(f, T) {
   let hit = null;
   for (const p of poses) {
     const c = Math.cos(p[2]), s = Math.sin(p[2]);
-    const cs = [[hl, hw], [hl, -hw], [-hl, hw], [-hl, -hw]].map(([a, b]) => [p[0] + a * c - b * s, p[1] + a * s + b * c]);
+    const cs = [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]].map(([a, b]) => [p[0] + a * c - b * s, p[1] + a * s + b * c]);
     const ol = T.outline.map(([a, b]) => [p[0] + a * c - b * s, p[1] + a * s + b * c]);
     const w = p[3] <= T.hit_wall_s + 1e-6 && ol.some(([x, y]) => wallAt(x, y));
     const bx = p[3] <= T.hit_s + 1e-6 && (ol.some(([x, y]) => boxAt(x, y)) || boxIn(p));
@@ -359,18 +379,24 @@ function planTouch(f, T) {
   return { poses: poses.filter((p, i) => i === 0 || i % SUB === 0), hit };
 }
 
+// heading along a path at point k (from the point before it; the first from `fb`)
+function headAt(Q, k, fb) {
+  const a = k > 0 ? Q[k - 1] : null, b = Q[k];
+  return a && Math.hypot(b[0] - a[0], b[1] - a[1]) > 0.01 ? Math.atan2(b[1] - a[1], b[0] - a[0]) : fb;
+}
+
 function drawMap(f, carP, oppP, T, trail) {
   const { g, W, H } = fit($("map"));
   g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
-  let cx, cy, span;
+  let cx, cy, span, moving = false;
   if (VIEW.mode === "follow") {
-    // (11-17, the user: "차 따라가는거 뭐이리 어지럽냐 ... 머리아파") the car in the middle, north up, nothing else: the look-ahead
-    // point that swung round with every heading change is gone, and the camera trails the car by a quarter second so the
-    // wiggles of an early policy do not shake the whole map. A jump (a new episode) moves it at once.
+    // (11-17, the user: "차 따라가는거 뭐이리 어지럽냐 ... 머리아파") the car in the middle, north up, nothing else: the camera trails
+    // the car by a quarter second so the wiggles of an early policy do not shake the whole map. A jump (a new episode) moves it at once.
     const tx = carP[0] + VIEW.ox, ty = carP[1] + VIEW.oy, now = performance.now();
-    if (!CAM.t || Math.hypot(tx - CAM.x, ty - CAM.y) > 3) { CAM.x = tx; CAM.y = ty; }
+    if (!CAM.t || Math.hypot(tx - CAM.x, ty - CAM.y) > 3 || now - CAM.t > 1000) { CAM.x = tx; CAM.y = ty; }
     else { const a = 1 - Math.exp(-(now - CAM.t) / 250); CAM.x += a * (tx - CAM.x); CAM.y += a * (ty - CAM.y); }
     CAM.t = now; cx = CAM.x; cy = CAM.y; span = VIEW.span;
+    moving = Math.hypot(tx - CAM.x, ty - CAM.y) > 0.01;
   }
   else if (VIEW.mode === "track") { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W * T.res, T.H * T.res * W / H) * 1.05; }
   else { cx = VIEW.cx; cy = VIEW.cy; span = VIEW.span; }
@@ -378,119 +404,129 @@ function drawMap(f, carP, oppP, T, trail) {
   LAST = Object.assign(LAST || {}, { cx, cy, s, W, H, T });
   const [ix, iy] = P(T.x0, T.y0 + T.H * T.res);
   g.imageSmoothingEnabled = s < 40; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s);
+  g.lineCap = "round"; g.lineJoin = "round";
+  const line = (pts, col, w, alpha, dash) => {
+    g.save(); g.globalAlpha = alpha; g.setLineDash(dash || []); g.strokeStyle = col; g.lineWidth = w; g.beginPath();
+    pts.forEach((q, i) => { const [x, y] = P(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); g.restore();
+  };
+  const dot = (x, y, r, col, alpha, ring) => {
+    g.save(); g.globalAlpha = alpha; g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fillStyle = col; g.fill();
+    if (ring) { g.strokeStyle = C.surface; g.lineWidth = ring; g.stroke(); }
+    g.restore();
+  };
+  // a car-sized body at a pose: true size, but never under 14 px long so it stays a shape when zoomed out
+  const body = (st, dims) => {
+    const k = Math.max(1, 14 / (dims[0] * s)), hl = dims[0] / 2 * k, hw = dims[1] / 2 * k;
+    const c0 = Math.cos(st[2]), s0 = Math.sin(st[2]);
+    return { c0, s0, hl, hw, at: (a, b) => P(st[0] + a * c0 - b * s0, st[1] + a * s0 + b * c0) };
+  };
+  const rect = (B, r) => {                          // a rounded rectangle in the body's frame (r in metres)
+    const { hl, hw, at } = B, n = 3, pts = [];
+    const corner = (cxm, cym, a0) => { for (let i = 0; i <= n; i++) { const a = a0 + i / n * Math.PI / 2; pts.push(at(cxm + r * Math.cos(a), cym + r * Math.sin(a))); } };
+    corner(hl - r, hw - r, 0); corner(-hl + r, hw - r, Math.PI / 2); corner(-hl + r, -hw + r, Math.PI); corner(hl - r, -hw + r, 1.5 * Math.PI);
+    g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
+  };
+  const dims = f.car_dims || T.car, odims = f.opp_dims || T.car;
+  const zf = Math.max(0.45, Math.min(1, s / 60));     // point marks shrink when zoomed out, so a plan's 0.1 s steps stay apart
+
   // LiDAR: quiet points
   g.fillStyle = C.scan;
   const ps = Math.max(1.5, Math.min(3.5, 0.03 * s));
   for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - ps / 2, y - ps / 2, ps, ps); }
   // boxes, each in its band of the car's half width (a stroke of the car's width centred on the outline), bands first
+  const boxes = f.boxes || [];
   const boxPath = (b) => {
     const fp = T.fp[String(b[0])]; if (!fp) return false;
     const c0 = Math.cos(b[3]), s0 = Math.sin(b[3]);
     g.beginPath(); fp.forEach((q, i) => { const [x, y] = P(b[1] + q[0] * c0 - q[1] * s0, b[2] + q[0] * s0 + q[1] * c0); i ? g.lineTo(x, y) : g.moveTo(x, y); });
     g.closePath(); return true;
   };
-  g.lineJoin = "round";
-  for (const b of f.boxes) if (boxPath(b)) { g.strokeStyle = C.band; g.lineWidth = T.car[1] * s; g.stroke(); }
-  for (const b of f.boxes) if (boxPath(b)) { g.fillStyle = C["s-box"]; g.fill(); }
+  for (const b of boxes) if (boxPath(b)) { g.strokeStyle = C.band; g.lineWidth = T.car[1] * s; g.stroke(); }
+  for (const b of boxes) if (boxPath(b)) { g.fillStyle = C.box; g.fill(); }
   // the memory's read-out: where it thinks the boxes ahead are (dashed circles, stronger = surer)
   for (const b of f.mem_boxes || []) {
     if (b[0] < 0.3) continue;
     const [x, y] = P(b[1], b[2]);
-    g.save(); g.setLineDash([5, 4]); g.lineWidth = 2; g.globalAlpha = Math.min(1, 0.3 + b[0]); g.strokeStyle = C.warning;
+    g.save(); g.setLineDash([5, 4]); g.lineWidth = 2; g.globalAlpha = Math.min(1, 0.3 + b[0]); g.strokeStyle = C.mem;
     g.beginPath(); g.arc(x, y, Math.max(6, 0.35 * s), 0, 2 * Math.PI); g.stroke(); g.restore();
   }
-  // trail, fading into the past
-  g.lineWidth = 3; g.lineCap = "round"; g.lineJoin = "round";
+  // our trail, fading into the past
+  g.lineWidth = 2.5; g.strokeStyle = C.ego; g.lineCap = "butt";     // butt ends: overlapping round caps bead a faded line
   for (let i = 1; i < trail.length; i++) {
     const [x0, y0] = P(trail[i - 1][0], trail[i - 1][1]), [x1, y1] = P(trail[i][0], trail[i][1]);
-    g.globalAlpha = 0.12 + 0.6 * i / trail.length; g.strokeStyle = C["s-car"]; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+    g.globalAlpha = 0.06 + 0.42 * i / trail.length; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
   }
-  g.globalAlpha = 1;
-  // plans: the mean's thin, the driven one on top
-  const path = (pts, col, w, dash) => {
-    g.setLineDash(dash || []); g.strokeStyle = col; g.lineWidth = w; g.beginPath();
-    pts.forEach((q, i) => { const [x, y] = P(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); g.setLineDash([]);
-  };
-  path(f.plan_mean, C["s-mean"], 2, [7, 6]);
-  // the driven plan's footprint every 0.1 s (faint), and where it first touches a wall or a box (red)
-  const pt = planTouch(f, T);
+  g.globalAlpha = 1; g.lineCap = "round";
+
+  // ---- the other car: its own plan (thin), and our prediction of its next second (points fading with time, its body at
+  // 0.5 s and 1.0 s), as strong as the policy is sure it sees a car
+  if (oppP && okPts(f.opp_plan)) line([[oppP[0], oppP[1]], ...f.opp_plan], C.opp, 1.5, 0.55);
+  const pr = f.pred && okPts(f.pred.pts) ? f.pred : null;
+  if (pr) {
+    const Q = pr.pts, pv = Math.max(0, Math.min(1, pr.p == null ? 1 : +pr.p)), pa = 0.15 + 0.85 * pv;
+    line(oppP ? [[oppP[0], oppP[1]], ...Q] : Q, C.opp, 1.5, 0.3 * pa);
+    for (const [k, a] of [[4, 0.75], [9, 0.5]]) {
+      if (k >= Q.length) continue;
+      const B = body([Q[k][0], Q[k][1], headAt(Q, k, oppP ? oppP[2] : 0)], odims);
+      rect(B, Math.min(B.hw, B.hl) * 0.35);
+      g.save(); g.globalAlpha = 0.1 * a * pa; g.fillStyle = C.opp; g.fill();
+      g.globalAlpha = a * pa; g.strokeStyle = C.opp; g.lineWidth = 1.5; g.stroke(); g.restore();
+    }
+    Q.forEach((q, k) => {
+      const u = Q.length > 1 ? k / (Q.length - 1) : 0, [x, y] = P(q[0], q[1]);
+      dot(x, y, lerp(4.5, 2.25, u) * zf, C.opp, pa * lerp(1, 0.4, u), 1.5 * zf);
+    });
+  }
+
+  // ---- our plans: the mean's thin dashes; the driven one with a tick every 0.1 s (longer at 0.5 s) and a dot at 1.0 s
+  if (okPts(f.plan_mean)) line([[carP[0], carP[1]], ...f.plan_mean], C.ego, 1.5, 0.6, [5, 5]);
+  const pt = planTouch(f, T, dims);
   const quad = (cs) => { g.beginPath(); cs.forEach(([x0, y0], i) => { const [x, y] = P(x0, y0); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.closePath(); };
   const corners = (p) => {
-    const c = Math.cos(p[2]), s0 = Math.sin(p[2]), hl = T.car[0] / 2, hw = T.car[1] / 2;
+    const c = Math.cos(p[2]), s0 = Math.sin(p[2]), hl = dims[0] / 2, hw = dims[1] / 2;
     return [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]].map(([a, b]) => [p[0] + a * c - b * s0, p[1] + a * s0 + b * c]);
   };
-  if (s > 30) {
-    g.globalAlpha = 0.45; g.strokeStyle = C["s-plan"]; g.lineWidth = 1;
+  if (s > 30) {                                       // close in: the body along the plan every 0.1 s, faint
+    g.save(); g.globalAlpha = 0.22; g.strokeStyle = C.ego; g.lineWidth = 1;
     for (const p of pt.poses) { quad(corners(p)); g.stroke(); }
-    g.globalAlpha = 1;
+    g.restore();
   }
-  path(f.plan, C["s-plan"], 3);
-  const end = f.plan[f.plan.length - 1], [ex, ey] = P(end[0], end[1]);
-  g.fillStyle = C["s-plan"]; g.beginPath(); g.arc(ex, ey, 5, 0, 7); g.fill(); g.strokeStyle = C.surface; g.lineWidth = 2; g.stroke();
+  const plan = f.plan;
+  line([[carP[0], carP[1]], ...plan], C.ego, 3, 1);
+  g.save(); g.strokeStyle = C.ego; g.lineWidth = 2; g.lineCap = "butt";
+  plan.forEach((q, k) => {
+    if (k === plan.length - 1 || s < 20) return;      // zoomed out to the whole track: the line alone
+    const a = headAt(plan, k + 1 < plan.length ? k + 1 : k, carP[2]), [x, y] = P(q[0], q[1]), L = (k === 4 ? 7 : 4.5) * zf;
+    const nx = Math.sin(a), ny = Math.cos(a);           // screen-space normal (y is flipped on screen)
+    g.beginPath(); g.moveTo(x - nx * L, y - ny * L); g.lineTo(x + nx * L, y + ny * L); g.stroke();
+  });
+  g.restore();
+  const end = plan[plan.length - 1], [ex, ey] = P(end[0], end[1]);
+  dot(ex, ey, 4.5 * zf, C.ego, 1, 2 * zf);
   if (pt.hit) {
-    const cs = pt.hit.cs, o = [cs[0], cs[1], cs[3], cs[2]];            // corners in drawing order
-    quad(o); g.globalAlpha = 0.45; g.fillStyle = C.critical; g.fill(); g.globalAlpha = 1;
+    const cs = pt.hit.cs;
+    quad(cs); g.save(); g.globalAlpha = 0.45; g.fillStyle = C.critical; g.fill(); g.restore();
     g.strokeStyle = C.critical; g.lineWidth = 2; g.stroke();
   }
-  // cars, at their footprint (the contact's and the plan-hit cost's)
-  const car = (st, col) => {
-    const c0 = Math.cos(st[2]), s0 = Math.sin(st[2]), L = T.car[0] / 2, Wd = T.car[1] / 2;
-    const q = [[L, Wd * 0.8], [L, -Wd * 0.8], [-L, -Wd], [-L, Wd]].map(([a, b]) => P(st[0] + a * c0 - b * s0, st[1] + a * s0 + b * c0));
-    g.beginPath(); q.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
-    g.fillStyle = col; g.fill(); g.strokeStyle = C.surface; g.lineWidth = 2; g.stroke();
-  };
-  if (oppP) car(oppP, f.copy ? C["s-copy"] : C["s-opp"]);
-  car(carP, C["s-car"]);
-  if (f.hit.some((x) => x > 0)) {
-    const [x, y] = P(carP[0], carP[1]); g.strokeStyle = C.critical; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 0.55 * s, 0, 7); g.stroke();
-  }
-}
 
-// ---------------------------------------------------------------- strips (one time axis: now at the right edge)
-function strip(id, series, opt) {
-  const { g, W, H } = fit($(id)), padL = 40, padR = 6, padT = 6, padB = 16;
-  g.clearRect(0, 0, W, H);
-  const now = S.length ? S[S.length - 1].t : 0, t0 = now - SPAN_S;
-  const vis = S.filter((r) => r.t >= t0);
-  let vals = [];
-  for (const s of series) for (const r of vis) { const v = r[s.key]; if (v != null && isFinite(v)) vals.push(v); }
-  if (!vals.length) return;
-  let lo = opt.lo != null ? Math.min(opt.lo, ...vals) : Math.min(...vals), hi = Math.max(...vals);
-  if (hi - lo < (opt.minSpan || 1e-3)) { const m = (hi + lo) / 2; lo = m - (opt.minSpan || 1e-3) / 2; hi = m + (opt.minSpan || 1e-3) / 2; }
-  const step = nice((hi - lo) / 3); lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
-  if (opt.lo != null) lo = Math.max(lo, opt.lo);
-  const X = (t) => padL + (t - t0) / SPAN_S * (W - padL - padR), Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
-  // grid + ticks
-  g.font = "11px system-ui, sans-serif"; g.fillStyle = C.muted; g.strokeStyle = C.grid; g.lineWidth = 1;
-  g.textAlign = "right"; g.textBaseline = "middle";
-  const ny = Math.max(2, Math.min(4, Math.floor((H - padT - padB) / 22)));      // as many gridlines as the height carries
-  const step2 = nice((hi - lo) / ny);
-  for (let v = Math.ceil(lo / step2) * step2; v <= hi + 1e-9; v += step2) { const y = Math.round(Y(v)) + 0.5; g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(fmt(v, step2), padL - 5, y); }
-  g.textAlign = "center"; g.textBaseline = "alphabetic";
-  for (let k = 0; k <= SPAN_S; k += 5) { const x = X(t0 + k); g.fillText(k === SPAN_S ? "지금" : `${k - SPAN_S}초`, Math.max(padL + 12, Math.min(x, W - 16)), H - 3); }
-  g.textAlign = "left";
-  // events across the strip: hard contacts (critical), new episodes (dashed)
-  for (const e of EV) {
-    if (e.t < t0) continue; const x = Math.round(X(e.t)) + 0.5;
-    g.strokeStyle = e.kind === "hit" ? C.critical : C.muted; g.lineWidth = e.kind === "hit" ? 1.5 : 1; g.setLineDash(e.kind === "hit" ? [] : [3, 3]);
-    g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.setLineDash([]);
+  // ---- the cars, at their true size (the contact's and the plan-hit cost's footprint), a notch at the front
+  const car = (st, d, col) => {
+    const B = body(st, d);
+    rect(B, Math.min(B.hw, B.hl) * 0.3);
+    g.fillStyle = col; g.fill(); g.strokeStyle = C.surface; g.lineWidth = 1.5; g.stroke();
+    const { hl, hw, at } = B, tri = [at(hl * 0.78, 0), at(hl * 0.18, hw * 0.5), at(hl * 0.18, -hw * 0.5)];
+    g.beginPath(); tri.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
+    g.save(); g.globalAlpha = 0.9; g.fillStyle = "#ffffff"; g.fill(); g.restore();
+  };
+  if (oppP) car(oppP, odims, C.opp);
+  car(carP, dims, C.ego);
+  if ((f.hit || []).some((x) => x > 0)) {
+    const [x, y] = P(carP[0], carP[1]); g.strokeStyle = C.critical; g.lineWidth = 2.5; g.beginPath(); g.arc(x, y, Math.max(12, 0.55 * s), 0, 7); g.stroke();
   }
-  for (const s of series) {
-    g.strokeStyle = s.col; g.lineWidth = 2; g.lineJoin = "round"; g.lineCap = "round"; g.beginPath();
-    let on = false, prevT = null;
-    for (const r of vis) {
-      const v = r[s.key];
-      if (v == null || !isFinite(v) || (prevT != null && r.t - prevT > 1.0)) { on = false; prevT = r.t; if (v == null) continue; }
-      const x = X(r.t), y = Y(v); on ? g.lineTo(x, y) : g.moveTo(x, y); on = true; prevT = r.t;
-    }
-    g.stroke();
-  }
+  return moving;
 }
-function nice(x) { const p = Math.pow(10, Math.floor(Math.log10(x || 1))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x) return m * p; return 10 * p; }
-function fmt(v, step) { return step >= 1 ? v.toFixed(0) : step >= 0.1 ? v.toFixed(1) : step >= 0.01 ? v.toFixed(2) : v.toFixed(3); }
 
 // ---------------------------------------------------------------- data
-let tick0 = performance.now();
 async function poll() {
   if (!RUN) return;
   let r;
@@ -498,10 +534,11 @@ async function poll() {
   if (!r.ok) return;
   const age = parseFloat(r.headers.get("X-Age") || "0");
   const live = age < 2;
-  $("status").className = "pill " + (live ? "live" : "wait");
-  $("status_t").textContent = live ? "실시간" : age < 300 ? `update 반영 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`;
-  $("veil").className = live ? "" : age < 300 ? "on" : "on stopped";
-  $("veil_t").textContent = age < 300 ? "update 반영 중" : "학습 멈춤";
+  const stCls = "pill " + (live ? "live" : "wait"), vlCls = live ? "" : "on";
+  if ($("status").className !== stCls) $("status").className = stCls;
+  setText($("status_t"), live ? "실시간" : age < 300 ? `update 반영 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`);
+  if ($("veil").className !== vlCls) $("veil").className = vlCls;
+  setText($("veil_t"), age < 300 ? `update 반영 중 · ${age.toFixed(0)}초` : "학습 멈춤");
   const d = await r.json(), f = d.now, key = f.upd * 100000 + f.k;
   if (key === lastKey) return;
   lastKey = key;
@@ -519,62 +556,78 @@ async function poll() {
   else if (PR.epDec != null && PR.prevK != null) PR.epDec += f.k >= PR.prevK ? f.k - PR.prevK : f.k + 1;
   PR.prevK = f.k; PR.trailLen = L;
   const rk = Math.min(1, (f.k + 1) / H);
-  $("p_upd_b").style.width = `${(100 * rk).toFixed(1)}%`; $("p_upd_t").textContent = `${f.k + 1}/${H} 결정`;
+  $("p_upd_b").style.width = `${(100 * rk).toFixed(1)}%`; setText($("p_upd_t"), `${f.k + 1}/${H} 결정`);
   const epLen = (f.replay ? scS : epS) * 10;
-  if (PR.epDec == null) { $("p_ep_b").style.width = "0%"; $("p_ep_t").textContent = "-"; }
-  else { const re = Math.min(1, PR.epDec / epLen); $("p_ep_b").style.width = `${(100 * re).toFixed(1)}%`; $("p_ep_t").textContent = `${(PR.epDec / 10).toFixed(1)}/${(epLen / 10).toFixed(0)} 초`; }
+  if (PR.epDec == null) { $("p_ep_b").style.width = "0%"; setText($("p_ep_t"), "-"); }
+  else { const re = Math.min(1, PR.epDec / epLen); $("p_ep_b").style.width = `${(100 * re).toFixed(1)}%`; setText($("p_ep_t"), `${(PR.epDec / 10).toFixed(1)}/${(epLen / 10).toFixed(0)} 초`); }
   const t = f.t;
   if (F1 && t - F1.t < 3) dtF = Math.max(0.05, Math.min(0.5, 0.7 * dtF + 0.3 * (t - F1.t)));
+  f.trail = d.trail || [];
   F0 = F1; F1 = f; t1 = performance.now();
-  if (f.new_ep) { EV.push({ t, kind: "ep" }); addEvent(f.replay ? "새 에피소드: 장면 재생 (예전에 세게 닿은 장면)" : "새 에피소드: 일반 경주", false); }
-  const kinds = ["벽", "상자", "상대 차"];
-  f.hit.forEach((h, i) => { if (h > 0) { EV.push({ t, kind: "hit" }); addEvent(`${kinds[i]}에 세게 닿음 · ${f.car[3].toFixed(1)} m/s`, true); } });
-  while (S.length && S[0].t < t - SPAN_S - 2) S.shift();
-  while (EV.length && EV[0].t < t - SPAN_S - 2) EV.shift();
-  $("upd").textContent = `update ${f.upd} · 결정 ${f.k}`;
-  $("ep").textContent = f.replay ? "장면 재생 중" : "일반 경주"; $("ep").className = "pill" + (f.replay ? " scene" : "");
-  $("opp").textContent = f.opp ? (f.copy ? "상대: 우리 policy 복제본" : "상대: 기존 상대 차") : "상대 차 없음";
-  for (const k of document.querySelectorAll(".k-opp")) k.style.display = f.opp ? "" : "none";   // a solo run has no opponents to key
+  setText($("upd"), `update ${f.upd} · 결정 ${f.k}`);
+  setText($("ep"), f.replay ? "장면 재생 중" : "일반 경주"); $("ep").className = "pill" + (f.replay ? " scene" : "");
+  setText($("opp"), f.opp ? (f.copy ? "상대: 우리 policy 복제본" : "상대: 기존 상대 차") : "상대 차 없음");
   panels(f);
-  $("hud_sub").textContent = `plan 목표 ${f.plan_v[0].toFixed(1)} · 1초 뒤 ${f.plan_v[9].toFixed(1)} m/s`;
-  F1.trail = d.trail;
-  strips();
+  setText($("hud_sub"), `plan 목표 ${f.plan_v[0].toFixed(1)} · 1초 뒤 ${f.plan_v[f.plan_v.length - 1].toFixed(1)} m/s`);
+  requestDraw();
 }
-function strips() {}
-// the reward's parts (the tap sums them: the page polls slower than decisions come) and the memory's boxes ahead
+
+// the reward's parts (the tap sums them: the page polls slower than decisions come): every part by name with the last 10 s
+// and this episode, the total under a rule; a bar per part for its episode sum, from a zero line, scaled to the largest part.
+// `parts` = [{n, win, ep}, ..., {n: "합", ...}]; runs before it wrote the anonymous arrays parts_win / parts_ep
+const OLD_PARTS = ["바퀴", "전진", "접촉", "박는 plan"];
+function rewardRows(f) {
+  if (Array.isArray(f.parts) && f.parts.length) {
+    const rows = f.parts.filter((p) => p && p.n !== "합").map((p) => ({ n: String(p.n), win: +p.win || 0, ep: +p.ep || 0 }));
+    const tot = f.parts.find((p) => p && p.n === "합");
+    return { rows, tot: tot ? { win: +tot.win || 0, ep: +tot.ep || 0 }
+                            : { win: rows.reduce((a, r) => a + r.win, 0), ep: rows.reduce((a, r) => a + r.ep, 0) } };
+  }
+  if (Array.isArray(f.parts_win) && Array.isArray(f.parts_ep)) {
+    const n = f.parts_win.length - 1;
+    const rows = f.parts_win.slice(0, n).map((w, i) => ({ n: OLD_PARTS[i] || `항목 ${i + 1}`, win: +w || 0, ep: +f.parts_ep[i] || 0 }));
+    return { rows, tot: { win: +f.parts_win[n] || 0, ep: +f.parts_ep[n] || 0 } };
+  }
+  return null;
+}
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const sgn = (v) => (Math.abs(v) < 0.005 ? "z" : v > 0 ? "p" : "m");
+const num = (v) => (Math.abs(v) < 0.005 ? "0.00" : (v > 0 ? "+" : "−") + Math.abs(v).toFixed(2));
 function panels(f) {
-  const sg = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
-  if (f.parts_win) {
-    const names = ["바퀴", "전진", "접촉", "박는 plan", "합"];
-    $("rw_b").innerHTML = names.map((n, i) => `<tr${i === 4 ? ' class="tot"' : ""}><td>${n}</td><td>${sg(f.parts_win[i])}</td><td>${sg(f.parts_ep[i])}</td></tr>`).join("");
-    $("laps").textContent = (f.laps && f.laps.length ? "바퀴 시간 " + f.laps.map((x) => x.toFixed(1)).join(" · ") + " s" : "바퀴 시간 -") + ` · 에피소드 ${f.ep_s.toFixed(0)} s`;
+  const R = rewardRows(f);
+  if (R) {
+    const mx = Math.max(1e-9, ...R.rows.map((r) => Math.abs(r.ep)));
+    const bar = (v) => {
+      const w = Math.abs(v) < 0.005 ? 0 : Math.max(2, 50 * Math.abs(v) / mx);
+      return w ? `<span class="bar"><i class="${v > 0 ? "p" : "m"}" style="left:${v > 0 ? 50 : 50 - w}%;width:${w.toFixed(1)}%"></i></span>` : `<span class="bar"></span>`;
+    };
+    const html = R.rows.map((r) => `<tr><td class="n">${esc(r.n)}</td><td class="${sgn(r.win)}">${num(r.win)}</td><td class="${sgn(r.ep)}">${num(r.ep)}</td><td class="b">${bar(r.ep)}</td></tr>`).join("")
+      + `<tr class="tot"><td class="n">합</td><td class="${sgn(R.tot.win)}">${num(R.tot.win)}</td><td class="${sgn(R.tot.ep)}">${num(R.tot.ep)}</td><td></td></tr>`;
+    if ($("rw_b").dataset.h !== html) { $("rw_b").dataset.h = html; $("rw_b").innerHTML = html; }
+    setText($("laps"), (f.laps && f.laps.length ? "바퀴 시간 " + f.laps.map((x) => x.toFixed(1)).join(" · ") + " s" : "바퀴 시간 -") + (f.ep_s != null ? ` · 에피소드 ${f.ep_s.toFixed(0)} s` : ""));
     $("rwp").hidden = false;
   } else $("rwp").hidden = true;
   if (f.mem_boxes != null) {
     const mb = f.mem_boxes.filter((b) => b[0] >= 0.3);
-    $("mem_b").innerHTML = (mb.length ? mb.map((b) => `<div class="memrow">${b[3].toFixed(1)} m 앞 · 확신 ${(100 * b[0]).toFixed(0)} %</div>`).join("") : `<div class="memrow">앞 12 m에 아는 상자 없음</div>`)
+    const html = (mb.length ? mb.map((b) => `<div class="memrow">${b[3].toFixed(1)} m 앞 · 확신 ${(100 * b[0]).toFixed(0)} %</div>`).join("") : `<div class="memrow">앞 12 m에 아는 상자 없음</div>`)
       + (f.known != null ? `<div class="memrow">이번 에피소드에 지나간 상자 ${f.known}개</div>` : "");
+    if ($("mem_b").dataset.h !== html) { $("mem_b").dataset.h = html; $("mem_b").innerHTML = html; }
     $("memp").hidden = false;
   } else $("memp").hidden = true;
 }
-window.addEventListener("resize", () => { try { strips(); } catch (e) {} });
+window.addEventListener("resize", requestDraw);
 
-// (11-18) the map at most ~15 times a second: redrawn on every animation frame, this page's Chrome GPU process took 72 % of
-// the 5060 -- the display GPU, which also trains (its rollout ran at half speed while the page was on screen)
-let lastDraw = 0;
 async function frame() {
-  const now = performance.now();
-  if (F1 && now - lastDraw >= 66) {
-    lastDraw = now;
-    const u = F0 ? Math.min(1, (performance.now() - t1) / (dtF * 1000)) : 1;
-    const carP = F0 && !F1.new_ep ? pose(F0.car, F1.car, u) : F1.car;
-    const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;
-    const T = TRACK[RUN + ":" + F1.tid] || await track(F1.tid);
-    drawMap(F1, carP, oppP, T, F1.trail || []);
-    $("hud_v").textContent = carP[3].toFixed(1);
-    $("hud_v").style.color = F1.hit.some((x) => x > 0) ? C.critical : C.ink;
-  }
-  requestAnimationFrame(() => frame().catch(() => requestAnimationFrame(frame)));
+  if (!F1) return;
+  lastDraw = performance.now();
+  const u = F0 ? Math.min(1, (lastDraw - t1) / (dtF * 1000)) : 1;
+  const carP = F0 && !F1.new_ep ? pose(F0.car, F1.car, u) : F1.car;
+  const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;
+  const T = TRACK[RUN + ":" + F1.tid] || await track(F1.tid);
+  const moving = drawMap(F1, carP, oppP, T, F1.trail || []);
+  setText($("hud_v"), carP[3].toFixed(1));
+  $("hud_v").style.color = (F1.hit || []).some((x) => x > 0) ? C.critical : C.ink;
+  if (u < 1 || moving) requestDraw();                  // easing toward the newest frame; idle once there
 }
 
 const SP = { frames: [], i: -1, run: "", open: false, imgs: {} };
@@ -630,7 +683,7 @@ function spLap() {
   const cell = spCell(w), top = 18, H = h - top - 8, lo = vs[0], med = vs[Math.floor(0.5 * (vs.length - 1))];
   const hi = Math.max(lo + 0.6, lo + 2.5 * (med - lo)), every = Math.max(1, Math.ceil(40 / cell));
   const X = (k) => SPG.padL + cell * (k + 0.5), Y = (x) => top + H * (1 - (Math.min(x, hi) - lo) / (hi - lo));
-  g.strokeStyle = C["s-car"]; g.lineWidth = 2; g.lineJoin = "round"; g.beginPath();
+  g.strokeStyle = C.ego; g.lineWidth = 2; g.lineJoin = "round"; g.beginPath();
   let pen = false;
   SP.frames.forEach((f, k) => {
     if (f.best_lap == null || (k > 0 && SP.frames[k - 1].run !== f.run)) pen = false;
@@ -644,7 +697,7 @@ function spLap() {
   SP.frames.forEach((f, k) => {
     if (f.best_lap == null) return;
     const on = k === SP.i, x = X(k), y = Y(f.best_lap), up = f.best_lap > hi;
-    g.fillStyle = on ? C.ink : C["s-car"]; g.beginPath();
+    g.fillStyle = on ? C.ink : C.ego; g.beginPath();
     if (up) { const r = on ? 5 : 4; g.moveTo(x, y - r); g.lineTo(x + r, y + r * 0.7); g.lineTo(x - r, y + r * 0.7); g.closePath(); }
     else g.arc(x, y, on ? 4 : 2.5, 0, 2 * Math.PI);                 // off the scale (slower than shown): a triangle at the top
     g.fill();
@@ -671,8 +724,8 @@ function spStrip() {
     const cx = SPG.padL + cell * (k + 0.5), hh = Math.max(f.hard ? 2 : 0, H * Math.min(1, f.hard / cap));
     const hw = f.hard ? hh * f.wall / f.hard : 0, on = k === SP.i;
     g.globalAlpha = on ? 1 : 0.7;
-    g.fillStyle = C.warning; g.fillRect(cx - bw / 2, y0 - hh, bw, hh - hw);
-    g.fillStyle = C["s-opp"]; g.fillRect(cx - bw / 2, y0 - hw, bw, hw);
+    g.fillStyle = C["box-hit"]; g.fillRect(cx - bw / 2, y0 - hh, bw, hh - hw);
+    g.fillStyle = C["wall-hit"]; g.fillRect(cx - bw / 2, y0 - hw, bw, hw);
     g.globalAlpha = 1;
     if (on || k % every === 0 || f.hard > cap) {
       g.fillStyle = on ? C.ink : C["ink-2"];
@@ -708,7 +761,6 @@ if (new URLSearchParams(location.search).get("spots")) spOpen(true);
   if (!RUN) { document.querySelector("main").innerHTML = '<div class="empty">실시간 기록을 쓰는 학습이 없습니다 (plan_rl --live-tap)</div>'; return; }
   setInterval(() => poll().catch(() => {}), 100);
   setInterval(() => { loadRuns().catch(() => {}); loadCars().catch(() => {}); }, 20000);
-  frame();
 })();
 </script>
 </body>
