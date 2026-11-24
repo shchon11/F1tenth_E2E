@@ -24,6 +24,7 @@ F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반�
 F1SIM_EXAM_SAVE_SCAN=1 (11-13, policy가 상자를 보고도 왜 그대로 가는지 policy 안에서 보는 분석용): 결정마다 policy가 읽은 가장 새 스캔
 (range_max로 나눈 값, float16; 입력은 이것과 앞 두 결정의 스캔)과 빔마다 맞은 것(lidar.HIT_*)을 `출력_scan.npz`(scan, typ, range_max, angles)에 남김.
 주행·기록은 그대로.
+F1SIM_EXAM_TRACK_MPC=1 (11-24): 제어기 "track"에서 시간 추종기 대신 모형 예측 추종기(plan_mpc.PlanMPC, 기본값)로 몲.
 F1SIM_EXAM_SAVE_PLAN=1 (11-24, 제어기 튜닝 방 map_room.py용): 결정마다 차 상태 전부와 MAP이 읽는 plan(구간 곡률·속도), plan을 만든 행동·출발 속도·조향을
 `출력_plan.npz`에 따로 남김. 주행은 그대로.
 F1SIM_EXAM_SAVE_VALUE=1 (11-13, 상자에 닿기 전 critic은 언제부터 그 상자를 값에 치는지 보는 분석용): 결정마다 critic이 읽은
@@ -63,6 +64,8 @@ SAVE_VALUE = os.environ.get("F1SIM_EXAM_SAVE_VALUE", "") == "1"  # the critic's 
 # wheel speed), the plan as MAP reads it (10 segments' curvature and speed, plan_segments) and as it was drawn (the action in
 # [-1, 1] and the start speed / steering `plan_steps.roll` took) -> `<output>_plan.npz` (float32); driving unchanged
 SAVE_PLAN = os.environ.get("F1SIM_EXAM_SAVE_PLAN", "") == "1"
+# (11-24) mode "track" with the model-predictive follower (plan_mpc.PlanMPC, defaults) instead of PlanFollower: "1"
+TRACK_MPC = os.environ.get("F1SIM_EXAM_TRACK_MPC", "") == "1"
 PLN = {"state": [], "kap": [], "vseg": [], "act": [], "v0": [], "d0": []}
 OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
 REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
@@ -231,6 +234,11 @@ if mode == "track":
     from f1sim.plan_follow import PlanFollower, to_car
     follower = PlanFollower(Bl, dev, k_v=2.0, k_lat=1.0, k_head=1.0, s_max=float(env.s_max), lut=env.tracker.map.lut,
                             grip=M.GRIP_LEVELS.index(1.0), wheelbase=float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"]))
+    if TRACK_MPC:
+        # (11-24, the controller room's reference row) the model-predictive follower with its defaults (`plan_policy.PlanRunner`'s
+        # F1SIM_TRACK_MPC=1: horizon 20, weights 400/100/2500/0, k_v 2)
+        from f1sim.plan_mpc import PlanMPC
+        follower = PlanMPC(Bl, dev, env.tracker.nominal, s_max=float(env.s_max), lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0))
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
 actor = load_actor2(ck, dev)
 if STEER_STD_FLOOR > 0:                     # the first step's turn: exploration at least this wide (plan_rl's log_std_floor)
@@ -707,7 +715,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT),
          kinds=np.array(KN), cols=np.array(COLS), name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
          ep_s=np.array(secs + 5.0), level=env.level_seed[lid].cpu().numpy(), lapL=pr.goal.lap.float().cpu().numpy(),
-         exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(float(getattr(env.tracker, "tw_speed_lead", 0.0) or 0.0) if mode == "map" else LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
+         exam=np.array(EXAM + ("+mpc" if TRACK_MPC else "") + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(float(getattr(env.tracker, "tw_speed_lead", 0.0) or 0.0) if mode == "map" else LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
          map=np.array(map_name(WORLD)), bank=np.array(f"{BANK} ({', '.join(_bank)}; sha256 {_sha})"), opp_restart_s=np.array(OPP_RESTART_S),
          lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0), opp_slot=np.array(OPP_SLOT), start_rest=np.array(REST), half_lap=np.array(HALF))
 if RACE4:

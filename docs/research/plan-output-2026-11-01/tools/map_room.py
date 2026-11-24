@@ -217,6 +217,7 @@ def follow_ref(room, c, st0, ax0, hist0, kind, p=None):
 def metrics(p, S, C, cdt, wheelbase):
     """per case: errors to the time-indexed plan at 0.1 .. 1.0 s, steering / yaw-rate wobble, slip (all numpy)"""
     n = C.shape[1]
+    H5 = 20                                                           # control steps in 0.5 s
     px, py, ppsi, pv, pd = (p[k][:, :n + 1] for k in ("x", "y", "psi", "v", "delta"))
     x, y = S[..., dyn.IX], S[..., dyn.IY]
     dx, dy = x - px, y - py
@@ -238,17 +239,20 @@ def metrics(p, S, C, cdt, wheelbase):
     out["in_max"] = lat_in[:, jj].clamp_min(0).amax(1); out["out_max"] = lat_out[:, jj].clamp_min(0).amax(1)
     out["alat_abs"] = lat[:, jj].abs().mean(1)
     bk_t = torch.atan(0.52 * torch.tan(S[..., dyn.ISTEER]))
-    out["slip_ex"] = torch.rad2deg((torch.atan2(S[..., dyn.IVY], S[..., dyn.IVX].abs().clamp_min(0.3)) - bk_t).abs())[:, 1:].amax(1)
-    r_car = S[..., dyn.IR][:, 1:]
-    r_plan = torch.diff(ppsi, dim=1) / cdt
+    sx = torch.rad2deg((torch.atan2(S[..., dyn.IVY], S[..., dyn.IVX].abs().clamp_min(0.3)) - bk_t).abs())
+    out["slip_ex"] = sx[:, 1:H5 + 1].amax(1); out["slip_ex_1s"] = sx[:, 1:].amax(1)
+    # yaw, steering and slip over the first 0.5 s: the car gets a new plan every 0.1 s, and a plan followed blind for a whole
+    # second at the limit spins far more often than the exam's car does (the policy re-plans when it slides)
+    r_car = S[..., dyn.IR][:, 1:H5 + 1]
+    r_plan = (torch.diff(ppsi, dim=1) / cdt)[:, :H5]
     out["yaw_over"] = (r_car - r_plan).abs().amax(1)
     out["yaw_rms"] = (r_car - r_plan).square().mean(1).sqrt()
-    sr_car = torch.diff(S[..., dyn.ISTEER], dim=1) / cdt
-    sr_plan = torch.diff(pd, dim=1) / cdt
+    sr_car = (torch.diff(S[..., dyn.ISTEER], dim=1) / cdt)[:, :H5]
+    sr_plan = (torch.diff(pd, dim=1) / cdt)[:, :H5]
     out["steer_rate_rms"] = (sr_car - sr_plan).square().mean(1).sqrt()
     cr = torch.diff(C[..., 0], dim=1)
     out["steer_flips"] = ((torch.sign(cr[:, 1:]) * torch.sign(cr[:, :-1]) < 0) & (cr[:, 1:].abs() > 1e-3)).float().sum(1) / (n * cdt)
-    out["slip"] = torch.rad2deg(torch.atan2(S[..., dyn.IVY], S[..., dyn.IVX].abs().clamp_min(0.3)).abs())[:, 1:].amax(1)
+    out["slip"] = torch.rad2deg(torch.atan2(S[..., dyn.IVY], S[..., dyn.IVX].abs().clamp_min(0.3)).abs())[:, 1:H5 + 1].amax(1)
     out["slip_all"] = torch.rad2deg(torch.atan2(S[..., dyn.IVY], S[..., dyn.IVX].abs().clamp_min(0.3)).abs())[:, 1:]
     # plan features (situation bins)
     k_ = torch.tan(pd) / wheelbase
@@ -287,7 +291,8 @@ def summary(m, sel):
     rms = float(np.sqrt(np.mean(m["pos"][sel, :5] ** 2)))
     return (f"위치 0.1-0.5 s RMS {100 * rms:5.1f} | 옆 평균 {100 * np.mean(m['alat_abs'][sel]):4.1f} | 안쪽 95 % {100 * np.percentile(m['in_max'][sel], 95):5.1f} "
             f"바깥 95 % {100 * np.percentile(m['out_max'][sel], 95):5.1f} | 요넘침 중앙 {np.median(m['yaw_over'][sel]):4.2f} 95 % {np.percentile(m['yaw_over'][sel], 95):4.2f} | "
-            f"미끄럼(자전거 초과) 90 % {np.percentile(m['slip_ex'][sel], 90):4.1f}도, 15도 넘음 {100 * np.mean(m['slip_ex'][sel] > 15):4.1f} % | n {int(sel.sum())}")
+            f"미끄럼(자전거 초과, 0.5 s) 90 % {np.percentile(m['slip_ex'][sel], 90):4.1f}도, 15도 넘음 {100 * np.mean(m['slip_ex'][sel] > 15):4.1f} % "
+            f"(1 s 동안 {100 * np.mean(m['slip_ex_1s'][sel] > 15):4.1f} %) | n {int(sel.sum())}")
 
 
 def objective(m, sel):
@@ -306,8 +311,8 @@ def table(m, c, title):
     out = [f"== {title}: 사례 {int(sel0.sum())}개 (plan 원점 출발), 0.1-0.5 s 위치 오차 RMS {100 * objective(m, sel0):.1f} cm =="]
     out.append(f"{'상황':<34}{'n':>6}{'0.2s 위치':>9}{'0.5s 위치':>9}{'0.5s 옆':>8}{'0.5s 앞뒤':>9}{'1.0s 위치':>9}{'0.5s 속도':>9}"
                f"{'요넘침':>7}{'조향흔들':>8}{'미끄럼max':>9}")
-    out.append("(0.5s 옆: + = plan이 도는 쪽 안으로, - = 바깥으로 / 앞뒤: + = plan보다 앞 / 요넘침: 실제 - plan 요 각속도 최대 [rad/s] 중앙값 / "
-               "조향흔들: 실제 - plan 조향 속도 RMS [rad/s] 중앙값 / 미끄럼max: 사례마다 최대 미끄럼각의 90 %)")
+    out.append("(0.5s 옆: + = plan이 도는 쪽 안으로, - = 바깥으로 / 앞뒤: + = plan보다 앞 / 요넘침: 0.5 s 안 실제 - plan 요 각속도 최대 [rad/s] 중앙값 / "
+               "조향흔들: 0.5 s 안 실제 - plan 조향 속도 RMS [rad/s] 중앙값 / 미끄럼max: 0.5 s 안 최대 미끄럼각의 90 %)")
     rms = lambda a: float(np.sqrt(np.mean(a ** 2))) if a.size else float("nan")
 
     def row(name, s):
@@ -442,16 +447,21 @@ if __name__ == "__main__":
     if cmd == "measure":
         name, over = sys.argv[2], json.loads(sys.argv[3])
         n = int(sys.argv[4]) if len(sys.argv) > 4 else 16384
+        n_rec = int(sys.argv[5]) if len(sys.argv) > 5 else 0
         t0 = time.time()
-        room = Room(n, dev)
-        c = room.bank(n)
+        room = Room(n + n_rec, dev)
+        c = room.bank(n, n_rec=n_rec, rec_npz=sys.argv[6] if len(sys.argv) > 6 else None)
         st0, ax0, h0 = room.settle(c)
         t1 = time.time()
-        p, S, C = room.follow(c, st0, ax0, h0, dict(NOW, **over))
+        kind = over.pop("follower", "map") if isinstance(over, dict) else "map"
+        if kind == "map":
+            p, S, C = room.follow(c, st0, ax0, h0, dict(NOW, **over))
+        else:
+            p, S, C = follow_ref(room, c, st0, ax0, h0, kind)
         t2 = time.time()
         m = metrics(p, S, C, room.cdt, room.lim.wheelbase)
         cn = {k: v.cpu().numpy() for k, v in c.items()}
-        np.savez_compressed(os.path.join(O, f"{name}.npz"), **{f"m_{k}": v for k, v in m.items() if k != "slip_all"},
+        np.savez_compressed(os.path.join(O, f"{name}.npz"), **{f"m_{k}": v for k, v in m.items() if k not in ("slip_all",)},
                             **{f"c_{k}": v for k, v in cn.items()}, setting=json.dumps(dict(NOW, **over)))
         print(f"[room] {n} 사례, 자리 잡기 {t1 - t0:.1f} s, 따라가기 {t2 - t1:.1f} s, 미끄럼 90 % (모든 시각) {np.percentile(m['slip_all'], 90):.1f}도")
         print(table(m, cn, name))
