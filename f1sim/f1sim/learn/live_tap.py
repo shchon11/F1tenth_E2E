@@ -13,11 +13,13 @@ of the car (the page keeps its own history from what it polls). One small device
 training reads or writes changes because of it.
 
 (11-24, the user: the reward panel did not tell whether every term shows) `now` also carries:
-* ``parts``: [{"n": name, "win": sum over the last 10 s, "ep": sum over the episode}, ...] -- one entry per term that enters
-  this car's reward (`set_parts`: the trainer names them, Korean), the last one "합" (their sum = the reward the training
-  used). A term the trainer can only price after the rollout (plan_rl --plan-car-cost: it needs the other car's next second)
-  is added to the decisions it belongs to when it arrives (`settle`); ``parts_pending_s`` = the window's seconds still
-  without it. ``parts_resid`` = the episode's reward minus the sum of the parts known per decision (~0: a check).
+* ``parts``: [{"n": name, "win": sum over 10 s, "ep": sum over the episode}, ...] -- one entry per term that enters this
+  car's reward (`set_parts`: the trainer names them, Korean), the last one "합" (their sum = the reward the training used).
+  A term the trainer can only price after the rollout (plan_rl --plan-car-cost: it needs the other car's next second) is
+  added to its decisions when it arrives (`settle`), so these sums cover the SETTLED decisions only -- every term over the
+  same decisions, all final: "win" = the last 10 s of them, "ep" = all of them in this episode; ``parts_lag_s`` = how far
+  the newest settled decision is behind this one (0 without such a term, up to one rollout with it). ``parts_resid`` = the
+  episode's reward minus the sum of its immediate parts, per decision (~0: a check).
 * ``pred``: the prediction head's answer for this car (plan_rl --pred-opp) in the world -- {"pts": 10 x [x, y], "p":
   P(visible)} -- from the pose the decision was made at (the console's `pred_w` transform); null without the head.
 * ``opp_plan``: 10 x [x, y] in the world, the plan of the policy copy driving the other car this decision (its path; a
@@ -49,7 +51,7 @@ class LiveTap:
         self.ep_sum = np.zeros(5); self.win = deque(maxlen=100); self.laps = deque(maxlen=6)
         # (11-24) the named parts (`set_parts`), per decision with its serial number so a late term finds its decisions
         self.part_names, self.late = None, None
-        self.ent = deque(maxlen=100); self.ep2 = None; self.serial = 0; self.ep_first = 1; self.resid_ep = 0.0
+        self.ent = deque(maxlen=400); self.ep2 = None; self.serial = 0; self.ep_first = 1; self.resid_ep = 0.0
         self.dec_ep, self.cross = 0, None
         self.run = os.path.basename(os.path.normpath(run_dir))
         self.trail = deque(maxlen=int(trail))
@@ -102,10 +104,8 @@ class LiveTap:
             i = e[0] - s0
             if 0 <= i < v.size and not e[2]:
                 e[1][-1] += v[i]; e[2] = True
-        if self.ep2 is not None:
-            first = max(s0, self.ep_first)
-            if first <= self.serial:
-                self.ep2[-1] += float(v[first - s0:].sum())
+                if e[0] >= self.ep_first:
+                    self.ep2 = e[1].copy() if self.ep2 is None else self.ep2 + e[1]
 
     @torch.no_grad()
     def record(self, upd: int, kd: int, pts: torch.Tensor, pts_mean: torch.Tensor, plan_v: torch.Tensor,
@@ -166,17 +166,21 @@ class LiveTap:
             self.ep_sum[:] = 0.0; self.win.clear(); self.laps.clear(); self.dec_ep, self.cross = 0, None
             self.ent.clear(); self.ep2 = None; self.ep_first = self.serial; self.resid_ep = 0.0
         # (11-24) the named parts: this decision's (+ a slot for the late term), the window's and the episode's sums
-        named = None
+        named, lag = None, None
         if self.part_names is not None and npart.size == len(self.part_names):
             vec = np.concatenate([npart, np.zeros(1 if self.late is not None else 0)])
-            self.ent.append([self.serial, vec.copy(), False])
-            self.ep2 = vec.copy() if self.ep2 is None else self.ep2 + vec
+            done = self.late is None                       # without a late term a decision is final at once
+            self.ent.append([self.serial, vec.copy(), done])
+            if done:
+                self.ep2 = vec.copy() if self.ep2 is None else self.ep2 + vec
             self.resid_ep += float(rew[0] - npart.sum())
-            win = np.sum([e[1] for e in self.ent], 0)
             names = self.part_names + ([self.late] if self.late is not None else [])
-            named = [{"n": n_, "win": round(float(w_), 4), "ep": round(float(e_), 4)} for n_, w_, e_ in zip(names, win, self.ep2)]
-            named.append({"n": "합", "win": round(float(win.sum()), 4), "ep": round(float(self.ep2.sum()), 4)})
-        pend = (sum(1 for e in self.ent if not e[2]) * 0.1) if (named is not None and self.late is not None) else 0.0
+            fin = [e for e in self.ent if e[2]][-100:]     # the last 10 s of settled decisions
+            win = np.sum([e[1] for e in fin], 0) if fin else np.zeros(len(names))
+            ep = self.ep2 if self.ep2 is not None else np.zeros(len(names))
+            named = [{"n": n_, "win": round(float(w_), 4), "ep": round(float(e_), 4)} for n_, w_, e_ in zip(names, win, ep)]
+            named.append({"n": "합", "win": round(float(win.sum()), 4), "ep": round(float(ep.sum()), 4)})
+            lag = round((self.serial - fin[-1][0]) * 0.1, 1) if fin else None
         pred_js = None
         if pq.size >= 21 and ppose.size == 3:
             # the head's 10 points in the car's frame at the decision (x PRED_SCALE 5 m) and its 'visible' logit, in the world
@@ -218,7 +222,7 @@ class LiveTap:
                "label": self.label, "parts_ep": _r(self.ep_sum, 3), "parts_win": _r(np.sum(self.win, 0), 3),
                "laps": list(self.laps), "ep_s": round(self.dec_ep * 0.1, 1), "mem_boxes": mem_boxes,
                "known": None if known is None else int(known),
-               "parts": named, "parts_pending_s": round(pend, 1), "parts_resid": round(self.resid_ep, 6),
+               "parts": named, "parts_lag_s": lag, "parts_resid": round(self.resid_ep, 6),
                "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
