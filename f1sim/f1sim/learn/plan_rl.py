@@ -51,7 +51,8 @@ from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, 
 from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models, PRED_N, PRED_SCALE
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
-from .plan_reward import PlanReward, SEEN_S
+from .plan_reward import PlanReward, SEEN_S, T_REF
+from . import plan_car_cost as PCC
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
 
@@ -478,6 +479,7 @@ class SelfOpponents:
             v_true = env.sim.state[self.rows, dyn.IVX].float()
             v0 = torch.where(slow, (v_true / self.pace).clamp(-PS.V_REV, PS.V_FWD), v0)
         self.p = PS.roll(torch.tanh(mean), v0, obs.cmd_d, self.lim)
+        self.st_plan = env.sim.state[self.rows, :3].clone()          # (11-24) where its plan starts (the live view draws it)
         self.cmd_v_driven = self.p["cmd_v"] * self.pace[:, None] if self.pace_range is not None else self.p["cmd_v"]
         self.restarted.zero_()
         env.sim.ideal_vcap[self.rows[live]] = self.cap[live]
@@ -759,6 +761,10 @@ def _arg_problem(args) -> str:
         (args.scene_copies and not (args.scene_replay > 0 and args.self_opp > 0), "--scene-copies needs --scene-replay and --self-opp"),
         (args.scene_near_miss and not args.scene_replay > 0, "--scene-near-miss needs --scene-replay"),
         (args.pred_opp and not (args.memory and args.mem_front and v2 and not v3), "--pred-opp needs --memory --mem-front (v2)"),
+        (args.plan_car_cost > 0 and (not v2 or v3 or args.hold_p > 0 or bool(args.plan_roll) or bool(args.roll_grow)
+                                     or args.branches == 2),
+         "--plan-car-cost needs --format v2 without --hold-p / --plan-roll / --roll-grow / --branches 2"),
+        (args.plan_car_cost > 0 and not 0.0 <= args.plan_car_w_end <= 1.0, "--plan-car-w-end: in [0, 1]"),
         (args.branches == 2 and (not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0
                                  or bool(args.init)),
          "--branches 2 needs --format v2 with --tail-consistency, from scratch, without --hold-p / --self-opp"),
@@ -1190,6 +1196,22 @@ def main(argv=None):
     ap.add_argument("--pred-range", type=float, default=10.0,
                     help="--pred-opp: [m] the other car counts as there (target 'visible', and the positions taught) within "
                          "this distance of our car at the decision and seen by a LiDAR beam within the last 1 s")
+    ap.add_argument("--plan-car-cost", type=float, default=0.0,
+                    help="SHARE (11-24, the race phase, agreed with the user): a plan whose points run into the other car's REAL "
+                         "future -- point k against where that car really was 0.1 k s after the decision (the simulator's truth, "
+                         "never the prediction head), both cars as 3 discs along their true length -- costs SHARE of the contact "
+                         "it would be (x --contact-scale, as --plan-hit-share prices a plan through a box): the first overlapping "
+                         "point, weighted 1.0 at 0.1 s down to --plan-car-w-end at 1.0 s, at the relative speed there. Only a car "
+                         "knowable at the decision (within --pred-range, a LiDAR beam on it within 1 s), only up to a restart of "
+                         "either car, only when the env's fault rule (--car-fault's: the other car ahead or less than a car length "
+                         "behind) puts the contact on us at the point before the overlap. The last decisions of a rollout compare "
+                         "only the points inside it (`learn.plan_car_cost`). Why: race32c u1000 drew 15 %% of its plans through "
+                         "where a 0.6x car really was (5 %% at 0.8x) and rear-ended it 5-6 times a session. 0 = off")
+    ap.add_argument("--plan-car-margin", type=float, default=0.05,
+                    help="--plan-car-cost: [m] the disc overlap allowed (an overlap = a disc pair closer than 2 r - this): a tight "
+                         "side-by-side pass at 0.35 m between centres is not one")
+    ap.add_argument("--plan-car-w-end", type=float, default=0.3,
+                    help="--plan-car-cost: the weight of the plan's last point (the first is 1.0, linear between)")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1423,6 +1445,17 @@ def main(argv=None):
     pred_on = bool(args.pred_opp)
     if pred_on and not (args.memory and args.mem_front and v2 and not v3 and env.M > 1):
         raise SystemExit("--pred-opp needs --memory --mem-front (v2) and a world with another car")
+    car_on = args.plan_car_cost > 0                                # (11-24) --plan-car-cost
+    if car_on and (not v2 or v3 or env.M < 2 or args.hold_p > 0 or args.plan_roll or args.roll_grow or two):
+        raise SystemExit("--plan-car-cost needs --format v2, a world with another car, without --hold-p / --plan-roll / "
+                         "--roll-grow / --branches 2")
+    car_dims = (float(env.cfg.vehicle.length), float(env.cfg.vehicle.width))
+    car_w = PCC.weights(PS.N_STEP, args.plan_car_w_end)
+    car_kofs = None                                                # the plan points' decisions after t, from the plan's stamps
+    if car_on:
+        print(f"[plan_rl] 앞차 plan 겹침 비용: 접촉의 {args.plan_car_cost:g}배 (접촉 무게 {args.contact_scale:g}), 차 {car_dims[0]:.2f} x "
+              f"{car_dims[1]:.2f} m를 원 3개(반지름 {PCC.disc_radius(*car_dims):.3f} m)로, 겹침 여유 {args.plan_car_margin:g} m, 점 무게 1.0 -> "
+              f"{args.plan_car_w_end:g}", flush=True)
     hold = args.hold_p > 0
     if hold and not v2:
         raise SystemExit("--hold-p needs --format v2 or v3")
@@ -1829,6 +1862,35 @@ def main(argv=None):
             for k_, r_ in enumerate(pick[:args.live_taps], start=1):
                 taps.append(LiveTap(env, run, row=r_, name=f"live_tap_{k_}.json", label=lab_(r_)))
     tap_pm = torch.zeros(10, 2, device=dev)
+    # (11-24) the live view's reward parts, named: every term that enters the reward this run, in `tap_parts`' order (a
+    # contact kind that cannot happen here is 0 and left out); the plan-car cost is priced after each rollout (`settle`)
+    tap_kinds = [0, 1] + ([2] if env.M > 1 else []) + ([3] if args.stall_s > 0 else [])
+    tap_ph = args.plan_hit_share > 0
+    tap_names = (["바퀴 완주", "전진 shaping", "벽 접촉", "상자 접촉"] + (["차 접촉(내 잘못)" if args.car_fault else "차 접촉"] if env.M > 1 else [])
+                 + (["멈춤"] if args.stall_s > 0 else []) + (["박는 plan(벽·상자)"] if tap_ph else []))
+    for tp_ in taps:
+        tp_.set_parts(tap_names, late="차 겹침 plan" if car_on else None)
+    tap_kinds_t = torch.tensor(tap_kinds, dtype=torch.long, device=dev)
+
+    def tap_parts(out_, q_):
+        """(11-24) row q_'s reward terms this decision, in `tap_names`' order"""
+        xs_ = [out_["lap"][q_:q_ + 1], out_["shaping"][q_:q_ + 1], out_["contact_kind"][q_, tap_kinds_t]]
+        if tap_ph:
+            xs_.append(out_["plan_hit_price"][q_:q_ + 1])
+        return torch.cat([x_.float() for x_ in xs_])
+
+    def tap_opp_plan(q_):
+        """(11-24) the plan of the copy driving the car that races row q_, its 10 points in the world (from where it drew it),
+        and whether a copy drives it -- tensors, read with the tap's one copy to the host"""
+        if drv.opp is None or getattr(drv.opp, "p", None) is None or getattr(drv.opp, "st_plan", None) is None:
+            return {}
+        oi_ = opp_index[others[q_, 0]]
+        ii_ = PT_IDX.to(dev)
+        sp_ = drv.opp.st_plan[oi_]
+        x_, y_ = drv.opp.p["x"][oi_, ii_], drv.opp.p["y"][oi_, ii_]
+        c_, s_ = torch.cos(sp_[2]), torch.sin(sp_[2])
+        return {"opp_plan": torch.stack([sp_[0] + x_ * c_ - y_ * s_, sp_[1] + x_ * s_ + y_ * c_], -1),
+                "opp_live": drv.opp.live[oi_]}
     tap_rows = torch.tensor([tp_.row for tp_ in taps], dtype=torch.long, device=dev)
     t0 = time.time()
     trk = None
@@ -1900,6 +1962,9 @@ def main(argv=None):
         sc_end_kind = torch.zeros(NK, dtype=torch.long, device=dev); sc_hit_kind = torch.zeros(NK, dtype=torch.long, device=dev)
         AX = []                                                # --mem-aux: the boxes ahead at each decision
         PRP, PRO, PROK, PRV = [], [], [], []                   # --pred-opp: our pose, the other car's xy, there, 'visible'
+        CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
+        car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
+        opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
         n_near = 0; n_near_gap = 0; n_fault = 0.0; opp_pres = 0.0   # near misses (of them: bodies < 10 cm), contacts charged to us,
                                                                     # races with the other car
         DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
@@ -2172,8 +2237,50 @@ def main(argv=None):
                         _c, _s = torch.cos(st_me[:, 2]), torch.sin(st_me[:, 2])
                         near_ahead = o_ok & ((_d[:, 0] * _c + _d[:, 1] * _s) > 0.0) & ((_d[:, 0] * _c + _d[:, 1] * _s) <= 3.0) \
                             & ((-_d[:, 0] * _s + _d[:, 1] * _c).abs() <= 1.0)
-                out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
-                                                     charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None)
+                    if car_on or drv.opp is not None:
+                        # the copy's pace in this race (NaN: no copy drives the other car)
+                        if drv.opp is not None:
+                            _oi = opp_index[others[:, 0]]
+                            pace_t = torch.where(drv.opp.on[_oi], drv.opp.pace[_oi], torch.full_like(drv.opp.pace[_oi], float("nan")))
+                        else:
+                            pace_t = torch.full((Bl,), float("nan"), device=dev)
+                        pb_t = torch.stack([pace_t < 0.7, (pace_t >= 0.7) & (pace_t < 0.9), pace_t >= 0.9], 0) & (o_ok & ordm)[None]
+                    if car_on:
+                        # (11-24) --plan-car-cost: our car and the other car (world velocity) at the decision; the plan's points
+                        # are added after it is driven, the other car's future is read after the rollout
+                        _tid = env.sim.tid[lid]
+                        _os = env.sim.state[others[:, 0]].float()
+                        _co, _so = torch.cos(_os[:, 2]), torch.sin(_os[:, 2])
+                        CQ["st0"].append(st_me[:, :3].clone()); CQ["tid"].append(_tid.clone())
+                        CQ["op"].append(torch.stack([_os[:, 0], _os[:, 1], _os[:, 2], _os[:, dyn.IVX] * _co - _os[:, dyn.IVY] * _so,
+                                                     _os[:, dyn.IVX] * _so + _os[:, dyn.IVY] * _co], 1))
+                        CQ["op_rem"].append(pr.goal.remaining(o_xy, _tid)); CQ["op_ok"].append(o_ok.clone())
+                        CQ["know"].append(o_ok & ((o_xy - st_me[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S))
+                        CQ["pace"].append(pace_t)
+                out, p, (xw_, yw_, pw_) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
+                                                       charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None)
+                if car_on:
+                    # the plan just driven, its 10 points (pose, world velocity) after our car at the decision; distance to go
+                    if car_kofs is None:
+                        _tk = p["t"][PT_IDX.to(dev)] if "t" in p else torch.arange(1, PS.N_STEP + 1, device=dev) * PS.DT
+                        car_kofs = [int(round(float(x_) / PS.DT)) for x_ in _tk]
+                        if car_kofs != list(range(1, PS.N_STEP + 1)):
+                            print(f"[plan_rl] 앞차 plan 겹침: plan 점의 시각이 0.1 s 간격이 아님 -> 결정 {car_kofs}과 비교", flush=True)
+                    _ii = PT_IDX.to(dev); _s0 = CQ["st0"][-1]
+                    _pp = pw_[:, _ii].float(); _pv = p["pv"].float()
+                    _mxy = torch.cat([_s0[:, None, :2], torch.stack([xw_[:, _ii], yw_[:, _ii]], -1).float()], 1)    # (Bl, 11, 2)
+                    _mps = torch.cat([_s0[:, 2:3], _pp], 1)
+                    _mv = torch.cat([torch.zeros(Bl, 1, 2, device=dev), torch.stack([_pv * torch.cos(_pp), _pv * torch.sin(_pp)], -1)], 1)
+                    _mr = pr.goal.remaining(_mxy.reshape(-1, 2), CQ["tid"][-1].repeat_interleave(PS.N_STEP + 1)).view(Bl, -1)
+                    CQ["me"].append(torch.cat([_mxy, _mps[..., None], _mv, _mr[..., None]], -1))                 # (Bl, 11, 6)
+                if car_on or drv.opp is not None:
+                    car_fault_b += (pb_t.float() * out["car_charged"][None]).sum(1); car_dec_b += pb_t.float().sum(1)
+                    if drv.opp is not None:                        # the copies' speed by pace (--self-opp-pace's slow end)
+                        _vb = torch.where(pace_t >= 0.999, torch.full_like(pace_t, 5),
+                                          ((pace_t - 0.5) / 0.1).floor().clamp(0, 4)).nan_to_num(-1).long()
+                        _okb = (_vb >= 0) & torch.isfinite(pace_t) & (pace_t >= 0.5) & o_ok
+                        opp_v_bins.index_add_(0, _vb.clamp_min(0), (env.sim.state[others[:, 0], dyn.IVX].float() * _okb).float())
+                        opp_n_bins.index_add_(0, _vb.clamp_min(0), _okb.float())
                 if roll_on:
                     # a whole plan next when the car is not where the plan put it: driven exactly, only something that stopped
                     # or pushed it does that (a wall it is held against, a box) -- 1 cm is far above the rounding; a restart too.
@@ -2197,7 +2304,10 @@ def main(argv=None):
                                replay=bool(scene.in_replay[_q]) if scene is not None else False,
                                copy_opp=bool(drv.opp.on[opp_index[others[_q, 0]]]) if drv.opp is not None else False,
                                mem_read=_mr, mem_pose=getattr(tp_, "pose0", None),
-                               known=int(aux_seen[_q].sum()) if aux_seen is not None else None)
+                               known=int(aux_seen[_q].sum()) if aux_seen is not None else None,
+                               parts=tap_parts(out, _q),
+                               pred=actor.pred_out[_q] if (pred_on and getattr(actor, "pred_out", None) is not None) else None,
+                               pred_pose=getattr(tp_, "pose0", None), **tap_opp_plan(_q))
                 if args.dump_rollout:
                     DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
                     for k in ("contact", "lap", "shaping"):
@@ -2347,8 +2457,60 @@ def main(argv=None):
         t_roll = time.time() - tr0
         if dist is not None:
             norm_merge(nsnap)
+        car_cost = None
+        t_car = time.time()
+        if car_on:
+            # (11-24) --plan-car-cost: every decision's plan against the other car's true next second, now that it is known --
+            # the last decisions compare only the points inside this rollout (the pose after its last decision included), so
+            # each reward is final before GAE reads it; every process alone, no collective
+            with torch.no_grad():
+                _os = env.sim.state[others[:, 0]].float()
+                _co, _so = torch.cos(_os[:, 2]), torch.sin(_os[:, 2])
+                _ok = (~env.sim.absent[others[:, 0]]) if getattr(env.sim, "absent_any", False) else torch.ones(Bl, dtype=torch.bool, device=dev)
+                OP_ = torch.stack(CQ["op"] + [torch.stack([_os[:, 0], _os[:, 1], _os[:, 2], _os[:, dyn.IVX] * _co - _os[:, dyn.IVY] * _so,
+                                                           _os[:, dyn.IVX] * _so + _os[:, dyn.IVY] * _co], 1)])     # (T+1, Bl, 5)
+                OR_ = torch.stack(CQ["op_rem"] + [pr.goal.remaining(_os[:, :2], env.sim.tid[lid])])
+                OK_ = torch.stack(CQ["op_ok"] + [_ok])
+                ME_ = torch.stack(CQ["me"])                                                                         # (T, Bl, 11, 6)
+                brk_ = (torch.stack(D) > 0) | ((OP_[1:, :, :2] - OP_[:-1, :, :2]).norm(dim=-1) > 2.0)   # a restart / put elsewhere
+                KN_ = torch.stack(CQ["know"]); LP_ = pr.goal.lap[torch.stack(CQ["tid"])].float()
+                cc_ = {k_: [] for k_ in ("price", "charged", "first", "n_ok", "gap0")}
+                for c0_ in range(0, Bl, 256):                                     # bounded memory: 256 cars at a time
+                    c_ = slice(c0_, min(Bl, c0_ + 256))
+                    o_ = PCC.plan_car_cost(torch, ME_[:, c_, :, 0:2], ME_[:, c_, :, 2], ME_[:, c_, :, 3:5], ME_[:, c_, :, 5],
+                                           OP_[:, c_, :2], OP_[:, c_, 2], OP_[:, c_, 3:5], OR_[:, c_], OK_[:, c_], brk_[:, c_],
+                                           KN_[:, c_], LP_[:, c_], car_kofs, car_w, car_dims[0], car_dims[1],
+                                           margin=args.plan_car_margin)
+                    for k_ in cc_:
+                        cc_[k_].append(o_[k_])
+                cc_ = {k_: torch.cat(v_, 1) for k_, v_ in cc_.items()}
+                car_cost = pr.contact_scale * args.plan_car_cost * cc_["price"] / T_REF                          # (T, Bl) [laps]
+                del OP_, OR_, OK_, ME_, o_
+                # the log's numbers (the ordinary races): decisions with the other car knowable and ahead along the track, of
+                # them the plans charged, by the copy's pace
+                P_ = torch.stack(CQ["pace"])
+                ah_ = KN_ & (cc_["gap0"] > 0.0) & ordm[None]
+                ch_ = cc_["charged"] & ah_
+                bk_ = (P_ < 0.7, (P_ >= 0.7) & (P_ < 0.9), P_ >= 0.9)
+                # the share of the cost the rollout's last decisions miss (they compare only the points inside it), estimated
+                # from the complete decisions: where their first charged point falls
+                full_ = cc_["charged"] & (cc_["n_ok"] == PS.N_STEP)
+                mk_ = torch.stack([(car_cost * (full_ & (cc_["first"] == k_))).sum() for k_ in range(1, PS.N_STEP + 1)])
+                fk_ = (mk_ / mk_.sum().clamp_min(1e-12)).tolist()
+                car_st = {"n": float(ah_.sum()), "hit": float(ch_.sum()), "nb": [float((ah_ & b_).sum()) for b_ in bk_],
+                          "hb": [float((ch_ & b_).sum()) for b_ in bk_], "cost": float(car_cost[:, ordm].sum()),
+                          "fire": float(cc_["charged"][:, ordm].sum()),
+                          "tail": sum(sum(fk_[m_:]) for m_ in range(1, PS.N_STEP)) / T}
+                del KN_, LP_, brk_
+                if taps:                                             # the live view: this rollout's plan-car cost, per tapped car
+                    _cc = (-car_cost[:, tap_rows]).cpu().numpy()
+                    for k_, tp_ in enumerate(taps):
+                        tp_.settle(_cc[:, k_])
+        t_car = time.time() - t_car                                # (the floats above have synchronised the GPU)
         # GAE; a restart (episode end) cuts the trace and bootstraps from the value before it
         V_ = torch.stack(V); R_ = torch.stack(R); D_ = torch.stack(D); FM_ = torch.stack(FM)
+        if car_cost is not None:
+            R_ = R_ - car_cost
         adv = torch.zeros_like(R_); gae = torch.zeros(Bl, device=dev)
         for t in reversed(range(T)):
             v_next = v_last if t == T - 1 else V_[t + 1]
@@ -2924,6 +3086,20 @@ def main(argv=None):
             row["near_miss_gap_per_min"] = n_near_gap / mins          # of them: the bodies within 10 cm (the rest: hard brakes)
         if args.car_fault:
             row["car_fault_per_min"] = n_fault / mins
+        if car_on:
+            _sh = lambda h_, n_: (h_ / n_) if n_ > 0 else None
+            row.update(plan_car_share=_sh(car_st["hit"], car_st["n"]), plan_car_share_lt07=_sh(car_st["hb"][0], car_st["nb"][0]),
+                       plan_car_share_07_09=_sh(car_st["hb"][1], car_st["nb"][1]),
+                       plan_car_share_ge09=_sh(car_st["hb"][2], car_st["nb"][2]), plan_car_ahead_n=car_st["nb"],
+                       plan_car_cost_per_min=car_st["cost"] / mins, plan_car_fire_per_min=car_st["fire"] / mins,
+                       plan_car_tail_missed=car_st["tail"], t_plan_car=t_car)
+        if car_on or drv.opp is not None:
+            # at-fault car contacts per minute against each pace (<0.7, 0.7-0.9, >=0.9 / own), the ordinary races
+            row["car_fault_per_min_by_pace"] = [float(f_) / (float(n_) * PS.DT / 60.0) if float(n_) > 0 else None
+                                                for f_, n_ in zip(car_fault_b, car_dec_b)]
+        if drv.opp is not None:
+            # the copies' mean speed by pace: 0.5-0.6, 0.6-0.7, 0.7-0.8, 0.8-0.9, 0.9-1.0, own [m/s]
+            row["opp_speed_pace_bins"] = [float(v_ / n_) if float(n_) > 0 else None for v_, n_ in zip(opp_v_bins, opp_n_bins)]
         if g_split["policy"]:
             # size = a minibatch's gradient on the GRU's weights; agree = the mean cosine between two minibatches' gradients:
             # 1 when every minibatch pushes the same way, 0 when they are unrelated (then the steps cancel)
@@ -2999,6 +3175,10 @@ def main(argv=None):
               + (f"선 상대 차 다시 출발 {n_restarted}번 | " if restarter is not None else "")
               + (f"상대 차 있는 판 {row['opp_present_share'] * 100:.0f} % | " if others is not None else "")
               + (f"우리 책임 차 접촉 {row['car_fault_per_min']:.2f}/분 | " if args.car_fault else "")
+              + ("앞차 plan 겹침 " + " · ".join(f"{lab_} " + ("-" if row[k_] is None else f"{row[k_] * 100:.1f} %")
+                                           for lab_, k_ in (("전체", "plan_car_share"), ("0.7배 미만", "plan_car_share_lt07"),
+                                                            ("0.7-0.9배", "plan_car_share_07_09"), ("0.9배 이상", "plan_car_share_ge09")))
+                 + f", 비용 {row['plan_car_cost_per_min']:.3f} 바퀴/분 | " if car_on else "")
               + (f"아슬아슬 스침 {row['near_miss_per_min']:.2f}/분 (10 cm 안 {row['near_miss_gap_per_min']:.2f}, 나머지는 바짝 뒤 급제동) | " if near_on else "")
               + (f"상대 차 예측: 0.5 s 뒤 오차 {(row['pred_err_05'] if row['pred_err_05'] is not None else float('nan')):.2f} m, 1.0 s 뒤 "
                  f"{(row['pred_err_10'] if row['pred_err_10'] is not None else float('nan')):.2f} m, 보이나 맞히기 AUC "

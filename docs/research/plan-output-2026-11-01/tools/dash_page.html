@@ -202,6 +202,10 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
         <div><h4>상대 차</h4><div class="cbox"><canvas id="c_cc2"></canvas></div></div></div></div>
     <div class="card hide" data-opt="car_fault_per_min"><h3>우리 책임 차 접촉 / 분</h3><div class="cbox"><canvas id="c_fault"></canvas></div></div>
     <div class="card hide" data-opt="near_miss_per_min"><h3>아슬아슬 스침 / 분</h3><div class="cbox"><canvas id="c_near"></canvas></div></div>
+    <div class="card hide" data-opt="plan_car_share" style="grid-column: 1 / -1"><h3>앞차 plan 겹침 <span class="sub">%</span></h3>
+      <div class="trio"><div><h4>0.7배 미만</h4><div class="cbox"><canvas id="c_pcar1"></canvas></div></div>
+        <div><h4>0.7-0.9배</h4><div class="cbox"><canvas id="c_pcar2"></canvas></div></div>
+        <div><h4>0.9배 이상</h4><div class="cbox"><canvas id="c_pcar3"></canvas></div></div></div></div>
     <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
     <div class="card"><h3>박는 plan 비율 <span class="sub">% · 벽·상자를 지나가는 plan (벌점 없음, 보기만)</span></h3><div class="cbox"><canvas id="c_phit"></canvas></div></div>
@@ -449,6 +453,13 @@ async function refresh() {
     const has = own.some((r) => r[k] != null) || rrOwn.some((r) => r[k] != null);
     document.querySelector(`[data-opt="${k}"]`).classList.toggle("hide", !has);
     if (has) chart(id, two((r) => r[k]), k !== "aux_auc"); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+  }
+  {   // (11-24, plan_rl --plan-car-cost) plans with a car knowable ahead that run into its true next second, by its pace
+    const has = own.some((r) => r.plan_car_share != null) || rrOwn.some((r) => r.plan_car_share != null);
+    document.querySelector('[data-opt="plan_car_share"]').classList.toggle("hide", !has);
+    for (const [id, k] of [["c_pcar1", "plan_car_share_lt07"], ["c_pcar2", "plan_car_share_07_09"], ["c_pcar3", "plan_car_share_ge09"]]) {
+      if (has) chart(id, two((r) => r[k] == null ? null : 100 * r[k])); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+    }
   }
   chart("c_phit", two((r) => r.plan_hit_share == null ? null : 100 * r.plan_hit_share));
   chart("c_t05", two((r) => r.tail_next_05 == null ? null : 100 * r.tail_next_05));
