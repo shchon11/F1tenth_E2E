@@ -17,7 +17,7 @@ policy가 읽은 그대로의 스캔(1081 빔 / 10 m), 두 차의 참 자세, �
 사용: python lidar_repr_test.py opp MODEL OUT_DIR BASE1 [BASE2 ...]   (BASE = 기록 .npz 경로에서 .npz 뺀 것)
       python lidar_repr_test.py box MODEL OUT_DIR BASE1 [...]          (상자 기억 시험, 아래 BOX 부분)
       python lidar_repr_test.py table OUT_DIR                          (한국어 요약)
-환경: REPR_EPOCHS(기본 20), REPR_BATCH(256), REPR_LR(1e-3), REPR_GPU_FRAC(0.3: 랩의 시험이 GPU에서 쫓겨나지 않게)."""
+환경: REPR_EPOCHS(기본 20), REPR_BATCH(128), REPR_LR(1e-3), REPR_GPU_FRAC(0.22: 랩의 시험이 GPU에서 쫓겨나지 않게)."""
 import os, sys, json, time, math
 import numpy as np
 import torch
@@ -31,7 +31,7 @@ HIST = 12                          # decisions of clean history every sample nee
 GX0, GY0, RES, GH, GW = -9.5, -10.0, 0.125, 160, 160     # the BEV grid: x ahead [GX0, GX0 + GH RES), y left
 SIG_P, SIG_TH = 0.02, math.radians(0.5)                  # odometry noise per 0.1 s (random walk)
 EPOCHS = int(os.environ.get("REPR_EPOCHS", "20"))
-BATCH = int(os.environ.get("REPR_BATCH", "256"))
+BATCH = int(os.environ.get("REPR_BATCH", "128"))
 LR = float(os.environ.get("REPR_LR", "1e-3"))
 
 
@@ -319,7 +319,7 @@ def opp_loss(out, tg, msk, there):
     return lp + 0.2 * lv, lp, lv
 
 
-def opp_predict(net, data, rows, bs=256, gen=None):
+def opp_predict(net, data, rows, bs=128, gen=None):
     net.eval(); P, L = [], []
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for i in range(0, rows.numel(), bs):
@@ -787,8 +787,8 @@ def run_box(kind, out_dir, bases):
         g = torch.Generator(device=DEV); g.manual_seed(seed)
         rows = []
         net.eval()
-        for k in range(0, len(sessions), 2 * GROUP_MEM):
-            ss = torch.as_tensor(sessions[k:k + 2 * GROUP_MEM], device=DEV)
+        for k in range(0, len(sessions), GROUP_MEM):
+            ss = torch.as_tensor(sessions[k:k + GROUP_MEM], device=DEV)
             rows += stream(net, data, ss, False, noise=noise, gen=g)[1]
         net.train()
         return np.concatenate(rows, 0) if rows else np.zeros((0, 5), np.float32)
@@ -960,7 +960,7 @@ def table(out_dir):
 if __name__ == "__main__":
     mode = sys.argv[1]
     if DEV.type == "cuda":
-        torch.cuda.set_per_process_memory_fraction(float(os.environ.get("REPR_GPU_FRAC", "0.3")))
+        torch.cuda.set_per_process_memory_fraction(float(os.environ.get("REPR_GPU_FRAC", "0.22")))
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
     if mode == "opp":
