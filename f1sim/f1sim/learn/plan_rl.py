@@ -1758,7 +1758,15 @@ def main(argv=None):
             dist.all_reduce(t_)
         return t_
 
-    Bl_all = int(dist_sum(Bl)[0]) if args.dist_world > 1 else Bl       # the learner cars of every process
+    Bl_all = Bl                                                         # the learner cars of every process
+    if dist is not None:
+        # (11-24) every process runs exactly --minibatches x K minibatches an epoch (`batches`), so each needs at least that
+        # many sequences: refused on every process at once (one leaving alone would leave the others waiting on it)
+        _mb_max = args.minibatches * max(1, args.horizon_auto)
+        _t = dist_sum(Bl, float(Bl < _mb_max))
+        Bl_all = int(_t[0])
+        if float(_t[1]) > 0:
+            raise SystemExit(f"--dist-world: a process has fewer learner cars than the {_mb_max} minibatches an epoch can have")
 
     def norm_snap():
         return [(m_.mean.double().clone(), m_.var.double().clone(), m_.count.double().clone()) for m_ in (actor.norm, critic.norm)]
@@ -2395,12 +2403,18 @@ def main(argv=None):
             tt = torch.arange(nC * Lc, device=dev).view(nC, Lc)
             seq_idx = (tt[:, :, None] * Bl + torch.arange(Bl, device=dev)[None, None, :]).permute(1, 0, 2).reshape(Lc, nC * Bl)
 
+        # (11-24) --dist-world: exactly MB minibatches on every process, whatever its number of cars -- each minibatch
+        # all-reduces its gradients, and `chunk` gives fewer than MB for some sizes (race32a: 304 and 208 sequences gave 31
+        # and 30 for MB 32 when the horizon went to K = 4, and rank 1 left the epochs while rank 0 was still all-reducing).
+        # One process: `chunk` as before
+        split_mb = (lambda t_: t_.tensor_split(MB)) if dist is not None else (lambda t_: t_.chunk(MB))
+
         def batches():
             if args.memory:
-                for sq in torch.randperm(seq_idx.shape[1], device=dev).chunk(MB):
+                for sq in split_mb(torch.randperm(seq_idx.shape[1], device=dev)):
                     yield seq_idx[:, sq]
             else:
-                for mb_ in torch.randperm(N, device=dev).chunk(MB):
+                for mb_ in split_mb(torch.randperm(N, device=dev)):
                     yield mb_
 
         def heads_on(fc, mb_):
@@ -2834,12 +2848,16 @@ def main(argv=None):
             with torch.no_grad():
                 pF_ = torch.cat([actor.features(bX[c_], bS[c_]).half() for c_ in idx_.split(8192)]).view(K_, Bl, -1)
             prev_mem = (pF_, bHM[idx_].view(K_, Bl, -1).clone(), D_[T - K_:].clone())
-        if args.tail_trunk and args.tail_trunk_ratio > 0 and tr_ratio:
+        if args.tail_trunk and args.tail_trunk_ratio > 0 and (tr_ratio or dist is not None):
             # measured with the present share: move the share toward the target ratio (damped; the next update uses it)
-            r_ = sum(tr_ratio) / len(tr_ratio)
+            r_ = sum(tr_ratio) / len(tr_ratio) if tr_ratio else 0.0
             if dist is not None:
-                r_ = float(dist_sum(r_)[0]) / args.dist_world          # one share for every process
-            tail_alpha = float(min(1.0, max(0.01, tail_alpha * (args.tail_trunk_ratio / max(r_, 1e-6)) ** 0.5)))
+                # one share for every process; every process takes part, measured or not (11-24: a collective only some
+                # processes reach puts the rest out of step)
+                t_ = dist_sum(r_, float(bool(tr_ratio)))
+                r_ = float(t_[0]) / float(t_[1]) if float(t_[1]) > 0 else None
+            if r_ is not None:
+                tail_alpha = float(min(1.0, max(0.01, tail_alpha * (args.tail_trunk_ratio / max(r_, 1e-6)) ** 0.5)))
         if trk is not None:
             # per optimizer step: the actor's move and the clipped gradient (descent sign) along each direction; per loss term
             # (first epoch, per minibatch): its descent direction along each, and the term summed over the first epoch

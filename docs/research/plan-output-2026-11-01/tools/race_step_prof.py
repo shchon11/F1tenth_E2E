@@ -23,8 +23,9 @@ import torch
 ARGS_JSON, WORLD, INIT = sys.argv[1], sys.argv[2], sys.argv[3]
 N_TAGS = int(sys.argv[4])
 W, N1, N2, N3 = (int(x) for x in sys.argv[5:9])
+N4 = int(os.environ.get("PROF_TORCH", "0"))     # then N4 decisions under torch.profiler (GPU kernel time per part)
 EXTRA = sys.argv[9:]
-T = W + N1 + N2 + N3
+T = W + N1 + N2 + N3 + N4
 
 from f1sim.learn import plan_rl as PR
 from f1sim.learn import plan_policy as PP
@@ -66,12 +67,17 @@ ST.dec = {"free": [], "sync": [], "prof": []}
 ST.phase = "warm"
 ST.prof = None
 ST.lobs = None
+ST.tp = None
+ST.dec["torch"] = []
 
 
 def timed(label, fn):
     lab = label if callable(label) else (lambda *a: label)
 
     def w(*a, **kw):
+        if ST.tp is not None:
+            with torch.profiler.record_function(lab(*a).strip()):
+                return fn(*a, **kw)
         if not ST.sync:
             return fn(*a, **kw)
         torch.cuda.synchronize(); t0 = time.perf_counter()
@@ -209,13 +215,21 @@ def boundary():
     if now_sync:
         torch.cuda.synchronize()
     t = time.perf_counter()
-    if ST.k >= 0 and ST.t_last is not None and ST.phase in ("free", "sync", "prof"):
+    if ST.k >= 0 and ST.t_last is not None and ST.phase in ("free", "sync", "prof", "torch"):
         ST.dec[ST.phase].append(t - ST.t_last)
     ST.k += 1
     k = ST.k
     if ST.phase == "prof" and ST.prof is not None and k >= W + N1 + N2 + N3:
         ST.prof.disable()
-    ph = "warm" if k < W else "free" if k < W + N1 else "sync" if k < W + N1 + N2 else "prof" if k < T else "end"
+    if ST.phase == "torch" and k >= T and ST.tp is not None:
+        torch.cuda.synchronize()
+        ST.tp.stop()
+    ph = ("warm" if k < W else "free" if k < W + N1 else "sync" if k < W + N1 + N2 else "prof" if k < W + N1 + N2 + N3
+          else "torch" if k < T else "end")
+    if ph == "torch" and ST.phase != "torch":
+        torch.cuda.synchronize()
+        ST.tp = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+        ST.tp.start()
     if ph == "end":
         report()
         sys.stdout.flush()
@@ -251,9 +265,25 @@ def report():
         print(f"\n[prof] cProfile {N3}결정, 자기 시간 순 (상위 40)")
         print("\n".join(s.getvalue().splitlines()[:70]))
         s = io.StringIO()
+        pstats.Stats(ST.prof, stream=s).sort_stats("tottime").print_callers(r"method 'to'|method 'tolist'|method 'cpu'|method 'item'|__bool__|nonzero")
+        print(f"\n[prof] cProfile {N3}결정, host 동기화가 되는 호출의 호출자")
+        print("\n".join(l_ for l_ in s.getvalue().splitlines() if l_.strip())[:12000])
+        s = io.StringIO()
         pstats.Stats(ST.prof, stream=s).sort_stats("cumulative").print_stats(45)
         print(f"\n[prof] cProfile {N3}결정, 누적 시간 순 (상위 45)")
         print("\n".join(s.getvalue().splitlines()[:75]))
+    if ST.tp is not None:
+        ka = ST.tp.key_averages()
+        n_ = max(1, N4)
+        dev_t = lambda e: getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0.0)
+        dev_i = lambda e: getattr(e, "device_time_total", None) or getattr(e, "cuda_time_total", 0.0)
+        kern = sum(dev_t(e) for e in ka) / 1e3 / n_
+        print(f"\n[prof] torch.profiler {N4}결정: 결정당 벽시계 {sum(ST.dec['torch']) / n_ * 1e3:.1f} ms, GPU 커널 시간 합 {kern:.1f} ms")
+        rows = [(e.key, dev_i(e) / 1e3 / n_, e.count / n_) for e in ka if e.key in set(ST.incl) | {L.strip() for L in ST.incl}]
+        for k_, t_, c_ in sorted(rows, key=lambda r: -r[1]):
+            print(f"  {k_:28s} GPU {t_:7.1f} ms/결정  호출 {c_:5.1f}")
+        print(ka.table(sort_by="self_cuda_time_total" if not hasattr(ka[0], "self_device_time_total") else "self_device_time_total",
+                       row_limit=25, max_name_column_width=60))
     print(f"[prof] GPU 최대 할당 {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GB")
 
 
