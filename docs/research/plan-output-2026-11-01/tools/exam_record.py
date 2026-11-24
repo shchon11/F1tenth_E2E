@@ -778,6 +778,7 @@ for kd in range(T):
         cf_ = torch.zeros(Bl, device=dev)
     if PRED_PROBE or PRED_SAVE:                                 # driving above is done; these passes touch nothing it reads
         PRD["orc"].append(opp_oracle(st).float().cpu())
+    if PRED_PROBE:
         PRD["probe"].append(probe_all(_scans0, _s0, _h0, cmd_d0, p).cpu())
     for j in range(PS.SUB):
         if mode == "ideal":
@@ -880,6 +881,7 @@ if PRED:
 if SAVE_SCAN:
     np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
                         ego=torch.stack(SCN["ego"]).numpy(),
+                        mount=torch.stack([env.sim.P[k_][lid].float() for k_ in ("mount_x", "mount_y", "mount_yaw")], 1).cpu().numpy(),
                         range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
 if SAVE_BOXVIS:
     np.savez_compressed(out_npz[:-4] + "_boxvis.npz", ds=torch.stack(BXV["ds"]).numpy(), live=torch.stack(BXV["live"]).numpy(),
