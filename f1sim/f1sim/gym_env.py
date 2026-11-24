@@ -2091,7 +2091,7 @@ class F1VecEnv:
         def calibrated(c, rows):
             return torch.stack([(c[:, 0] - cal[rows, 0].to(c.dtype)) / cal[rows, 1].to(c.dtype),
                                 c[:, 1] / cal[rows, 2].to(c.dtype)], 1)
-        unused = self._external_unused() if self.external_skip_unused else None
+        unused = self._external_unused() if getattr(self, "external_skip_unused", False) else None
         for i, rows in self.external_slot_rows.items():
             drv = self.external_drivers[i]
             if hasattr(drv, "command_env"):                  # a planner: privileged state, not a scan
