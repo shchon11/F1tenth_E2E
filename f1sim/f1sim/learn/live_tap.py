@@ -11,6 +11,19 @@ its speed estimate, the noise it drew, the memory's 128 values.
 draw on) and then, every `record`, `<run_dir>/live_tap.json` (atomic replace): the newest decision in full and a short trail
 of the car (the page keeps its own history from what it polls). One small device->host copy a decision; nothing the
 training reads or writes changes because of it.
+
+(11-24, the user: the reward panel did not tell whether every term shows) `now` also carries:
+* ``parts``: [{"n": name, "win": sum over the last 10 s, "ep": sum over the episode}, ...] -- one entry per term that enters
+  this car's reward (`set_parts`: the trainer names them, Korean), the last one "합" (their sum = the reward the training
+  used). A term the trainer can only price after the rollout (plan_rl --plan-car-cost: it needs the other car's next second)
+  is added to the decisions it belongs to when it arrives (`settle`); ``parts_pending_s`` = the window's seconds still
+  without it. ``parts_resid`` = the episode's reward minus the sum of the parts known per decision (~0: a check).
+* ``pred``: the prediction head's answer for this car (plan_rl --pred-opp) in the world -- {"pts": 10 x [x, y], "p":
+  P(visible)} -- from the pose the decision was made at (the console's `pred_w` transform); null without the head.
+* ``opp_plan``: 10 x [x, y] in the world, the plan of the policy copy driving the other car this decision (its path; a
+  slowed copy covers it at its pace factor); null when no copy drives it.
+* ``car_dims`` / ``opp_dims``: [length, width] [m] of the two cars.
+The old ``parts_ep`` / ``parts_win`` (lap, shaping, contact, plan hit, total) stay.
 """
 import json
 import os
@@ -34,6 +47,9 @@ class LiveTap:
         # (11-22, the user: "항목별 보상값들이라던지 아니면 좀 기억관련 좀 직관적이게 볼 수 있는것들?") the reward's parts summed
         # over this episode and the last 10 s, and the episode's lap times -- the page polls slower than decisions come
         self.ep_sum = np.zeros(5); self.win = deque(maxlen=100); self.laps = deque(maxlen=6)
+        # (11-24) the named parts (`set_parts`), per decision with its serial number so a late term finds its decisions
+        self.part_names, self.late = None, None
+        self.ent = deque(maxlen=100); self.ep2 = None; self.serial = 0; self.ep_first = 1; self.resid_ep = 0.0
         self.dec_ep, self.cross = 0, None
         self.run = os.path.basename(os.path.normpath(run_dir))
         self.trail = deque(maxlen=int(trail))
@@ -52,6 +68,7 @@ class LiveTap:
                     pass
         # (11-18) the car's length and width: the page draws the plan's footprints and the half-width band with them
         car = np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)])
+        self.car_dims = _r(car, 3)
         if name == "live_tap.json":                                 # the drawing set once, by the first car's tap
             np.savez(os.path.join(run_dir, "live_tracks.npz"), edt=tr.edt.float().cpu().numpy(), t_off=tr.t_off.cpu().numpy(),
                      t_H=tr.t_H.cpu().numpy(), t_W=tr.t_W.cpu().numpy(), t_res=tr.t_res.cpu().numpy(),
@@ -68,15 +85,40 @@ class LiveTap:
         self.prev_mem = None
         self.prev_xy = None
 
+    def set_parts(self, names, late=None) -> None:
+        """(11-24) the reward's terms by name, in the order `record(parts=...)` gives them; `late`: the name of one more term
+        priced after the rollout (`settle`)"""
+        self.part_names, self.late = list(names), late
+        self.ent.clear(); self.ep2 = None
+
+    def settle(self, values) -> None:
+        """(11-24) the late term of this car's last len(values) decisions (the rollout just priced), as reward parts (a cost
+        negative): added to the decisions still in the window and in this episode"""
+        if self.late is None:
+            return
+        v = np.asarray(values, dtype=np.float64).reshape(-1)
+        s0 = self.serial - v.size + 1
+        for e in self.ent:
+            i = e[0] - s0
+            if 0 <= i < v.size and not e[2]:
+                e[1][-1] += v[i]; e[2] = True
+        if self.ep2 is not None:
+            first = max(s0, self.ep_first)
+            if first <= self.serial:
+                self.ep2[-1] += float(v[first - s0:].sum())
+
     @torch.no_grad()
     def record(self, upd: int, kd: int, pts: torch.Tensor, pts_mean: torch.Tensor, plan_v: torch.Tensor,
                value: torch.Tensor, reward: torch.Tensor, lap: torch.Tensor, contact: torch.Tensor, shaping: torch.Tensor,
                vhat: torch.Tensor, noise: torch.Tensor, std: torch.Tensor, mem=None, replay: bool = False,
-               copy_opp: bool = False, mem_read=None, mem_pose=None, known=None) -> None:
+               copy_opp: bool = False, mem_read=None, mem_pose=None, known=None, parts=None, pred=None, pred_pose=None,
+               opp_plan=None, opp_live=None) -> None:
         """after a decision, learner `row`'s: `pts` (10, 2) the plan it drove (world), `pts_mean` (10, 2) the plan its mean
         action makes, `plan_v` (10,) the driven plan's speeds, the critic's `value`, the reward and its parts, the speed
         estimate `vhat`, the size of the noise drawn (`noise`, in std units) and the policy's mean std, `mem` (memory,) the
-        memory after this decision. The car as it stands at the decision's end."""
+        memory after this decision. The car as it stands at the decision's end. (11-24) `parts` (n,) the reward's terms
+        named by `set_parts`; `pred` (21,) the prediction head's raw output and `pred_pose` (3,) the pose the decision was
+        made at; `opp_plan` (10, 2) the other car's copy's plan (world) and `opp_live` () whether a copy drives it."""
         env, sim, r, o = self.env, self.env.sim, self.r, self.o
         dev = sim.state.device
         st = sim.state[r, :4].float()
@@ -92,14 +134,19 @@ class LiveTap:
             torch.zeros(0, device=dev)
         m = mem.float().reshape(-1) if mem is not None else torch.zeros(0, device=dev)
         sc = lambda x: torch.as_tensor(x, device=dev).float().reshape(-1)
-        parts = [st, ost, present, sc(pts), sc(pts_mean), sc(plan_v), hard, sim.tid[r].float().reshape(1),
-                 sc(value), sc(reward), sc(lap), sc(contact), sc(shaping), sc(vhat), sc(noise), sc(std), box, m, rng]
-        sizes = [int(p_.numel()) for p_ in parts]
-        flat = torch.cat(parts).cpu().numpy().astype(np.float64)
+        e0 = torch.zeros(0, device=dev)
+        extra = [sc(parts) if parts is not None else e0, sc(pred) if pred is not None else e0,
+                 sc(pred_pose)[:3] if pred_pose is not None else e0, sc(opp_plan) if opp_plan is not None else e0,
+                 sc(opp_live) if opp_live is not None else e0]
+        parts_l = [st, ost, present, sc(pts), sc(pts_mean), sc(plan_v), hard, sim.tid[r].float().reshape(1),
+                   sc(value), sc(reward), sc(lap), sc(contact), sc(shaping), sc(vhat), sc(noise), sc(std), box, m, rng] + extra
+        sizes = [int(p_.numel()) for p_ in parts_l]
+        flat = torch.cat(parts_l).cpu().numpy().astype(np.float64)        # still the one device->host copy a decision
         out, i = [], 0
         for n_ in sizes:
             out.append(flat[i:i + n_]); i += n_
-        car, opp, pres, plan, plan_m, pv, hit, tid, val, rew, lap_, con, shp, vh, noi, sd, bx, mm, rr = out
+        car, opp, pres, plan, plan_m, pv, hit, tid, val, rew, lap_, con, shp, vh, noi, sd, bx, mm, rr = out[:19]
+        npart, pq, ppose, oplan, olive = out[19:]
         a = self.angles + car[2]
         sx, sy = car[0] + self.mount_x * np.cos(car[2]), car[1] + self.mount_x * np.sin(car[2])
         ok = np.isfinite(rr) & (rr > 0.05) & (rr < 29.0)
@@ -113,9 +160,32 @@ class LiveTap:
             float(np.linalg.norm(plan_xy[:-1] - self.prev_plan[1:], axis=1).mean())
         mem_change = None if new_ep or self.prev_mem is None or not len(mm) else float(np.abs(mm - self.prev_mem).mean())
         self.prev_plan, self.prev_mem, self.prev_xy = plan_xy, (mm.copy() if len(mm) else None), car[:2].copy()
+        self.serial += 1
         if new_ep:
             self.trail.clear()
             self.ep_sum[:] = 0.0; self.win.clear(); self.laps.clear(); self.dec_ep, self.cross = 0, None
+            self.ent.clear(); self.ep2 = None; self.ep_first = self.serial; self.resid_ep = 0.0
+        # (11-24) the named parts: this decision's (+ a slot for the late term), the window's and the episode's sums
+        named = None
+        if self.part_names is not None and npart.size == len(self.part_names):
+            vec = np.concatenate([npart, np.zeros(1 if self.late is not None else 0)])
+            self.ent.append([self.serial, vec.copy(), False])
+            self.ep2 = vec.copy() if self.ep2 is None else self.ep2 + vec
+            self.resid_ep += float(rew[0] - npart.sum())
+            win = np.sum([e[1] for e in self.ent], 0)
+            names = self.part_names + ([self.late] if self.late is not None else [])
+            named = [{"n": n_, "win": round(float(w_), 4), "ep": round(float(e_), 4)} for n_, w_, e_ in zip(names, win, self.ep2)]
+            named.append({"n": "합", "win": round(float(win.sum()), 4), "ep": round(float(self.ep2.sum()), 4)})
+        pend = (sum(1 for e in self.ent if not e[2]) * 0.1) if (named is not None and self.late is not None) else 0.0
+        pred_js = None
+        if pq.size >= 21 and ppose.size == 3:
+            # the head's 10 points in the car's frame at the decision (x PRED_SCALE 5 m) and its 'visible' logit, in the world
+            from .plan_policy import PRED_N, PRED_SCALE
+            q = pq[:2 * PRED_N].reshape(PRED_N, 2) * PRED_SCALE
+            c_, s_ = np.cos(ppose[2]), np.sin(ppose[2])
+            wpts = np.stack([ppose[0] + q[:, 0] * c_ - q[:, 1] * s_, ppose[1] + q[:, 0] * s_ + q[:, 1] * c_], 1)
+            pred_js = {"pts": _r(wpts, 3), "p": round(float(1.0 / (1.0 + np.exp(-pq[-1]))), 4)}
+        opp_js = _r(oplan.reshape(10, 2), 3) if (oplan.size == 20 and olive.size == 1 and olive[0] > 0.5) else None
         self.trail.append(_r([car[0], car[1], car[3]], 2))
         # the reward's parts: lap bonus, distance shaping, contacts, the plan-hit price (what the total leaves), the total
         parts = np.array([lap_[0], shp[0], con[0], rew[0] - lap_[0] - shp[0] - con[0], rew[0]])
@@ -147,7 +217,9 @@ class LiveTap:
                "mem_change": None if mem_change is None else round(mem_change, 5),
                "label": self.label, "parts_ep": _r(self.ep_sum, 3), "parts_win": _r(np.sum(self.win, 0), 3),
                "laps": list(self.laps), "ep_s": round(self.dec_ep * 0.1, 1), "mem_boxes": mem_boxes,
-               "known": None if known is None else int(known)}
+               "known": None if known is None else int(known),
+               "parts": named, "parts_pending_s": round(pend, 1), "parts_resid": round(self.resid_ep, 6),
+               "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))

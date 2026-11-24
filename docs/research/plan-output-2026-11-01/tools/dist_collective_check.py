@@ -6,6 +6,8 @@ update 수, 롤아웃 길이만 작게. torch.distributed의 all_reduce / broadc
 K를 update마다 주어진 순서대로 강제(horizon_k 대신)해 K가 바뀌는 update를 지나게 함.
 인자: args.json world.json init.pt rank envs updates port K순서(예 2,2,4,4,2) out.json
       비교: cmp r0.json r1.json
+환경 변수(11-24): DIST_CHECK_SET='{"plan_car_cost": 0.1, ...}' = args.json 위에 덮어쓸 인자(update_offset 포함),
+      DIST_CHECK_TAPS=1 = 저장된 live tap 설정을 그대로 둠(기본: 끔)
 """
 import argparse
 import json
@@ -39,11 +41,14 @@ OUT = sys.argv[9]
 from f1sim.learn import plan_rl as PR
 
 saved = json.load(open(ARGS_JSON))["args"]
+saved.update(json.loads(os.environ.get("DIST_CHECK_SET", "") or "{}"))
 name = os.environ.get("DIST_CHECK_NAME", f"racefast_dist_{time.strftime('%m%d_%H%M')}")
 off = int(saved["update_offset"])
 over = dict(name=name, world=WORLD, init=INIT, envs=ENVS, dist_world=2, dist_rank=RANK, dist_init=f"tcp://127.0.0.1:{PORT}",
             horizon=int(os.environ.get("DIST_CHECK_HORIZON", "16")), updates=off + UPD, save_every=10 ** 6, live_tap=-1,
             live_taps=0)
+if os.environ.get("DIST_CHECK_TAPS") == "1":
+    del over["live_tap"], over["live_taps"]
 _orig_pa = argparse.ArgumentParser.parse_args
 
 

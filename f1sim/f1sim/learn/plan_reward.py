@@ -177,6 +177,8 @@ class PlanReward:
         self.phi = torch.zeros(Bl, device=device)              # Phi of the state at the last decision
         self.d_prev = torch.zeros(Bl, device=device)           # the CAR's distance left there (laps are the car's)
         self.cost = torch.zeros(Bl, device=device)             # [laps] contacts since the last decision
+        # (11-24) the same cost by kind -- wall, box, car, stall -- for the live view's reward parts (sums to `cost`)
+        self.cost_kind = torch.zeros(Bl, 4, device=device)
         self.seen_t = torch.full((Bl,), 1e9, device=device)    # [s] since a beam last hit a car
         self.n_contacts = torch.zeros(Bl, 3, device=device)
         self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
@@ -254,6 +256,7 @@ class PlanReward:
         self.d_prev[rows] = d
         self.phi[rows] = -d / L
         self.cost[rows] = 0.0
+        self.cost_kind[rows] = 0.0
         self.seen_t[rows] = 1e9
         if self._st_buf is not None:
             self._st_buf[:, rows] = 0.0; self._st_sum[rows] = 0.0; self._st_n[rows] = 0
@@ -278,7 +281,9 @@ class PlanReward:
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
         if self.car_fault_only and bool(on[:, 2].any()):
             charge[:, 2] = charge[:, 2] * self.at_fault().float()
-        self.cost = self.cost + self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
+        ck = self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge) / T_REF
+        self.cost = self.cost + ck.sum(1)
+        self.cost_kind[:, :3] += ck
         self.car_charged = self.car_charged + charge[:, 2]
         self.n_contacts = self.n_contacts + on
 
@@ -323,6 +328,7 @@ class PlanReward:
         rate = self._st_sum / (self._st_n.clamp(min=1).float() * dt)
         short = ((self.stall_vmin - rate) / max(self.stall_vmin, 1e-6)).clamp(0.0, 1.0) * (self._st_n > 0).float()
         self.cost = self.cost + self.stall_s * dt * short / T_REF
+        self.cost_kind[:, 3] += self.stall_s * dt * short / T_REF
         self.stall_time = self.stall_time + dt * short
         self._st_d = d
 
@@ -385,6 +391,8 @@ class PlanReward:
                "reward": lap + shaping - self.cost - pp, "progress": adv}
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
+        out["contact_kind"] = -self.cost_kind                  # (B_l, 4) wall, box, car, stall [laps]; sums to "contact"
+        self.cost_kind = torch.zeros_like(self.cost_kind)
         out["car_charged"] = self.car_charged
         self.car_charged = torch.zeros_like(self.car_charged)
         if restarted is not None and bool(restarted.any()):
