@@ -429,6 +429,7 @@ def run_opp(kind, out_dir, bases):
 #                     shifted / turned every step, without re-sampling it 600 times), channels: ever hit / how recently / the
 #                     scan now; read by a small U-Net. Odometry noise x0 (true motion) or x1 (2 cm, 0.5 deg per 0.1 s random walk)
 #         box_now   = the same U-Net, the scan now only (no memory): what the map shape alone gives away (the floor)
+#         box_bevgru= (c) the scan now as a grid -> a 2-D CNN -> the box_gru GRU and decoder (spatial features, latent memory)
 # No global map, no scan matching, no lap position, no line: only the ego motion integrated.
 BOX_AHEAD = 8.0
 OX0, OY0, ORES, OH, OW = -8.0, -8.0, 0.25, 64, 64
@@ -619,6 +620,9 @@ class BoxNet(nn.Module):
         self.kind = kind
         if kind == "box_gru":
             self.enc = Enc1D(3, beams); self.cell = nn.GRUCell(256 + 2, 256); self.dec = VecDecoder(512)
+        elif kind == "box_bevgru":
+            # (c) the scan now as a grid in the car's frame -> a 2-D CNN -> the same GRU and decoder as box_gru
+            self.enc = Enc2D(1, hw=(IH, IW)); self.cell = nn.GRUCell(256 + 2, 256); self.dec = VecDecoder(512)
         else:
             self.unet = UNet(3)
 
@@ -639,15 +643,18 @@ def stream(net, data, sess, train, noise=0.0, opt=None, sch=None, gen=None, keep
     n = sess.numel(); T = data.T
     kind = net.kind
     h = torch.zeros(n, 256, device=DEV)
-    mem = SpatialMem(n) if kind != "box_gru" else None
+    mem = SpatialMem(n) if kind in ("box_mem", "box_now") else None
     out_rows, losses = [], []
     for t0 in range(0, T, CHUNK):
         ts = list(range(t0, min(t0 + CHUNK, T)))
         with torch.set_grad_enabled(train):
-            if kind == "box_gru":
-                x = torch.stack([data.stack3(t, sess) for t in ts], 1)                     # (n, L, 3, beams)
+            if kind in ("box_gru", "box_bevgru"):
+                if kind == "box_gru":
+                    x = torch.stack([data.stack3(t, sess) for t in ts], 1).reshape(n * len(ts), 3, -1)   # (n L, 3, beams)
+                else:
+                    x = torch.stack([data.scan_now(t, sess)[:, 0] for t in ts], 1).reshape(n * len(ts), 1, IH, IW)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    f = net.enc(x.reshape(-1, 3, x.shape[-1]).float()).view(n, len(ts), 256)
+                    f = torch.cat([net.enc(x[k:k + 1024].float()) for k in range(0, x.shape[0], 1024)]).view(n, len(ts), 256)
                 feats = []
                 for j, t in enumerate(ts):
                     if t > 0:
@@ -767,9 +774,9 @@ def run_box(kind, out_dir, bases):
     net = BoxNet(base_kind, data.scan.shape[-1]).to(DEV)
     n_par = sum(p.numel() for p in net.parameters())
     tr_s = np.nonzero(~val)[0]; va_s = np.nonzero(val)[0]
-    GROUP = GROUP_GRU if base_kind == "box_gru" else GROUP_MEM
+    GROUP = GROUP_GRU if base_kind in ("box_gru", "box_bevgru") else GROUP_MEM
     groups_ep = math.ceil(len(tr_s) / GROUP)
-    if base_kind == "box_gru":
+    if base_kind in ("box_gru", "box_bevgru"):
         steps_group = math.ceil(data.T / CHUNK)
     else:
         steps_group = sum(math.ceil(GROUP * len([t for t in range(t0, min(t0 + CHUNK, data.T)) if t % 2 == 0]) / 128)
@@ -832,8 +839,9 @@ def run_box(kind, out_dir, bases):
             f"정밀도 {sc['tp'] / max(sc['tp'] + sc['fp'], 1):.3f}, 오차 중앙 {np.median(sc['err']) if len(sc['err']) else float('nan'):.3f} m")
     # cost at batch 1
     net.eval()
-    if base_kind == "box_gru":
-        x1 = data.stack3(5, torch.as_tensor([0], device=DEV)).float()
+    if base_kind in ("box_gru", "box_bevgru"):
+        x1 = (data.stack3(5, torch.as_tensor([0], device=DEV)).float() if base_kind == "box_gru"
+              else data.scan_now(5, torch.as_tensor([0], device=DEV)))
         fl = (flops_of(net.enc, x1) + 2 * 3 * (256 + 2 + 256) * 256 + flops_of(net.dec, torch.zeros(1, 512, device=DEV)))
         ms = latency_ms(lambda: net.dec(torch.cat([net.cell(torch.cat([net.enc(x1), torch.zeros(1, 2, device=DEV)], 1),
                                                             torch.zeros(1, 256, device=DEV)), net.enc(x1)], 1)))
@@ -864,7 +872,7 @@ OPP_NAMES = [("polar_gru", "극좌표 스캔 + GRU 10결정 (지금 policy 방�
              ("bev10_noise", "위에서 본 격자 10장 (거리계 잡음으로 학습·평가)")]
 REF_NAMES = [("head", "라이브 policy 머리 (race33b u925, 같은 결정)"), ("still", "[참값] 지금 자리에 그대로 선다고 봄"),
              ("cv", "[참값] 지금 자리 + 참 속도로 직진"), ("oracle", "[참값] 상대 복사본 자신의 plan")]
-BOX_NAMES = [("box_gru", "극좌표 스캔 + GRU (세션 전체, 지금 policy 방식)"), ("box_now", "지금 스캔만 격자로 (기억 없음: 바닥선)"),
+BOX_NAMES = [("box_gru", "극좌표 스캔 + GRU (세션 전체, 지금 policy 방식)"), ("box_bevgru", "지금 스캔 격자 CNN + GRU (세션 전체)"), ("box_now", "지금 스캔만 격자로 (기억 없음: 바닥선)"),
              ("box_mem", "자기 움직임으로 옮기는 격자 기억 (참 움직임으로 학습)"), ("box_mem_noise", "같은 격자 기억 (거리계 잡음으로 학습)")]
 
 
