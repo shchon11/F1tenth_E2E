@@ -533,26 +533,137 @@ PRED_SCALE = 5.0
 PRED_OUT = 2 * PRED_N + 1                 # x0, y0, ..., x9, y9, visible
 PRED_IN = 1 + 2 * PRED_N                  # what the trunk reads: P(visible), then the points x P(visible)
 
+# (11-25) `pred_smooth` (plan_rl --pred-smooth; the user watched the live view: "기이하게 예측되면 안되잖어"). Each of the 10
+# points was regressed on its own and the path zig-zagged -- race32c u850 on exam4, decisions with the car there: the mean
+# |turn| between successive predicted segments 41.5 deg a step, the realised paths' 6.4 deg. The smooth head outputs the
+# other car's pose now (x0, y0, heading0, in our frame at the decision) and its speed and curvature over the next second,
+# each a cubic in time (4 Legendre coefficients), and the 10 points are that path integrated -- the same output format as
+# before, so everything that reads the prediction is unchanged. Why a cubic and not 10 free steps: fitted to the same
+# record's realised 1 s paths, 4 + 4 coefficients miss them by 0.8 cm median / 2.7 cm p90 at 1 s (10 + 10: 0.8 / 2.2 cm),
+# while free steps could still alternate the curvature's sign every 0.1 s (a zig-zag of up to 2 v k_max dt a step)
+PRED_NB = 4                               # Legendre coefficients of the speed and of the curvature over the second
+PRED_KIN_OUT = 3 + 2 * PRED_NB + 1        # x0 / PRED_SCALE, y0 / PRED_SCALE, heading0 / pi, speed's, curvature's, visible
+PRED_V_UNIT = 2.0                         # [m/s] the speed is this x softplus(the speed's cubic)
+PRED_V0 = 4.0                             # [m/s] a fresh head's speed (the realised paths' median 3.7 m/s)
+PRED_W_POSE = 0.2                         # the loss on the pose now: Huber on (x0, y0) / PRED_SCALE, this x the points' mean
+PRED_W_HEAD = 0.05                        # and (1 - cos) of heading0 against the other car's yaw
+
+
+def pred_basis(n_b: int = PRED_NB, n: int = PRED_N) -> torch.Tensor:
+    """(n_b, n): Legendre polynomials P0, P1, .. at the middle of each 0.1 s step, the second mapped to [-1, 1]"""
+    t = (torch.arange(n, dtype=torch.float32) + 0.5) / n * 2.0 - 1.0
+    P = [torch.ones_like(t), t]
+    for j in range(2, n_b):
+        P.append(((2 * j - 1) * t * P[-1] - (j - 1) * P[-2]) / j)
+    return torch.stack(P[:n_b], 0)
+
+
+def unicycle(x0: torch.Tensor, y0: torch.Tensor, th0: torch.Tensor, v: torch.Tensor, k: torch.Tensor,
+             dt: float = PS.DT) -> torch.Tensor:
+    """(n,) x3 the start pose, (n, N) speeds [m/s] >= 0 and curvatures [1/m] per step -> (n, N, 2) the positions at the end
+    of each step. A step is an exact arc: its heading turns v k dt, its chord (length v dt sinc) points along the step's
+    middle heading"""
+    phi = v * k * dt
+    th_mid = th0[:, None] + torch.cumsum(phi, 1) - 0.5 * phi
+    ds = v * dt * torch.sinc(phi / (2.0 * math.pi))               # torch.sinc(x) = sin(pi x) / (pi x)
+    return torch.stack([x0[:, None] + torch.cumsum(ds * torch.cos(th_mid), 1),
+                        y0[:, None] + torch.cumsum(ds * torch.sin(th_mid), 1)], -1)
+
 
 class OppPredictor(nn.Module):
     """`Actor2.pred` (plan_rl --pred-opp): the nearest other car's next 1 s from what the policy itself reads -- the LiDAR
     stack (through an encoder of its own, started as a copy of the policy's), the normalised state and the memory's state
     (both detached). Taught by a supervised loss with its own optimizer; nothing of the policy's loss reaches it, and the
-    policy reads its answer detached (`Actor2.pred_feed`)."""
+    policy reads its answer detached (`Actor2.pred_feed`).
+    `smooth` (11-25, see PRED_NB): the last layer gives the pose now and the cubics, `forward` returns the integrated points
+    in the old format. Speed = PRED_V_UNIT softplus(.) >= 0; curvature = k_max(speed) tanh(.), k_max the car's own limit
+    `kin` = (speeds (G,) [m/s] from 0, evenly spaced; the curvature held there (G,) [1/m]) -- `plan_steps.Limits` of the
+    nominal car at full grip: the smaller of the steering lock's tan(s_max) / wheelbase and the tyres' a_lat(v) / v^2.
+    Kept in the checkpoint (`kin_v`, `kin_k`)."""
 
-    def __init__(self, beams: int, state_dim: int, memory: int, hidden: int = 256):
+    def __init__(self, beams: int, state_dim: int, memory: int, hidden: int = 256, smooth: bool = False, kin=None):
         super().__init__()
+        self.smooth = bool(smooth)
         self.enc = ScanEncoder(beams)
         self.mlp = nn.Sequential(nn.Linear(256 + state_dim + memory, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh(),
-                                 nn.Linear(hidden, PRED_OUT))
+                                 nn.Linear(hidden, PRED_KIN_OUT if self.smooth else PRED_OUT))
+        if self.smooth:
+            if kin is None:
+                raise ValueError("pred_smooth needs the car's curvature limit: kin = (speeds (G,) [m/s], curvature (G,) [1/m])")
+            v_g, k_g = (torch.as_tensor(x).detach().float().cpu().clone() for x in kin)
+            if v_g.shape != k_g.shape or v_g.numel() < 2 or float(v_g[0]) != 0.0 or \
+                    float((v_g.diff() - (v_g[1] - v_g[0])).abs().max()) > 1e-4:
+                raise ValueError("kin: speeds from 0, evenly spaced, one curvature each")
+            self.register_buffer("kin_v", v_g)
+            self.register_buffer("kin_k", k_g)
+            self.register_buffer("basis", pred_basis(), persistent=False)
+            self.kin_reset()
 
-    def forward(self, scans: torch.Tensor, state_n: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([self.enc(scans), state_n.detach(), h.detach()], 1))
+    def kin_reset(self) -> None:
+        """the pose / speed / curvature outputs afresh (the 'visible' row untouched): weights x 0.01, so a fresh head says a
+        car here, heading as we do, PRED_V0 straight on, whatever it reads, and learns from there"""
+        last = self.mlp[-1]
+        with torch.no_grad():
+            w = torch.empty(PRED_KIN_OUT - 1, last.in_features)
+            nn.init.orthogonal_(w, 0.01)
+            last.weight[:-1] = w.to(last.weight)
+            last.bias[:-1] = 0.0
+            last.bias[3] = math.log(math.expm1(PRED_V0 / PRED_V_UNIT))   # the speed's constant term (P0 = 1)
+
+    def kappa_max(self, v: torch.Tensor) -> torch.Tensor:
+        """the curvature the car holds at speed v >= 0 (linear in the table; above its top speed the top's lateral
+        acceleration: k_top (v_top / v)^2)"""
+        n = self.kin_v.numel()
+        g = (v / (self.kin_v[1] - self.kin_v[0])).clamp(0.0, n - 1 - 1e-3)
+        i0 = g.floor().long()
+        w = g - i0.to(g.dtype)
+        k = self.kin_k[i0] * (1.0 - w) + self.kin_k[i0 + 1] * w
+        v_top = self.kin_v[-1]
+        return torch.where(v > v_top, self.kin_k[-1] * (v_top / v.clamp_min(1e-6)) ** 2, k)
+
+    def kin_vk(self, o: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """the last layer's output (n, PRED_KIN_OUT) -> each step's speed [m/s] and curvature [1/m], (n, PRED_N) each"""
+        nb = PRED_NB
+        v = PRED_V_UNIT * nn.functional.softplus(o[:, 3:3 + nb].float() @ self.basis)
+        return v, self.kappa_max(v) * torch.tanh(o[:, 3 + nb:3 + 2 * nb].float() @ self.basis)
+
+    def kin_path(self, o: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """the last layer's output (n, PRED_KIN_OUT) -> (points (n, PRED_N, 2) [m], pose now (n, 3): x0, y0 [m], heading0)"""
+        o = o.float()
+        x0, y0, th0 = o[:, 0] * PRED_SCALE, o[:, 1] * PRED_SCALE, o[:, 2] * math.pi
+        v, k = self.kin_vk(o)
+        return unicycle(x0, y0, th0, v, k), torch.stack([x0, y0, th0], 1)
+
+    def forward(self, scans: torch.Tensor, state_n: torch.Tensor, h: torch.Tensor, pose: bool = False):
+        """(n, PRED_OUT): the points / PRED_SCALE and the 'visible' logit; with `pose`, (that, the pose now (n, 3) or None)"""
+        o = self.mlp(torch.cat([self.enc(scans), state_n.detach(), h.detach()], 1))
+        if not self.smooth:
+            return (o, None) if pose else o
+        pts, z = self.kin_path(o)
+        q = torch.cat([pts.reshape(-1, 2 * PRED_N) / PRED_SCALE, o[:, -1:].float()], 1).to(o.dtype)
+        return (q, z) if pose else q
 
 
 def pred_points(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """a prediction (n, PRED_OUT) -> (points (n, PRED_N, 2) [m] in the car's frame at the decision, P(visible) (n,))"""
     return q[:, :2 * PRED_N].reshape(-1, PRED_N, 2) * PRED_SCALE, torch.sigmoid(q[:, -1])
+
+
+def pred_zigzag(pts: torch.Tensor, real: torch.Tensor, min_seg: float = 0.05) -> torch.Tensor:
+    """(11-25) how much a predicted path zig-zags: (n, N, 2) predicted points and (n, N, 2) where the car really was ->
+    (m,) [deg] per decision, the mean |turn| between successive segments of the prediction minus the same of the realised
+    path, over the turns where the realised car moved >= `min_seg` [m] in both segments (a standing car has no direction);
+    decisions with no such turn are left out"""
+    def turns(P):
+        s = P[:, 1:] - P[:, :-1]
+        a = torch.atan2(s[..., 1], s[..., 0])
+        return (torch.remainder(a[:, 1:] - a[:, :-1] + math.pi, 2.0 * math.pi) - math.pi).abs(), s.norm(dim=-1)
+    tp, _ = turns(pts.float())
+    tr, lr = turns(real.float())
+    m = ((lr[:, 1:] >= min_seg) & (lr[:, :-1] >= min_seg)).float()
+    n = m.sum(1)
+    z = ((tp - tr) * m).sum(1) / n.clamp_min(1.0)
+    return torch.rad2deg(z[n > 0])
 
 
 class Actor2(nn.Module):
@@ -614,7 +725,7 @@ class Actor2(nn.Module):
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
                  mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
                  pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = "",
-                 pred_opp: bool = False):
+                 pred_opp: bool = False, pred_smooth: bool = False, pred_kin=None):
         super().__init__()
         self.branches = int(branches)
         # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
@@ -656,13 +767,18 @@ class Actor2(nn.Module):
         self.pred_opp = bool(pred_opp)
         if self.pred_opp and not self.mem_front:
             raise ValueError("pred_opp needs memory with mem_front")
+        # (11-25) `pred_smooth`: the head's points are a path integrated from its pose now, speed and curvature
+        # (`OppPredictor.smooth`; `pred_kin` the car's curvature limit) -- same output, same trunk inputs
+        self.pred_smooth = bool(pred_smooth)
+        if self.pred_smooth and not self.pred_opp:
+            raise ValueError("pred_smooth needs pred_opp")
         n_pr = PRED_IN if self.pred_opp else 0
         self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai + n_pr) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
         self.pred = None
         self.pred_out = None
         if self.pred_opp:
-            self.pred = OppPredictor(beams, sd, int(memory) + self.box_memory, hidden)
+            self.pred = OppPredictor(beams, sd, int(memory) + self.box_memory, hidden, smooth=self.pred_smooth, kin=pred_kin)
             with torch.no_grad():
                 self.trunk[0].weight[:, -n_pr:] = 0.0
                 self.pred.enc.load_state_dict(self.enc.state_dict())
@@ -774,10 +890,11 @@ class Actor2(nn.Module):
             x = x + [pin]
         return self.trunk(torch.cat(x, 1))
 
-    def pred_q(self, scans: torch.Tensor, f: torch.Tensor, hs: torch.Tensor) -> torch.Tensor:
+    def pred_q(self, scans: torch.Tensor, f: torch.Tensor, hs: torch.Tensor, pose: bool = False):
         """`pred_opp`: the raw prediction (n, PRED_OUT) from the scans, the features `f` (their normalised-state part) and
-        the memory's state `hs` -- the head's own weights only carry a gradient"""
-        return self.pred(scans, f[:, 256:], hs)
+        the memory's state `hs` -- the head's own weights only carry a gradient. `pose`: (that, the smooth head's pose now
+        (n, 3) -- None for the old head)"""
+        return self.pred(scans, f[:, 256:], hs, pose)
 
     @staticmethod
     def pred_feed(q: torch.Tensor) -> torch.Tensor:
@@ -931,7 +1048,10 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    pace_caps=str(ck["args"].get("pace_caps", "") or ""), pace_hold=int(ck["args"].get("pace_hold", 10) or 10),
                    pace_floor=float(ck["args"].get("pace_floor", 0.05) or 0.05),
                    line_shifts=str(ck["args"].get("line_shifts", "") or ""),
-                   pred_opp=any(k.startswith("pred.") for k in ck["actor"])).to(device)
+                   pred_opp=any(k.startswith("pred.") for k in ck["actor"]),
+                   pred_smooth="pred.kin_k" in ck["actor"],
+                   pred_kin=((ck["actor"]["pred.kin_v"], ck["actor"]["pred.kin_k"]) if "pred.kin_k" in ck["actor"] else None)
+                   ).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

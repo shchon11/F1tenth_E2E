@@ -25,7 +25,8 @@ FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts
           "plan_hit_share", "tail_next_05", "tail_driven_10", "vest_mae",      # (11-16, the user: "plan관련 지표는 못보여주나?")
           "noise_scale", "aux_auc",       # (11-19, the user: "잡음 크기는 사이트에 plot 안되나?"; + the box memory's side task)
           "car_fault_per_min", "near_miss_per_min", "pred_err_05", "pred_err_10",   # (11-24) the race phase (1v1)
-          "plan_car_share", "plan_car_share_lt07", "plan_car_share_07_09", "plan_car_share_ge09")  # (11-25) --plan-car-cost
+          "plan_car_share", "plan_car_share_lt07", "plan_car_share_07_09", "plan_car_share_ge09",  # (11-25) --plan-car-cost
+          "pred_zigzag", "pred_zigzag_p90")   # (11-25) the other car's predicted path: zig-zag against the realised [deg]
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()

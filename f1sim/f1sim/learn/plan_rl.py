@@ -48,7 +48,8 @@ from .. import map_controller as M
 from . import state_rl as SR
 from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2, ROLL_IDX, roll_shift, \
     roll_shift_c, commit_masks, tanh_logp_m
-from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models, PRED_N, PRED_SCALE
+from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models, PRED_N, PRED_SCALE, PRED_OUT, PRED_W_POSE, PRED_W_HEAD, \
+    pred_zigzag
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
 from .plan_reward import PlanReward, SEEN_S, T_REF
@@ -709,15 +710,36 @@ def mem_prefix(gru, pF: torch.Tensor, pHM: torch.Tensor, pD: torch.Tensor, cars:
     return torch.where(pD[-1][cars][:, None] > 0, h_now, h)
 
 
-def init_actor(actor, sd0: dict) -> bool:
+def init_actor(actor, sd0: dict) -> str:
     """--init: `actor` from a checkpoint's actor weights `sd0` -- the trunk's first layer widened with zero columns for inputs
     the checkpoint had none of (the memory, the box memory, the other car's prediction: all appended last), the input
     statistics widened, every weight the checkpoint lacks left as built (a fresh GRU, a fresh prediction head) -- so the
-    actor drives exactly as the checkpoint did. True when a prediction head (`Actor2.pred_opp`) was added: its scan encoder
-    then starts as a copy of the policy's (11-24)"""
+    actor drives exactly as the checkpoint did. Returns "new" when a prediction head (`Actor2.pred_opp`) was added: its scan
+    encoder then starts as a copy of the policy's (11-24); "smooth" when the checkpoint's head was the old kind and the actor's
+    is `pred_smooth` (11-25): the head's encoder, hidden layers and 'visible' row are kept, its position outputs start afresh
+    (`OppPredictor.kin_reset`, as built), and the trunk's 20 columns that read the predicted points start at zero (the
+    column of P(visible) kept) -- the plan learns to read the new paths from scratch. The fork then drives as its parent
+    except for what the parent's plan took from its old points (those weights are gone; race32c u800: rms 0.007 against
+    0.04 for the trunk's other inputs -- `tools/pred_zero_init_check.py ... smooth` measures the plans' difference);
+    "" otherwise"""
     sd = dict(sd0)
     w = sd["trunk.0.weight"]
     sd["trunk.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], actor.trunk[0].in_features - w.shape[1], device=w.device)], 1)
+    head = getattr(actor, "pred", None)
+    smooth_ck = "pred.kin_k" in sd0
+    if smooth_ck and not getattr(head, "smooth", False):
+        raise ValueError("--init: the checkpoint's prediction head is the smooth kind: add --pred-smooth")
+    to_smooth = bool(getattr(head, "smooth", False) and "pred.mlp.4.weight" in sd0 and not smooth_ck)
+    if to_smooth:
+        if sd0["pred.mlp.4.weight"].shape[0] != PRED_OUT:
+            raise ValueError("--init: the checkpoint's prediction head has an unknown output size")
+        own = actor.state_dict()
+        w4, b4 = own["pred.mlp.4.weight"].clone(), own["pred.mlp.4.bias"].clone()
+        w4[-1] = sd0["pred.mlp.4.weight"][-1].to(w4); b4[-1] = sd0["pred.mlp.4.bias"][-1].to(b4)
+        sd["pred.mlp.4.weight"], sd["pred.mlp.4.bias"] = w4, b4
+        tw = sd["trunk.0.weight"].clone()
+        tw[:, -2 * PRED_N:] = 0.0                          # the points x P(visible); P(visible) itself is the column before
+        sd["trunk.0.weight"] = tw
     for k_, fill in (("norm.mean", 0.0), ("norm.var", 1.0)):
         v_ = sd[k_]
         sd[k_] = torch.cat([v_, torch.full((actor.norm.mean.numel() - v_.numel(),), fill, device=v_.device)])
@@ -728,10 +750,10 @@ def init_actor(actor, sd0: dict) -> bool:
             # a wider read-out (--aux-opp) from a boxes-only one: the boxes' rows kept, the new ones fresh
             nv = v_.clone(); nv[: sd[k_].shape[0]] = sd[k_]; sd[k_] = nv
     actor.load_state_dict(sd)
-    if getattr(actor, "pred", None) is not None and not any(k_.startswith("pred.") for k_ in sd0):
+    if head is not None and not any(k_.startswith("pred.") for k_ in sd0):
         actor.pred.enc.load_state_dict(actor.enc.state_dict())
-        return True
-    return False
+        return "new"
+    return "smooth" if to_smooth else ""
 
 
 def _arg_problem(args) -> str:
@@ -750,6 +772,8 @@ def _arg_problem(args) -> str:
         if not os.path.isfile(args.init):
             return f"--init {args.init}: no such file"
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
+        if "pred.kin_k" in (ck.get("actor") or {}) and not args.pred_smooth:
+            return "--init: the checkpoint's prediction head is the smooth kind: add --pred-smooth"
         if bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             return "--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch"
     rules = (
@@ -761,6 +785,7 @@ def _arg_problem(args) -> str:
         (args.scene_copies and not (args.scene_replay > 0 and args.self_opp > 0), "--scene-copies needs --scene-replay and --self-opp"),
         (args.scene_near_miss and not args.scene_replay > 0, "--scene-near-miss needs --scene-replay"),
         (args.pred_opp and not (args.memory and args.mem_front and v2 and not v3), "--pred-opp needs --memory --mem-front (v2)"),
+        (args.pred_smooth and not args.pred_opp, "--pred-smooth needs --pred-opp"),
         (args.plan_car_cost > 0 and (not v2 or v3 or args.hold_p > 0 or bool(args.plan_roll) or bool(args.roll_grow)
                                      or args.branches == 2),
          "--plan-car-cost needs --format v2 without --hold-p / --plan-roll / --roll-grow / --branches 2"),
@@ -1192,6 +1217,14 @@ def main(argv=None):
                          "the decision) and whether it is there, from the policy's own inputs only; taught supervised (Huber on "
                          "the positions, BCE on 'there') by an optimizer of its own; the plan reads the answer detached through "
                          "new trunk weights that start at zero (a fork drives exactly as its parent at first)")
+    ap.add_argument("--pred-smooth", action="store_true",
+                    help="(11-25, the user: the predicted points zig-zagged, '기이하게 예측되면 안되잖어') --pred-opp's head outputs the "
+                         "other car's pose now (x, y, heading in our frame) and its speed (>= 0) and curvature (within the car's "
+                         "own limit: steering lock and tyres, `plan_steps.Limits` at full grip) over the next second as cubics in "
+                         "time; the 10 points are that path integrated (same format, same trunk inputs). Loss: the same Huber on "
+                         "the points + a small one on the pose now. From a checkpoint with the old head: its encoder and "
+                         "'there' branch kept, the position outputs fresh, the trunk's 20 point columns zero (drives as its parent "
+                         "but for what its plan took from the old points)")
     ap.add_argument("--pred-lr", type=float, default=3e-4, help="--pred-opp: the head's own Adam learning rate")
     ap.add_argument("--pred-range", type=float, default=10.0,
                     help="--pred-opp: [m] the other car counts as there (target 'visible', and the positions taught) within "
@@ -1445,6 +1478,14 @@ def main(argv=None):
     pred_on = bool(args.pred_opp)
     if pred_on and not (args.memory and args.mem_front and v2 and not v3 and env.M > 1):
         raise SystemExit("--pred-opp needs --memory --mem-front (v2) and a world with another car")
+    pred_smooth = bool(args.pred_smooth)
+    if pred_smooth and not pred_on:
+        raise SystemExit("--pred-smooth needs --pred-opp")
+    pred_kin = None
+    if pred_smooth:
+        # the other car's curvature limit: the nominal car's steering lock and tyres at full grip, no plan margin
+        _lk = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev, margin=1.0)
+        pred_kin = (_lk.v_grid, _lk.k_tyre)
     car_on = args.plan_car_cost > 0                                # (11-24) --plan-car-cost
     if car_on and (not v2 or v3 or env.M < 2 or args.hold_p > 0 or args.plan_roll or args.roll_grow or two):
         raise SystemExit("--plan-car-cost needs --format v2, a world with another car, without --hold-p / --plan-roll / "
@@ -1654,7 +1695,8 @@ def main(argv=None):
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
                     aux_in=args.mem_aux_in, pace_caps=args.pace_caps, pace_hold=args.pace_hold,
-                    pace_floor=args.pace_floor, line_shifts=args.line_shifts, pred_opp=args.pred_opp) if v2
+                    pace_floor=args.pace_floor, line_shifts=args.line_shifts, pred_opp=args.pred_opp,
+                    pred_smooth=pred_smooth, pred_kin=pred_kin) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -1726,8 +1768,12 @@ def main(argv=None):
         ck0 = torch.load(args.init, map_location=dev, weights_only=False)
         if bool((ck0.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             raise SystemExit("--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch")
-        if init_actor(actor, ck0["actor"]):
+        _added = init_actor(actor, ck0["actor"])
+        if _added == "new":
             print("[plan_rl] 상대 차 예측 머리 새로 붙임: 스캔 encoder는 policy 것을 복사, plan이 읽는 가중치는 0에서 시작", flush=True)
+        elif _added == "smooth":
+            print("[plan_rl] 상대 차 예측 머리를 매끈한 길(지금 자세 + 속도·곡률)로 바꿈: encoder와 '있음' 갈래는 그대로, 위치 출력은 새로, "
+                  "plan이 읽는 예측 점 20칸은 0에서 시작", flush=True)
         enc = {k_[4:]: v_ for k_, v_ in ck0["critic"].items() if k_.startswith("enc.")}
         critic.enc.load_state_dict(enc)
         if args.init_critic:
@@ -1961,7 +2007,7 @@ def main(argv=None):
         sc_dec = sc_end = sc_end_hit = 0
         sc_end_kind = torch.zeros(NK, dtype=torch.long, device=dev); sc_hit_kind = torch.zeros(NK, dtype=torch.long, device=dev)
         AX = []                                                # --mem-aux: the boxes ahead at each decision
-        PRP, PRO, PROK, PRV = [], [], [], []                   # --pred-opp: our pose, the other car's xy, there, 'visible'
+        PRP, PRO, PROK, PRV, PRH = [], [], [], [], []           # --pred-opp: our pose, the other car's xy, there, 'visible', its yaw
         CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
         car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
         opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
@@ -2230,6 +2276,8 @@ def main(argv=None):
                     opp_pres += float(o_ok[ordm].float().mean())
                     if pred_on:
                         PRP.append(st_me[:, :3].clone()); PRO.append(o_xy.clone()); PROK.append(o_ok.clone())
+                        if pred_smooth:
+                            PRH.append(env.sim.state[others[:, 0], dyn.IYAW].float().clone())
                         PRV.append(o_ok & ((o_xy - st_me[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S))
                     if near_on:
                         c_car0 = env.sim.contact_counts[lid, 2].clone()
@@ -2551,6 +2599,13 @@ def main(argv=None):
                 ok_ = ((cb_[k_ - 1:T - 1] - before_) == 0) & OK_[k_:] & (rel_.norm(dim=-1) <= args.pred_range)
                 PT_[:T - k_, :, k_ - 1] = rel_; PM_[:T - k_, :, k_ - 1] = ok_
             bPT, bPM, bPVIS = PT_.reshape(T * Bl, PRED_N, 2), PM_.reshape(T * Bl, PRED_N), torch.stack(PRV).reshape(-1)
+            if pred_smooth:
+                # (11-25) --pred-smooth: the pose now -- where the other car is at the decision and its heading, in our frame
+                d0_ = O_ - P_[..., :2]
+                r0_ = torch.stack([d0_[..., 0] * c_ + d0_[..., 1] * s_, -d0_[..., 0] * s_ + d0_[..., 1] * c_], -1)
+                bPZ = torch.cat([r0_, (torch.stack(PRH) - P_[..., 2])[..., None]], -1).reshape(T * Bl, 3)
+                bPZM = (OK_ & (r0_.norm(dim=-1) <= args.pred_range)).reshape(-1)
+                del d0_, r0_
             del P_, O_, OK_, PT_, PM_, jmp_, brk_, cb_
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
@@ -2614,7 +2669,7 @@ def main(argv=None):
             pin_ = None
             if pred_on:
                 # (11-24) the head's prediction (its own weights carry the gradient, `pred_step`); the trunk reads it detached
-                aux_box["pred_q"] = actor.pred_q(bX[mb_], fflat_, hcat_)
+                aux_box["pred_q"], aux_box["pred_pose"] = actor.pred_q(bX[mb_], fflat_, hcat_, pose=True)
                 pin_ = actor.pred_feed(aux_box["pred_q"])
             fc = (actor.mem_trunk(fflat_, hcat_, pin_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
             if line_on:
@@ -2636,6 +2691,7 @@ def main(argv=None):
             return heads_on(fc, mb_)
 
         pe5, pe10, pauc, ploss = [], [], [], []                     # --pred-opp: errors at 0.5 / 1.0 s [m], 'visible' AUC, loss
+        pzz = []                                                    # its zig-zag against the realised paths [deg] per decision
 
         def pred_step(mb_):
             """(11-24) --pred-opp: one step of the prediction head's own optimizer on this minibatch -- Huber on the positions
@@ -2645,7 +2701,15 @@ def main(argv=None):
             m_p = bPM[mb_].float()
             lpos_ = (nn.functional.smooth_l1_loss(pts_, bPT[mb_] / PRED_SCALE, reduction="none").sum(-1) * m_p).sum() / m_p.sum().clamp_min(1.0)
             lvis_ = nn.functional.binary_cross_entropy_with_logits(q_[:, -1], bPVIS[mb_].float())
-            gs_ = torch.autograd.grad(lpos_ + lvis_, pred_params, allow_unused=True)
+            lpose_ = 0.0
+            if pred_smooth:
+                # (11-25) the pose now: where the integrated path starts (the points fix its shape; this its start, and the
+                # heading of a car standing still)
+                z_, m0_ = aux_box["pred_pose"], bPZM[mb_].float()
+                l0_ = nn.functional.smooth_l1_loss(z_[:, :2] / PRED_SCALE, bPZ[mb_, :2] / PRED_SCALE, reduction="none").sum(-1)
+                lh_ = 1.0 - torch.cos(z_[:, 2] - bPZ[mb_, 2])
+                lpose_ = ((PRED_W_POSE * l0_ + PRED_W_HEAD * lh_) * m0_).sum() / m0_.sum().clamp_min(1.0)
+            gs_ = torch.autograd.grad(lpos_ + lvis_ + lpose_, pred_params, allow_unused=True)
             for p_, g_ in zip(pred_params, gs_):
                 p_.grad = g_ if g_ is not None else torch.zeros_like(p_)
             dist_grads(pred_params)
@@ -2654,8 +2718,11 @@ def main(argv=None):
             for p_ in pred_params:
                 p_.grad = None
             with torch.no_grad():
-                ploss.append(float(lpos_ + lvis_))
+                ploss.append(float(lpos_ + lvis_ + lpose_))
                 err_ = (pts_ * PRED_SCALE - bPT[mb_]).norm(dim=-1)
+                full_ = bPVIS[mb_] & bPM[mb_].all(1)                 # 'visible' and the whole realised second known
+                if bool(full_.any()):
+                    pzz.append(pred_zigzag(pts_[full_] * PRED_SCALE, bPT[mb_][full_]))
                 for k_, lst_ in ((4, pe5), (9, pe10)):
                     ok_ = bPM[mb_][:, k_]
                     if bool(ok_.any()):
@@ -3079,6 +3146,9 @@ def main(argv=None):
             row.update(pred_err_05=(sum(pe5) / len(pe5)) if pe5 else None, pred_err_10=(sum(pe10) / len(pe10)) if pe10 else None,
                        pred_vis_auc=(sum(pauc) / len(pauc)) if pauc else None, pred_loss=(sum(ploss) / len(ploss)) if ploss else None,
                        pred_vis_share=float(bPVIS.float().mean()))
+            _zz = torch.cat(pzz) if pzz else None
+            row.update(pred_zigzag=float(_zz.mean()) if _zz is not None and _zz.numel() else None,
+                       pred_zigzag_p90=float(torch.quantile(_zz, 0.9)) if _zz is not None and _zz.numel() else None)
         if others is not None:
             row["opp_present_share"] = opp_pres / max(T, 1)        # decisions of the ordinary races with the other car there
         if near_on:
@@ -3183,7 +3253,9 @@ def main(argv=None):
               + (f"상대 차 예측: 0.5 s 뒤 오차 {(row['pred_err_05'] if row['pred_err_05'] is not None else float('nan')):.2f} m, 1.0 s 뒤 "
                  f"{(row['pred_err_10'] if row['pred_err_10'] is not None else float('nan')):.2f} m, 보이나 맞히기 AUC "
                  f"{(row['pred_vis_auc'] if row['pred_vis_auc'] is not None else float('nan')):.2f} (보이는 결정 "
-                 f"{row['pred_vis_share'] * 100:.0f} %) | " if pred_on else "")
+                 f"{row['pred_vis_share'] * 100:.0f} %), 꺾임 실제보다 "
+                 f"{(row['pred_zigzag'] if row['pred_zigzag'] is not None else float('nan')):+.1f}° (p90 "
+                 f"{(row['pred_zigzag_p90'] if row['pred_zigzag_p90'] is not None else float('nan')):.1f}°) | " if pred_on else "")
               + (f"복사본이 모는 상대 차 {row['self_opp_share'] * 100:.0f} % (update {row['self_opp_pool']}의 복사본) | " if drv.opp is not None else "")
               + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
                  f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
