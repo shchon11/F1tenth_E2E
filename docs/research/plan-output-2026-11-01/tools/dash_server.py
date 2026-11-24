@@ -26,7 +26,9 @@ FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts
           "noise_scale", "aux_auc",       # (11-19, the user: "잡음 크기는 사이트에 plot 안되나?"; + the box memory's side task)
           "car_fault_per_min", "near_miss_per_min", "pred_err_05", "pred_err_10",   # (11-24) the race phase (1v1)
           "plan_car_share", "plan_car_share_lt07", "plan_car_share_07_09", "plan_car_share_ge09",  # (11-25) --plan-car-cost
-          "pred_zigzag", "pred_zigzag_p90")   # (11-25) the other car's predicted path: zig-zag against the realised [deg]
+          "pred_zigzag", "pred_zigzag_p90",   # (11-25) the other car's predicted path: zig-zag against the realised [deg]
+          # (11-25) plans through the car-ahead's spot now that stay clear of its real future (plan_car_cost.moving_read)
+          "plan_now_clear_share", "plan_now_clear_share_lt07", "plan_now_clear_share_07_09", "plan_now_clear_share_ge09")
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()

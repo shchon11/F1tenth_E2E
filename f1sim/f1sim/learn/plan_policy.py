@@ -548,6 +548,18 @@ PRED_V0 = 4.0                             # [m/s] a fresh head's speed (the real
 PRED_W_POSE = 0.2                         # the loss on the pose now: Huber on (x0, y0) / PRED_SCALE, this x the points' mean
 PRED_W_HEAD = 0.05                        # and (1 - cos) of heading0 against the other car's yaw
 
+# (11-25) `pred_clear` (plan_rl --pred-clear, agreed with the user): the trunk also reads, for t_k = 0.1 k s (k = 1..10), the
+# clearance between where its PREVIOUS plan puts the car at t_k and where the head predicts the other car(s) at t_k -- the
+# plan-car cost's 3-disc geometry (`plan_car_cost.clearance`, its interface takes any number of predicted things), the
+# minimum over them, `PC_FAR` when nothing predicted is there (P(there) < PC_PMIN) or there is no previous plan (a start),
+# clipped to [PC_LO, PC_HI] m and / PC_SCALE. Why: the policy detoured around where the other car IS, decision after
+# decision (an endless chase), and the predicted path it was given as 20 raw coordinates moved its plan 0.5 cm for a 0.5 m
+# shift (race33b u875): "does my plan meet it" was never read out of them. Detached (computed from the head's output and the
+# previous plan, nothing flows back), its 10 trunk columns last and zero at the start -- a fork drives as its parent
+PC_N = PS.N_STEP
+PC_FAR, PC_LO, PC_HI, PC_SCALE = 3.0, -1.0, 3.0, 3.0     # [m]
+PC_PMIN = 0.5                                             # a predicted car counts from this P(there) on
+
 
 def pred_basis(n_b: int = PRED_NB, n: int = PRED_N) -> torch.Tensor:
     """(n_b, n): Legendre polynomials P0, P1, .. at the middle of each 0.1 s step, the second mapped to [-1, 1]"""
@@ -587,6 +599,9 @@ class OppPredictor(nn.Module):
         self.enc = ScanEncoder(beams)
         self.mlp = nn.Sequential(nn.Linear(256 + state_dim + memory, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh(),
                                  nn.Linear(hidden, PRED_KIN_OUT if self.smooth else PRED_OUT))
+        # (11-25) the smooth head's heading at each predicted point (n, PRED_N) [rad, our frame at the decision], from its last
+        # `forward` (detached; `pred_clear` places the predicted car's footprint with it). None for the old head
+        self.psi_out = None
         if self.smooth:
             if kin is None:
                 raise ValueError("pred_smooth needs the car's curvature limit: kin = (speeds (G,) [m/s], curvature (G,) [1/m])")
@@ -634,11 +649,18 @@ class OppPredictor(nn.Module):
         v, k = self.kin_vk(o)
         return unicycle(x0, y0, th0, v, k), torch.stack([x0, y0, th0], 1)
 
+    def kin_heading(self, o: torch.Tensor) -> torch.Tensor:
+        """the last layer's output (n, PRED_KIN_OUT) -> (n, PRED_N) the heading at the end of each step: heading0 + the turns so
+        far (`unicycle`'s)"""
+        v, k = self.kin_vk(o)
+        return o[:, 2].float()[:, None] * math.pi + torch.cumsum(v * k * PS.DT, 1)
+
     def forward(self, scans: torch.Tensor, state_n: torch.Tensor, h: torch.Tensor, pose: bool = False):
         """(n, PRED_OUT): the points / PRED_SCALE and the 'visible' logit; with `pose`, (that, the pose now (n, 3) or None)"""
         o = self.mlp(torch.cat([self.enc(scans), state_n.detach(), h.detach()], 1))
         if not self.smooth:
             return (o, None) if pose else o
+        self.psi_out = self.kin_heading(o.detach())
         pts, z = self.kin_path(o)
         q = torch.cat([pts.reshape(-1, 2 * PRED_N) / PRED_SCALE, o[:, -1:].float()], 1).to(o.dtype)
         return (q, z) if pose else q
@@ -647,6 +669,27 @@ class OppPredictor(nn.Module):
 def pred_points(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """a prediction (n, PRED_OUT) -> (points (n, PRED_N, 2) [m] in the car's frame at the decision, P(visible) (n,))"""
     return q[:, :2 * PRED_N].reshape(-1, PRED_N, 2) * PRED_SCALE, torch.sigmoid(q[:, -1])
+
+
+def pred_headings(pts: torch.Tensor, psi: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """(n, N, 2) predicted points -> (n, N) the predicted car's heading at each: `psi` when the head gives it (the smooth
+    head's integrated heading), else the direction from the point before (the first point: towards the second)"""
+    if psi is not None:
+        return psi.float()
+    seg = pts[:, 1:] - pts[:, :-1]
+    a = torch.atan2(seg[..., 1], seg[..., 0])
+    return torch.cat([a[:, :1], a], 1)
+
+
+def prev_plan_poses(rel: torch.Tensor, rel_psi: torch.Tensor, rel_v: torch.Tensor) -> torch.Tensor:
+    """--pred-clear: where the previous plan puts the car at t_k = 0.1 k s after this decision, k = 1..10, (n, 10, 3) x, y,
+    heading -- in the frame of the pose that plan said the car would be in now (its 0.1 s point; the frame `PlanObs2.rel` is
+    in, which the trunk reads as 'the car now'). The plan was drawn 0.1 s ago: its point j falls at t - 0.1 + 0.1 j, so its
+    points 2..10 are t_1..t_9 (`rel`, `rel_psi`). It ends at t_9: t_10 is its last point carried on 0.1 s straight along its
+    last heading at its last speed (`rel_v`'s last)"""
+    x9, h9, v9 = rel[:, -1], rel_psi[:, -1], rel_v[:, -1]
+    x10 = x9 + (v9 * PS.DT)[:, None] * torch.stack([torch.cos(h9), torch.sin(h9)], -1)
+    return torch.cat([torch.cat([rel, x10[:, None]], 1), torch.cat([rel_psi, h9[:, None]], 1)[..., None]], -1)
 
 
 def pred_zigzag(pts: torch.Tensor, real: torch.Tensor, min_seg: float = 0.05) -> torch.Tensor:
@@ -716,7 +759,12 @@ class Actor2(nn.Module):
     없냐"): the trunk also reads the box memory's own answer -- the read-out's first AUX_IN_SLOTS boxes as (P(present),
     position x P) -- through weights it cannot move (detached), so the answer keeps the side task's meaning. Why: the box
     memory told passed boxes apart at 98-100 % in training (0.87-0.94 on held-out layouts) while the trunk's weights on its
-    128 values were a tenth of the others' and re-hits swung 17 % <-> 44-63 % between checkpoints 25 updates apart."""
+    128 values were a tenth of the others' and re-hits swung 17 % <-> 44-63 % between checkpoints 25 updates apart.
+    `pred_clear` (11-25, with `pred_opp`; see PC_N): the trunk also reads PC_N clearances between the previous plan and the
+    predicted other car(s), after every other input, zero-weighted at the start. `pc_geom` = (car length, width, margin) [m]
+    (the plan-car cost's), kept in the checkpoint (`pc_geom` buffer). `forward` / `remember` then need `prev` = (the previous
+    plan's poses at t_1..t_10 (n, 10, 3), whether there is one (n,) bool) -- `PlanObs2.prev_poses()`; the values used are left
+    in `pc_out`."""
 
     GAP0 = 0.5                # the gap between the two plans' first-step turn at the start (the action before its tanh)
     AUX_IN_SLOTS, AUX_IN_KEYS = 3, 4     # `aux_in`: the read-out's boxes (present, dx/5, dy/5, distance/5 along the track)
@@ -725,7 +773,7 @@ class Actor2(nn.Module):
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
                  mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
                  pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = "",
-                 pred_opp: bool = False, pred_smooth: bool = False, pred_kin=None):
+                 pred_opp: bool = False, pred_smooth: bool = False, pred_kin=None, pred_clear: bool = False, pc_geom=None):
         super().__init__()
         self.branches = int(branches)
         # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
@@ -773,14 +821,24 @@ class Actor2(nn.Module):
         if self.pred_smooth and not self.pred_opp:
             raise ValueError("pred_smooth needs pred_opp")
         n_pr = PRED_IN if self.pred_opp else 0
-        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai + n_pr) if self.mem_front else 0), hidden), nn.Tanh(),
+        self.pred_clear = bool(pred_clear)
+        if self.pred_clear and not self.pred_opp:
+            raise ValueError("pred_clear needs pred_opp")
+        if self.pred_clear:
+            if pc_geom is None or len(pc_geom) != 3:
+                raise ValueError("pred_clear needs pc_geom = (car length, car width, margin) [m]")
+            self.pc_dims = tuple(float(x) for x in pc_geom)
+            self.register_buffer("pc_geom", torch.tensor(self.pc_dims, dtype=torch.float32))
+        n_pc = PC_N if self.pred_clear else 0
+        self.pc_out = None
+        self.trunk = nn.Sequential(nn.Linear(256 + sd + ((int(memory) + self.box_memory + n_ai + n_pr + n_pc) if self.mem_front else 0), hidden), nn.Tanh(),
                                    nn.Linear(hidden, hidden), nn.Tanh())
         self.pred = None
         self.pred_out = None
         if self.pred_opp:
             self.pred = OppPredictor(beams, sd, int(memory) + self.box_memory, hidden, smooth=self.pred_smooth, kin=pred_kin)
             with torch.no_grad():
-                self.trunk[0].weight[:, -n_pr:] = 0.0
+                self.trunk[0].weight[:, -(n_pr + n_pc):] = 0.0      # the prediction's columns (and the clearances' after them)
                 self.pred.enc.load_state_dict(self.enc.state_dict())
         self.pi = nn.Linear(hidden, self.branches * PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
@@ -880,15 +938,46 @@ class Actor2(nn.Module):
         p = torch.sigmoid(a[..., :1])
         return torch.cat([p, a[..., 1:] * p], -1).reshape(-1, k * n)
 
-    def mem_trunk(self, f: torch.Tensor, hs: torch.Tensor, pin: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def mem_trunk(self, f: torch.Tensor, hs: torch.Tensor, pin: Optional[torch.Tensor] = None,
+                  pc: Optional[torch.Tensor] = None) -> torch.Tensor:
         """`mem_front`: the trunk on the inputs and the memory's state (and its answer with `aux_in`; `pin`: the other car's
-        prediction as `pred_feed` gives it, with `pred_opp`)"""
+        prediction as `pred_feed` gives it, with `pred_opp`; `pc`: the PC_N clearances as `clear_in` gives them, with
+        `pred_clear`)"""
         x = [f, hs, self.aux_feed(hs)] if self.aux_in else [f, hs]
         if self.pred_opp:
             if pin is None:
                 raise ValueError("a pred_opp actor's trunk reads the prediction: pass pin (pred_feed(pred_q(...)))")
             x = x + [pin]
+        if self.pred_clear:
+            if pc is None:
+                raise ValueError("a pred_clear actor's trunk reads the plan clearances: pass pc (clear_in(...))")
+            x = x + [pc.to(f.dtype)]
         return self.trunk(torch.cat(x, 1))
+
+    @torch.no_grad()
+    def clear_in(self, q: torch.Tensor, prev, psi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`pred_clear`: the trunk's PC_N inputs (n, PC_N) from a prediction `q` (n, PRED_OUT) and `prev` = (the previous plan's
+        poses (n, PC_N, 3) at t_1..t_PC_N in the frame of the car now, (n,) bool there is one): at each t_k the smallest
+        clearance [m] between our car where the previous plan puts it and every predicted car that counts (P(there) >=
+        PC_PMIN; today the head's one car), PC_FAR without either, clipped, / PC_SCALE. Built on `plan_car_cost.clearance`'s
+        element interface: a head that predicts more cars (slots with their own P(there)) or obstacle points adds elements
+        there, the input stays PC_N numbers. `psi` (n, PRED_N): the predicted car's headings (default: the smooth head's own,
+        else from the points). Detached"""
+        from .plan_car_cost import car_cover, clearance
+        if prev is None:
+            raise ValueError("a pred_clear actor needs prev = (the previous plan's poses, there is one): PlanObs2.prev_poses()")
+        poses, ok = prev
+        pts, pv = pred_points(q.detach().float())
+        if psi is None:
+            psi = self.pred.psi_out if (self.pred is not None and self.pred.psi_out is not None
+                                        and self.pred.psi_out.shape[0] == q.shape[0]) else None
+        psi = pred_headings(pts, psi)
+        L, W, mg = self.pc_dims
+        elem = car_cover(torch, pts[:, None], psi[:, None], L, W, conf=pv[:, None])      # one car: 3 discs, P(there)
+        c = clearance(torch, poses[..., :2].float(), poses[..., 2].float(), *elem, L, W, mg, far=PC_FAR, lo=PC_LO, hi=PC_HI,
+                      w_min=PC_PMIN)
+        c = torch.where(ok[:, None], c, torch.full_like(c, PC_FAR))
+        return c / PC_SCALE
 
     def pred_q(self, scans: torch.Tensor, f: torch.Tensor, hs: torch.Tensor, pose: bool = False):
         """`pred_opp`: the raw prediction (n, PRED_OUT) from the scans, the features `f` (their normalised-state part) and
@@ -924,25 +1013,27 @@ class Actor2(nn.Module):
             hs.append(h)
         return torch.cat(hs, 0)
 
-    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor], scans: Optional[torch.Tensor] = None):
+    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor], scans: Optional[torch.Tensor] = None, prev=None):
         """one decision of the memory: (features with the memory added, the new state). A `pred_opp` actor also needs the
-        `scans` (its prediction, left in `pred_out`)"""
+        `scans` (its prediction, left in `pred_out`), a `pred_clear` one `prev` (the clearances, left in `pc_out`)"""
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
         h1 = self.mem_cell(f, h0)
         if self.mem_front:
-            pin = None
+            pin = pc = None
             if self.pred_opp:
                 if scans is None:
                     raise ValueError("a pred_opp actor's memory step needs the scans (its prediction reads them)")
                 self.pred_out = self.pred_q(scans, f, h1)
                 pin = self.pred_feed(self.pred_out)
-            return self.mem_trunk(f, h1, pin), h1
+            if self.pred_clear:
+                pc = self.pc_out = self.clear_in(self.pred_out, prev)
+            return self.mem_trunk(f, h1, pin, pc), h1
         return f + self.mem_out(h1), h1
 
-    def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None):
+    def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None, prev=None):
         f = self.features(scans, state)
         if self.memory:
-            f, self.h_out = self.remember(f, h, scans)
+            f, self.h_out = self.remember(f, h, scans, prev)
         return self.heads(f)
 
     def policy_parameters(self):
@@ -958,6 +1049,10 @@ class PlanObs2(PlanObs):
         dev = env.device
         self.rel = torch.zeros(Bl, PS.N_STEP - 1, 2, device=dev)     # last plan's points 2..10 in its 0.1 s pose's frame
         self.rel_v = torch.zeros(Bl, PS.N_STEP, device=dev)          # its speeds
+        # (11-25, --pred-clear; not trunk inputs) the last plan's heading at points 2..10 in the same frame, and whether there
+        # is a last plan (False from a start until the first plan is drawn)
+        self.rel_psi = torch.zeros(Bl, PS.N_STEP - 1, device=dev)
+        self.prev_ok = torch.zeros(Bl, dtype=torch.bool, device=dev)
         self.cmd_d = torch.zeros(Bl, device=dev)                     # its steering / speed 0.1 s in: what was commanded
         self.cmd_v = torch.zeros(Bl, device=dev)
         # a two-plan actor (`Actor2.branches`): which plan was chosen last, +1 / -1, 0 at a start (B_l,). None = no such
@@ -980,6 +1075,7 @@ class PlanObs2(PlanObs):
         if rows.numel() == 0:
             return
         self.rel[rows] = 0.0; self.rel_v[rows] = 0.0; self.cmd_d[rows] = 0.0; self.cmd_v[rows] = 0.0
+        self.rel_psi[rows] = 0.0; self.prev_ok[rows] = False
         if getattr(self, "mem_h", None) is not None:
             self.mem_h[rows] = 0.0                                   # a new episode remembers nothing
         if self.prev_branch is not None:
@@ -995,14 +1091,22 @@ class PlanObs2(PlanObs):
         dx = p["x"][:, idx] - x1[:, None]; dy = p["y"][:, idx] - y1[:, None]
         c, s_ = torch.cos(h1)[:, None], torch.sin(h1)[:, None]
         rel = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c], -1)
+        rpsi = p["psi"][:, idx] - h1[:, None]
         cd, cv = p["delta"][:, i1], p["v"][:, i1]
         if rows is None:
             self.rel, self.rel_v, self.cmd_d, self.cmd_v = rel, p["pv"].clone(), cd.clone(), cv.clone()   # its own (see `set_plan`)
+            self.rel_psi = rpsi.clone(); self.prev_ok = torch.ones_like(self.prev_ok)
         else:
+            self.rel_psi = torch.where(rows[:, None], rpsi, self.rel_psi)
+            self.prev_ok = self.prev_ok | rows
             self.rel = torch.where(rows[:, None, None], rel, self.rel)
             self.rel_v = torch.where(rows[:, None], p["pv"], self.rel_v)
             self.cmd_d = torch.where(rows, cd, self.cmd_d)
             self.cmd_v = torch.where(rows, cv, self.cmd_v)
+
+    def prev_poses(self):
+        """--pred-clear: (the last plan's poses at t_1..t_10 after this decision (B_l, 10, 3), there is a last plan (B_l,))"""
+        return prev_plan_poses(self.rel, self.rel_psi, self.rel_v), self.prev_ok
 
     def state(self) -> torch.Tensor:
         r = self.env.last_result
@@ -1050,7 +1154,9 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    line_shifts=str(ck["args"].get("line_shifts", "") or ""),
                    pred_opp=any(k.startswith("pred.") for k in ck["actor"]),
                    pred_smooth="pred.kin_k" in ck["actor"],
-                   pred_kin=((ck["actor"]["pred.kin_v"], ck["actor"]["pred.kin_k"]) if "pred.kin_k" in ck["actor"] else None)
+                   pred_kin=((ck["actor"]["pred.kin_v"], ck["actor"]["pred.kin_k"]) if "pred.kin_k" in ck["actor"] else None),
+                   pred_clear="pc_geom" in ck["actor"],
+                   pc_geom=(ck["actor"]["pc_geom"].tolist() if "pc_geom" in ck["actor"] else None)
                    ).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
@@ -1074,7 +1180,10 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, 
     pace = getattr(actor, "pace_levels", 0)
     if pace and getattr(obs, "pace_idx", None) is None:
         obs.pace_on(pace, actor.pace_hold)
-    mean, log_std, v_hat = actor(obs.scans, obs.state(), h)
+    if getattr(actor, "pred_clear", False):                 # (11-25) the clearances read the last plan
+        mean, log_std, v_hat = actor(obs.scans, obs.state(), h, prev=obs.prev_poses())
+    else:
+        mean, log_std, v_hat = actor(obs.scans, obs.state(), h)
     if getattr(actor, "memory", 0):
         obs.mem_h = actor.h_out.detach()
     if pace:

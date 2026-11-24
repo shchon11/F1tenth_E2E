@@ -10,6 +10,9 @@
     벽에 안 가린 시선) 트랙을 따라 앞에 있는 결정 중, plan 점이 같은 시각 상대 차의 실제 자리와 겹치고(차 크기 원 3개, 0.05 m 여유)
     env 규칙으로 우리 책임인 몫. 기록에 없는 것은 근사: LiDAR 빔 대신 스캐너에서 상대 차 중심까지의 시선(벽 칸 없음, +-135도),
     plan 방향은 점과 점 사이 방향, plan 점의 '트랙을 따라' 순서는 plan 방향으로 잰 앞뒤
+  - 지금 자리 지나되 실제와 안 겹친 plan(11-25, `plan_car_cost.moving_read`, plan_rl 로그와 같은 계산): 상대 차 중심이 우리 차 앞
+    0.5-4 m, 옆 1 m 안인 결정 중, plan 점(차 크기 원 3개, 0.05 m 여유)이 상대 차의 '결정 때 자리'와는 겹치고 같은 시각 '실제 자리'와는
+    안 겹치는 몫 -- 움직이는 차 뒤에서 바라는 plan(지금 자리를 피하면 상자처럼 본 것). plan 10점 모두 실제와 비교되는 결정만
 모든 평균·비율에 세션 다시 뽑기 95 % 구간.
 인자: 기록npz"""
 import os, sys
@@ -159,6 +162,7 @@ def plan_car(z, T, B):
     lapT = z["lapL"][tid[:T]].astype(float)
     orem = z["orem"].astype(float)
     n_a, n_h = np.zeros(B, int), np.zeros(B, int)
+    m_a, m_w = np.zeros(B, int), np.zeros(B, int)
     for a in range(0, B, 16):                                                  # 16 sessions at a time: ~80 MB, not 700
         c = slice(a, min(B, a + 16))
         o = PCC.plan_car_cost(np, me_xy[:, c], me_psi[:, c], me_v[:, c], me_rem[:, c], op[:T + 1, c, :2], op[:T + 1, c, 2],
@@ -166,15 +170,21 @@ def plan_car(z, T, B):
                               list(range(1, K + 1)), PCC.weights(K, 0.3), float(z["car"][0]), float(z["car"][1]))
         ahead = know[:, c] & (o["gap0"] > 0.0)
         n_a[c], n_h[c] = ahead.sum(0), (o["charged"] & ahead).sum(0)
-    return n_a, n_h
+        # (11-25) the moving-car read: a car 0.5-4 m ahead, the plan through its spot now and clear of its real future
+        mr = PCC.moving_read(np, me_xy[:, c], me_psi[:, c], op[:T + 1, c, :2], op[:T + 1, c, 2], on[:T + 1, c], brk[:, c],
+                             list(range(1, K + 1)), float(z["car"][0]), float(z["car"][1]))
+        m_a[c], m_w[c] = mr["ahead"].sum(0), mr["want"].sum(0)
+    return n_a, n_h, m_a, m_w
 
 
-pc_n, pc_hit = plan_car(z, T, B)
+pc_n, pc_hit, mv_n, mv_want = plan_car(z, T, B)
 
 
-def pooled(m):
-    """the overlap share over the sessions `m` (pooled decisions) with a session-bootstrap 95 % interval"""
-    n_, h_ = pc_n[m].astype(float), pc_hit[m].astype(float)
+def pooled(m, n_all=None, h_all=None):
+    """the overlap share over the sessions `m` (pooled decisions) with a session-bootstrap 95 % interval (default: the plan-car
+    overlap; `n_all` / `h_all` per session: another share)"""
+    n_all = pc_n if n_all is None else n_all; h_all = pc_hit if h_all is None else h_all
+    n_, h_ = n_all[m].astype(float), h_all[m].astype(float)
     if n_.sum() == 0:
         return "  -"
     idx = RNG.integers(0, len(n_), (2000, len(n_)))
@@ -186,7 +196,7 @@ print(f"== exam4 경주 시험 · {dict(map='MAP', track='시간 추종기', ide
       f"{os.path.basename(os.path.dirname(str(z['ref'])))}/{os.path.basename(str(z['ref']))}의 복사본 "
       f"(세션 {B}개 x {secs:.0f} s, 상자는 {rm_t:g} s에 치움, 시드 {int(z['seed'])}, 상대 차 다시 출발 {int(ors.sum())}번) ==")
 hdr = (f"{'조건':<22} | {'세션':>3} | {'바퀴 (상대)':>13} | {'앞지름':>15} | {'앞지름 당함':>6} | {'우리 책임 차 접촉':>14} | "
-       f"{'세게 닿음 벽 · 상자 · 차':>20} | {'멈춘 세션':>14} | {'앞차 plan 겹침':>18}")
+       f"{'세게 닿음 벽 · 상자 · 차':>20} | {'멈춘 세션':>14} | {'앞차 plan 겹침':>18} | {'지금 자리 지나되 실제와 안 겹친 plan':>18}")
 
 
 def line(label, m):
@@ -195,7 +205,7 @@ def line(label, m):
         return
     print(f"{label:<22} | {n:>3} | {laps[m].mean():5.2f} ({olaps[m].mean():4.2f}) | {mean(made[m]):>15} | {lost[m].mean():6.2f} | "
           f"{mean(fault[m]):>14} | {hard[m, 0].mean():5.2f} · {hard[m, 1].mean():4.2f} · {hard[m, 2].mean():4.2f} | {pct(stalls[m] > 0):>14} | "
-          f"{pooled(m):>18}")
+          f"{pooled(m):>18} | {pooled(m, mv_n, mv_want):>18}")
 
 
 START = {0: "반 바퀴", 1: "5 m 뒤"}
@@ -219,8 +229,11 @@ for k, v in START.items():
 print("[앞차 plan 겹침 · 상대 페이스 구간별]")
 for lab_, m_ in (("0.7배 미만", c_pace < 0.7), ("0.7-0.9배", (c_pace >= 0.7) & (c_pace < 0.9)), ("0.9배 이상 · 제 페이스", c_pace >= 0.9)):
     if m_.any():
-        print(f"{lab_:<22} | 앞에 보이는 결정 {int(pc_n[m_].sum()):>6} | 겹쳐서 우리 책임 {int(pc_hit[m_].sum()):>5} | {pooled(m_)}")
+        print(f"{lab_:<22} | 앞에 보이는 결정 {int(pc_n[m_].sum()):>6} | 겹쳐서 우리 책임 {int(pc_hit[m_].sum()):>5} | {pooled(m_)} | "
+              f"0.5-4 m 앞 결정 {int(mv_n[m_].sum()):>6} | 지금 자리 지나되 실제와 안 겹침 {int(mv_want[m_].sum()):>5} | {pooled(m_, mv_n, mv_want)}")
 print("앞차 plan 겹침 = 상대 차가 10 m 안에 보이고(1 s 안에 벽에 안 가린 시선) 트랙을 따라 앞에 있는 결정 중, plan 점이 같은 시각 상대 차의 "
       "실제 자리와 겹치고(차 크기 원 3개, 0.05 m 여유) env 규칙으로 우리 책임인 몫 (plan_rl --plan-car-cost와 같은 계산)")
+print("지금 자리 지나되 실제와 안 겹친 plan = 상대 차가 0.5-4 m 앞(옆 1 m 안)인 결정 중, plan이 상대 차의 결정 때 자리와는 겹치고 같은 시각 "
+      "실제 자리와는 안 겹치는 몫 (plan_rl 로그와 같은 계산)")
 print(f"멈춤 = {STALL_S:g} s 동안 트랙을 따라 {STUCK_M:g} m도 못 간 적 있는 세션 (그렇게 보낸 시간: 평균 {stuck_s.mean():.1f} s/세션, 가장 긴 것 "
       f"{(np.where(longest > 0, longest + n_st - 1, 0) * dt).max():.1f} s)")

@@ -433,7 +433,9 @@ PRED = PRED_ORACLE or PRED_PROBE
 if PRED:
     assert RACE4 and so is not None and getattr(actor, "pred_opp", False), "PRED_ORACLE / PRED_PROBE: race4 and a pred_opp checkpoint"
     assert getattr(actor, "branches", 1) == 1 and not getattr(actor, "pace_levels", 0) and not ROLL and not SLIP
-    from f1sim.learn.plan_policy import PRED_N, PRED_SCALE, pred_points
+    from f1sim.learn.plan_policy import PRED_N, PRED_SCALE, pred_points, pred_headings, prev_plan_poses
+    PC_ON = bool(getattr(actor, "pred_clear", False))       # (11-25) --pred-clear: the clearances follow the probe / oracle too
+    PC_PREV = {}
     from f1sim.learn.plan_reward import SEEN_S
     PRED_RANGE = float(ck["args"].get("pred_range") or 10.0)
     _orow = torch.full((env.B,), -1, dtype=torch.long, device=dev)
@@ -472,14 +474,21 @@ if PRED_PROBE:
     PCOLS = ("mean_disp", "disp_05", "disp_10", "dv_abs", "dy_10", "dx_10", "dv_mean")
     PRD.update(probe=[], base_err=[])
 
-    def plan_from(scans: torch.Tensor, s_in: torch.Tensor, h_in: torch.Tensor, cmd_d: torch.Tensor, pin_of=None):
+    def plan_from(scans: torch.Tensor, s_in: torch.Tensor, h_in: torch.Tensor, cmd_d: torch.Tensor, pin_of=None, q_of=None):
         """one forward pass of the actor as `plan_v2` runs it (mean plan), touching neither `obs` nor the driving state;
-        `pin_of(q)` replaces what the trunk reads of the prediction q"""
+        `pin_of(q)` replaces what the trunk reads of the prediction q. (11-25) a --pred-clear policy: its clearances from the
+        prediction as perturbed (`q_of(q)`, the raw prediction) and the last plan as the (perturbed) state has it"""
         f_ = actor.features(scans, s_in)
         h1 = actor.mem_cell(f_, h_in)
         q_ = actor.pred_q(scans, f_, h1)
         pin = actor.pred_feed(q_) if pin_of is None else pin_of(q_)
-        m_, _, vh = actor.heads(actor.mem_trunk(f_, h1, pin))
+        pc_ = None
+        if PC_ON:
+            i0, i1 = 8, 8 + 2 * (PS.N_STEP - 1)                 # STATE_DIM2: the last plan's points 2..10, then its speeds
+            prev_ = (prev_plan_poses(s_in[:, i0:i1].reshape(-1, PS.N_STEP - 1, 2), PC_PREV["psi"], s_in[:, i1:i1 + PS.N_STEP]),
+                     PC_PREV["ok"])
+            pc_ = actor.clear_in(q_ if q_of is None else q_of(q_), prev_)
+        m_, _, vh = actor.heads(actor.mem_trunk(f_, h1, pin, pc_))
         return PS.roll(torch.tanh(m_), vh.clamp(-PS.V_REV, PS.V_FWD), cmd_d, lim), q_
 
     def probe_all(scans, s_in, h_in, cmd_d, p_drv) -> torch.Tensor:
@@ -490,10 +499,12 @@ if PRED_PROBE:
         for _nm, kind, val in PROBES:
             if kind == "shift":
                 d_ = torch.tensor(val, device=dev) / PRED_SCALE
-                pin_of = lambda q, d_=d_: type(actor).pred_feed(torch.cat([(q[:, :2 * PRED_N].view(-1, PRED_N, 2) + d_).reshape(q.shape[0], -1), q[:, -1:]], 1))
-                pk, _ = plan_from(scans, s_in, h_in, cmd_d, pin_of)
+                q_of = lambda q, d_=d_: torch.cat([(q[:, :2 * PRED_N].view(-1, PRED_N, 2) + d_).reshape(q.shape[0], -1), q[:, -1:]], 1)
+                pin_of = lambda q, q_of=q_of: type(actor).pred_feed(q_of(q))
+                pk, _ = plan_from(scans, s_in, h_in, cmd_d, pin_of, q_of)
             elif kind == "gone":
-                pk, _ = plan_from(scans, s_in, h_in, cmd_d, lambda q: torch.zeros(q.shape[0], 2 * PRED_N + 1, device=dev))
+                pk, _ = plan_from(scans, s_in, h_in, cmd_d, lambda q: torch.zeros(q.shape[0], 2 * PRED_N + 1, device=dev),
+                                  lambda q: torch.cat([q[:, :-1], torch.full_like(q[:, -1:], -30.0)], 1))
             else:
                 ix_, dv_ = val
                 s2 = s_in.clone(); s2[:, ix_] = s2[:, ix_] + dv_
@@ -689,8 +700,14 @@ for kd in range(T):
         PRD["orc"].append(_orc.float().cpu())
         _pin = feed_of(_orc, _there.float())
         actor.pred_feed = lambda q_, _p=_pin: _p.to(q_.dtype)    # the trunk reads the oracle (the head still runs: pred_out)
+        if PC_ON:                                               # (11-25) and its clearances are measured to the oracle's path
+            _qo = torch.cat([(_orc / PRED_SCALE).reshape(Bl, -1), (_there.float() * 60.0 - 30.0)[:, None]], 1)
+            actor.clear_in = (lambda q_, prev_, psi=None, _q=_qo, _h=pred_headings(_orc.float()):
+                              type(actor).clear_in(actor, _q, prev_, psi=_h))
     if PRED_PROBE:
         _scans0, _s0 = obs.scans.clone(), obs.state().clone()
+        if PC_ON:
+            PC_PREV.update(psi=obs.rel_psi.clone(), ok=obs.prev_ok.clone())
         _h0 = (obs.mem_h.clone() if getattr(obs, "mem_h", None) is not None
                else torch.zeros(Bl, actor.memory, device=dev))
     u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)

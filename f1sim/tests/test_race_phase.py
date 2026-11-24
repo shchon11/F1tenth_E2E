@@ -93,6 +93,7 @@ class _Obs:
         self.rel = torch.zeros(n, PS.N_STEP - 1, 2); self.rel_v = torch.zeros(n, PS.N_STEP)
         self.cmd_d = torch.zeros(n); self.cmd_v = torch.zeros(n)
         self.plan_xy = torch.zeros(n, PS.N_STEP, 2); self.plan_v = torch.zeros(n, PS.N_STEP)
+        self.rel_psi = torch.zeros(n, PS.N_STEP - 1); self.prev_ok = torch.zeros(n, dtype=torch.bool)   # (11-25, --pred-clear)
         self.mem_h = None
         self.reset_rows(torch.arange(n))
 
@@ -101,7 +102,7 @@ class _Obs:
 
     def reset_rows(self, rows):
         self.scans[rows] = self._scan()[rows][:, None, :].expand(-1, N_SCANS, -1)
-        self.rel[rows] = 0.0; self.cmd_d[rows] = 0.0
+        self.rel[rows] = 0.0; self.cmd_d[rows] = 0.0; self.rel_psi[rows] = 0.0; self.prev_ok[rows] = False
         if self.mem_h is not None:
             self.mem_h[rows] = 0.0
 
@@ -113,6 +114,7 @@ class _Obs:
 
     def set_plan2(self, p):
         self.cmd_d = p["delta"][:, PS.SUB]; self.cmd_v = p["v"][:, PS.SUB]
+        self.rel_psi = p["psi"][:, 2 * PS.SUB::PS.SUB] - p["psi"][:, PS.SUB:PS.SUB + 1]; self.prev_ok = torch.ones_like(self.prev_ok)
 
 
 def _env():

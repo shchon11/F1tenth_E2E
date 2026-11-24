@@ -206,6 +206,7 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
       <div class="trio"><div><h4>0.7배 미만</h4><div class="cbox"><canvas id="c_pcar1"></canvas></div></div>
         <div><h4>0.7-0.9배</h4><div class="cbox"><canvas id="c_pcar2"></canvas></div></div>
         <div><h4>0.9배 이상</h4><div class="cbox"><canvas id="c_pcar3"></canvas></div></div></div></div>
+    <div class="card hide" data-opt="plan_now_clear_share"><h3>앞차 지금 자리 지나되 실제와 안 겹친 plan <span class="sub">%</span></h3><div class="cbox"><canvas id="c_pnow"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
     <div class="card hide" data-opt="pred_zigzag"><h3>상대 예측 꺾임 <span class="sub">°</span></h3><div class="cbox"><canvas id="c_pzz"></canvas></div></div>
@@ -461,6 +462,12 @@ async function refresh() {
     for (const [id, k] of [["c_pcar1", "plan_car_share_lt07"], ["c_pcar2", "plan_car_share_07_09"], ["c_pcar3", "plan_car_share_ge09"]]) {
       if (has) chart(id, two((r) => r[k] == null ? null : 100 * r[k])); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
     }
+  }
+  {   // (11-25) plans through the car-ahead's spot now that stay clear of its real future
+    const has = own.some((r) => r.plan_now_clear_share != null) || rrOwn.some((r) => r.plan_now_clear_share != null);
+    document.querySelector('[data-opt="plan_now_clear_share"]').classList.toggle("hide", !has);
+    if (has) chart("c_pnow", two((r) => r.plan_now_clear_share == null ? null : 100 * r.plan_now_clear_share));
+    else if (charts.c_pnow) { charts.c_pnow.destroy(); delete charts.c_pnow; }
   }
   chart("c_phit", two((r) => r.plan_hit_share == null ? null : 100 * r.plan_hit_share));
   chart("c_t05", two((r) => r.tail_next_05 == null ? null : 100 * r.tail_next_05));

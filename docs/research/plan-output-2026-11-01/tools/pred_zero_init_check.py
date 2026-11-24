@@ -3,10 +3,13 @@
 fork를 만드는 길(plan_rl.init_actor: trunk 첫 층에 예측 입력 열을 0으로 붙이고, 예측 머리의 스캔 encoder는 policy 것을 복사) 그대로
 부모 checkpoint에서 fork actor를 만들고, 경주 세계(상대 차 = 복사본, 배율 여러 가지 -> 예측 값이 실제로 움직이는 상황)에서 부모가 모는
 대로 달리며 결정마다 같은 입력(스캔 3장, 상태, 기억)을 두 actor에 넣어 출력(plan 평균 20개, 표준편차, 속도 짐작, 새 기억 상태)을 비교.
-인자: checkpoint [경주 수 8] [결정 수 60] [장치 cuda] [smooth]
+인자: checkpoint [경주 수 8] [결정 수 60] [장치 cuda] [smooth | clear]
 smooth (11-25, plan_rl --pred-smooth): 부모가 옛 예측 머리를 가진 checkpoint일 때, 매끈한 머리 fork(encoder·'있음' 갈래 그대로, 위치 출력
   새로, trunk가 예측 점을 읽는 20칸 0)를 같은 길로 만들어 비교. 부모의 plan이 자기 예측 점을 읽었다면(0이 아닌 가중치) fork는 그만큼
   다르게 몲 -> 그 차이를 plan 10점 거리(cm)로 재고, '점 20칸만 0으로 한 부모'와 fork가 같은지(부동소수 반올림까지)도 따로 잼.
+clear (11-25, plan_rl --pred-clear): 부모(예측 머리 있는 checkpoint)에 plan-예측 간격 입력 10칸(trunk 끝, 0에서 시작)을 붙인 fork를
+  plan_rl.init_actor로 만들어 같은 입력에 비교 -- 간격 값이 실제로 움직이는 동안(상대 차가 예측되는 결정) 출력이 부동소수 반올림까지
+  같은지, 그리고 간격 입력의 분포(1 s 안 가장 좁은 값, '멀리' 3 m 아닌 결정 몫)를 찍음.
 """
 import os, sys, json
 os.environ["F1SIM_NO_STAGGER"] = "1"
@@ -19,8 +22,9 @@ G = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 N = int(sys.argv[3]) if len(sys.argv) > 3 else 60
 dev = torch.device(sys.argv[4] if len(sys.argv) > 4 else "cuda")
 SMOOTH = len(sys.argv) > 5 and sys.argv[5] == "smooth"
+CLEAR = len(sys.argv) > 5 and sys.argv[5] == "clear"
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
-from f1sim.learn.plan_policy import lidar_mount_of, load_actor2, Actor2, PlanObs2, plan_world, PT_IDX, PRED_N
+from f1sim.learn.plan_policy import lidar_mount_of, load_actor2, Actor2, PlanObs2, plan_world, PT_IDX, PRED_N, PC_SCALE, PC_FAR
 os.environ["F1SIM_LIDAR_MOUNT_X"] = str(lidar_mount_of(ck))
 os.environ["F1SIM_PLAN_LAT_MARGIN"] = str((ck.get("args") or {}).get("plan_lat_margin", 0.95))
 from f1sim.learn import plan_rl as PR
@@ -36,11 +40,16 @@ if SMOOTH:
     assert getattr(base, "pred_opp", False) and not getattr(base, "pred_smooth", False), "smooth: a checkpoint with the OLD head"
     _lk = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev, margin=1.0)
     kw = dict(pred_smooth=True, pred_kin=(_lk.v_grid, _lk.k_tyre))     # as plan_rl --pred-smooth builds it
+if CLEAR:
+    assert getattr(base, "pred_opp", False) and not getattr(base, "pred_clear", False), "clear: a checkpoint with the head, no clearances"
+    kw = dict(pred_clear=True, pc_geom=(float(env.cfg.vehicle.length), float(env.cfg.vehicle.width), float(ca.get("plan_car_margin", 0.05))))
+    if getattr(base, "pred_smooth", False):
+        kw.update(pred_smooth=True, pred_kin=(base.pred.kin_v, base.pred.kin_k))
 fork = Actor2(int(ck["beams"]), std0=float(ca.get("std0", 0.6)), memory=int(ca.get("memory", 0)), mem_front=bool(ca.get("mem_front")),
               mem_value="v_mem.weight" in ck["actor"], pred_opp=True, **kw).to(dev)
 added = PR.init_actor(fork, ck["actor"])
 fork.eval()
-assert added == ("smooth" if SMOOTH else "new") and fork.pred is not None, added
+assert added == ("smooth" if SMOOTH else "" if CLEAR else "new") and fork.pred is not None, added
 ref = None
 if SMOOTH:
     ref = load_actor2(ck, dev)
@@ -55,11 +64,14 @@ hb = torch.zeros(lid.numel(), base.memory, device=dev); hf = hb.clone(); hr = hb
 dm = dls = dv = dh = 0.0
 rm = rv = rp = 0.0
 pv_rng, disp, there = [], [], []
+pcs = []                                                        # clear: the fork's clearance inputs [m], (Bl, 10) a decision
 ii = PT_IDX.to(dev)
 for t in range(N):
     sc, s = obs.scans.clone(), obs.state()
     mb, lsb, vb = base(sc, s, hb); hb1 = base.h_out; qb = base.pred_out
-    mf, lsf, vf = fork(sc, s, hf); hf1 = fork.h_out
+    mf, lsf, vf = (fork(sc, s, hf, prev=obs.prev_poses()) if CLEAR else fork(sc, s, hf)); hf1 = fork.h_out
+    if CLEAR:
+        pcs.append(fork.pc_out.float() * PC_SCALE)
     dm = max(dm, float((mb - mf).abs().max())); dls = max(dls, float((lsb - lsf).abs().max()))
     dv = max(dv, float((vb - vf).abs().max())); dh = max(dh, float((hb1 - hf1).abs().max()))
     pv_rng.append(torch.sigmoid(fork.pred_out[:, -1]))
@@ -87,12 +99,21 @@ for t in range(N):
     if bool(rs.any()):
         r_ = torch.nonzero(rs)[:, 0]; obs.reset_rows(r_); hb[r_] = 0.0; hf[r_] = 0.0; hr[r_] = 0.0
 pv = torch.stack(pv_rng)
-kind = "매끈한 예측 머리로 바꿈" if SMOOTH else "예측 머리 붙임"
+kind = "매끈한 예측 머리로 바꿈" if SMOOTH else "plan-예측 간격 입력 10칸 붙임" if CLEAR else "예측 머리 붙임"
 print(f"[예측 머리 0 초기화 확인] {os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)} -> fork ({kind}), "
       f"경주 {G}개 x {N} 결정, 상대 차 = 복사본(배율 0.6-0.95 / 제 페이스)")
 print(f"  부모와 fork의 최대 차이: plan 평균 {dm:.3g} | 표준편차 {dls:.3g} | 속도 짐작 {dv:.3g} m/s | 새 기억 상태 {dh:.3g}")
 print(f"  그동안 fork 예측 머리의 '보임' 확률: 최소 {float(pv.min()):.3f} 최대 {float(pv.max()):.3f}")
 out = {"mean": dm, "log_std": dls, "v_hat": dv, "mem": dh, "pvis_min": float(pv.min()), "pvis_max": float(pv.max())}
+if CLEAR:
+    PCs = torch.stack(pcs)                                      # (N, Bl, 10) [m]
+    mn = PCs.amin(-1)
+    near = mn < PC_FAR - 1e-4
+    q_ = lambda x, f: float(torch.quantile(x.float(), f)) if x.numel() else float("nan")
+    print(f"  간격 입력: '멀리'(3 m) 아닌 결정 {float(near.float().mean()) * 100:.1f} % | 그때 1 s 안 가장 좁은 값 중앙 {q_(mn[near], 0.5):.2f} m · "
+          f"p10 {q_(mn[near], 0.1):.2f} m · 최소 {q_(mn[near], 0.0):.2f} m | 겹침(< 0) 결정 {float((mn < 0).float().mean()) * 100:.1f} %")
+    out.update(pc_near_share=float(near.float().mean()), pc_min_p50=q_(mn[near], 0.5), pc_min_p10=q_(mn[near], 0.1),
+               pc_overlap_share=float((mn < 0).float().mean()))
 if SMOOTH:
     D = torch.stack(disp)                                       # (N, Bl, 10) [m]
     TH = torch.stack(there)
