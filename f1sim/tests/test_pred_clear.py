@@ -346,6 +346,50 @@ def test_the_update_reads_exactly_the_rollouts_clearances():
     assert not torch.equal(again, bPCL)
 
 
+def test_the_update_reads_the_rollouts_prediction_inputs_too():
+    """(11-25) the trunk's 21 prediction inputs (`pred_feed` of the head's output) are stored at the rollout as well: after the
+    head's own optimizer moves it, the update (plan_rl's `actor_on`: the memory replayed, the head re-run for its own loss)
+    still feeds the trunk what the rollout did, so the policy's log-probabilities at the start of the update are the
+    rollout's; the prediction made again would not be"""
+    a = _actor(seed=4)
+    with torch.no_grad():
+        for p in a.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+        a.trunk[0].weight[:, -(PRED_IN + PC_N):].normal_(0.0, 0.3)     # the plan reads the prediction and the clearances
+    T, n = 5, 4
+    h = torch.zeros(n, MEM)
+    X, S, PIN, PCL, MEAN = [], [], [], [], []
+    for t in range(T):                                                    # the rollout, as plan_rl stores it
+        sc, st, prev = _inputs(n, 40 + t)
+        with torch.no_grad():
+            m, _, _ = a(sc, st, h, prev=prev)
+        h = a.h_out
+        X.append(sc); S.append(st); MEAN.append(m)
+        PIN.append(a.pred_feed(a.pred_out).clone()); PCL.append(a.pc_out.clone())
+    bX, bS, bPIN, bPCL = torch.cat(X), torch.cat(S), torch.cat(PIN), torch.cat(PCL)
+    assert bPIN.shape == (T * n, PRED_IN)
+
+    def update(stored):
+        f = a.features(bX, bS).view(T, n, -1)
+        hh, hs = torch.zeros(n, MEM), []
+        for i in range(T):
+            hh = a.mem_cell(f[i], hh); hs.append(hh)
+        hcat, fflat = torch.cat(hs, 0), f.reshape(T * n, -1)
+        q = a.pred_q(bX, fflat, hcat)                                     # (the head's own loss still reads this)
+        pin = bPIN if stored else a.pred_feed(q)
+        return a.heads(a.mem_trunk(fflat, hcat, pin, bPCL))[0], a.pred_feed(q)
+    with torch.no_grad():
+        m0, rec0 = update(True)
+        assert torch.allclose(m0, torch.cat(MEAN), atol=1e-5) and torch.allclose(rec0, bPIN, atol=1e-5)
+        for p in a.pred.parameters():                                     # a step of the head's own optimizer
+            p.add_(0.05 * torch.randn_like(p))
+        m1, rec1 = update(True)
+        m2, _ = update(False)
+    assert torch.allclose(m1, torch.cat(MEAN), atol=1e-5)                # stored: the rollout's input, the rollout's plan
+    assert float((rec1 - bPIN).abs().mean()) > 1e-3                      # the prediction made again has drifted
+    assert float((m2 - torch.cat(MEAN)).abs().max()) > 1e-4              # and would have moved the policy's output
+
+
 # ------------------------------------------------------------------------------------------------ the moving-car read
 @pytest.mark.parametrize("xp", [np, torch])
 def test_moving_read(xp):

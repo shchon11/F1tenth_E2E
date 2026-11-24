@@ -2049,6 +2049,7 @@ def main(argv=None):
         AX = []                                                # --mem-aux: the boxes ahead at each decision
         PRP, PRO, PROK, PRV, PRH = [], [], [], [], []           # --pred-opp: our pose, the other car's xy, there, 'visible', its yaw
         PCL = []                                               # --pred-clear: the trunk's clearance inputs, as the rollout read them
+        PIN = []                                               # --pred-opp: the trunk's prediction inputs (pred_feed), as read
         CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
         car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
         opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
@@ -2159,6 +2160,8 @@ def main(argv=None):
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                     if pc_on:
                         PCL.append(actor.pc_out.detach().clone())  # the update reads exactly these
+                    if pred_on:
+                        PIN.append(actor.pred_feed(actor.pred_out).clone())   # (11-25) and these
                 elif v2:
                     mean, log_std, v_hat = actor(sc, s)
                 else:
@@ -2683,6 +2686,11 @@ def main(argv=None):
             del P_, O_, OK_, PT_, PM_, jmp_, brk_, cb_
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
         bPCL = torch.cat(PCL) if pc_on else None               # (T Bl, PC_N): the trunk's clearance inputs as driven
+        # (11-25) (T Bl, PRED_IN): the prediction as the trunk read it at the rollout. Until 11-25 the update fed the trunk the
+        # head's prediction made again -- by a head its own optimizer moves every minibatch (`pred_step`), so the policy's
+        # input drifted from the one its actions were drawn with
+        bPIN = torch.cat(PIN) if pred_on else None
+        drift_box = {"on": False}                              # the epochs: how far a recomputed prediction input would be
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
         bFM = FM_.reshape(-1)                                  # the policy learns from the decisions it made
         N = bS.shape[0]
@@ -2745,9 +2753,22 @@ def main(argv=None):
             if pred_on:
                 # (11-24) the head's prediction (its own weights carry the gradient, `pred_step`); the trunk reads it detached
                 aux_box["pred_q"], aux_box["pred_pose"] = actor.pred_q(bX[mb_], fflat_, hcat_, pose=True)
-                pin_ = actor.pred_feed(aux_box["pred_q"])
+                pin_ = bPIN[mb_]                                   # (11-25) stored: the rollout's, not the moved head's
             pc_ = bPCL[mb_] if pc_on else None                 # (11-25) stored: the head moves during the update, the input must not
             fc = (actor.mem_trunk(fflat_, hcat_, pin_, pc_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            if pred_on and drift_box["on"] and not two:
+                # (11-25) what the update read before 11-25 -- the prediction made again by the head as it is now, on the
+                # memory as it is now -- against the stored one: the inputs' gap and the log-probability's (same weights)
+                with torch.no_grad():
+                    rec_ = actor.pred_feed(aux_box["pred_q"])
+                    pfd.append(float((rec_ - pin_).abs().mean())); pfd_p.append(float((rec_[:, 0] - pin_[:, 0]).abs().mean()))
+                    ls_ = torch.maximum(actor.log_std, actor.log_std_floor).expand(mb_.numel(), -1)
+                    fu_ = bFULL[mb_] if roll_on else None
+                    dl_ = (lp_scored(bU[mb_], actor.pi(actor.mem_trunk(fflat_, hcat_, rec_, pc_)), ls_, fu_)
+                           - lp_scored(bU[mb_], actor.pi(fc), ls_, fu_)).abs()
+                    pdl.append(float(dl_.mean())); pdl90.append(float(torch.quantile(dl_.float(), 0.9)))
+                    pdlc.append(float((dl_ > math.log(1.0 + args.clip)).float().mean()))
+                    del rec_, ls_, dl_
             if line_on:
                 # the plan this state would draw at level 0: the same memory (it went through the levels actually held), the
                 # level input set to 0 -- what a level's plan is measured against
@@ -2767,6 +2788,7 @@ def main(argv=None):
             return heads_on(fc, mb_)
 
         pe5, pe10, pauc, ploss = [], [], [], []                     # --pred-opp: errors at 0.5 / 1.0 s [m], 'visible' AUC, loss
+        pfd, pfd_p, pdl, pdl90, pdlc = [], [], [], [], []           # (11-25) a recomputed prediction input's drift, per minibatch
         pzz = []                                                    # its zig-zag against the realised paths [deg] per decision
 
         def pred_step(mb_):
@@ -2941,6 +2963,7 @@ def main(argv=None):
             for k_ in trk:
                 T_[f"step_{k_}"] = []; T_[f"grad_{k_}"] = []
             T_terms = {}
+        drift_box["on"] = True                                 # (11-25) measured in the epochs only
         for ep in range(args.epochs):
             for sel in batches():
                 aux_g = None
@@ -3145,6 +3168,7 @@ def main(argv=None):
                     cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
+        drift_box["on"] = False
         if args.mem_prev > 0:
             # --mem-prev: this rollout's last decisions for the next update's replay -- features with the weights just learnt
             # (fp16, no gradient), the state each decision began with, the restarts
@@ -3225,6 +3249,15 @@ def main(argv=None):
             _zz = torch.cat(pzz) if pzz else None
             row.update(pred_zigzag=float(_zz.mean()) if _zz is not None and _zz.numel() else None,
                        pred_zigzag_p90=float(torch.quantile(_zz, 0.9)) if _zz is not None and _zz.numel() else None)
+            # (11-25) the trunk reads the rollout's stored prediction; had it read the prediction made again (before 11-25): the
+            # 21 inputs' mean |gap| (all minibatches / the last epoch's), P(there)'s alone, and the PPO log-ratio's |change|
+            # (mean, p90 per minibatch averaged; share of decisions moved past log(1 + clip) by it alone)
+            _nl = max(1, len(pfd) // max(1, args.epochs))
+            _mn = lambda x_: (sum(x_) / len(x_)) if x_ else None
+            row.update(pred_feed_drift=_mn(pfd), pred_feed_drift_last=_mn(pfd[-_nl:]), pred_feed_drift_p=_mn(pfd_p),
+                       pred_feed_drift_first=pfd[0] if pfd else None,   # (before any step: ~0, the replay matches the rollout)
+                       pred_logratio_drift=_mn(pdl), pred_logratio_drift_last=_mn(pdl[-_nl:]), pred_logratio_drift_p90=_mn(pdl90),
+                       pred_logratio_past_clip=_mn(pdlc))
         if others is not None:
             row["opp_present_share"] = opp_pres / max(T, 1)        # decisions of the ordinary races with the other car there
         if near_on:
