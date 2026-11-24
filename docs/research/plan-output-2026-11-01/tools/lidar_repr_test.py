@@ -957,7 +957,7 @@ def table(out_dir):
                 cells = []
                 for i in range(len(edges) - 1):
                     h_ = ((ha >= edges[i]) & (ha < edges[i + 1])).sum(); m_ = ((ma >= edges[i]) & (ma < edges[i + 1])).sum()
-                    cells.append(f"{h_ / max(h_ + m_, 1):7.2f}")
+                    cells.append(f"{h_ / (h_ + m_):7.2f}" if h_ + m_ else f"{'-':>7}")
                 rec = len(ha) / max(len(ha) + len(ma), 1); prec = r["tp"] / max(r["tp"] + r["fp"], 1)
                 e = np.asarray(r["err"])
                 pr(f"{n + ' (x' + nz[1:] + ')':<60} | 재현율 " + " ".join(cells) + f" | {rec:4.2f} | {prec:5.2f} | "
