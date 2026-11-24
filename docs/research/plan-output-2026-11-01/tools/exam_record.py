@@ -42,7 +42,16 @@ F1SIM_EXAM_HALF_LAP=1 (11-12, 사용자가 나간 대회의 1대1 출발): 상�
 조건 = {반 바퀴 떨어져 출발, 5 m 뒤에서 출발} x {상대 페이스 0.6, 0.8, 0.95, 제 페이스} x {줄 위 상자 3개(exam3 은행), 상자 없음} = 16가지,
 조건마다 같은 수의 세션(F1SIM_EXAM4_PER, 기본 8 -> 128 세션 = 환경 256), 경주 i는 조건 i % 16. 90 s, 상자는 50 s에 치움.
 기록에 조건(c_start 0 반 바퀴/1 5 m 뒤, c_pace, c_box), 우리 책임 차 접촉(cfault: env 규칙 car_contact_charge -- 뒤 차, 또는 차 길이
-안에 나란히)을 더함; 표는 exam_race_table.py."""
+안에 나란히)을 더함; 표는 exam_race_table.py.
+F1SIM_EXAM_PRED_ORACLE=1 / F1SIM_EXAM_PRED_PROBE=1 (11-24, 사용자: "예측이 도움이 됐나" -- 입력을 0으로 지우는 건 학습 분포 밖이라 거절, 이 둘만
+OK): race4 + 상대 차 예측 머리가 있는 checkpoint(plan_rl --pred-opp)만. 둘 다 결정마다 머리의 예측(우리 차 틀, m)·P(보임), 상대 차 복사본의
+자기 plan으로 만든 오라클(같은 형식: 0.1..1.0 s 뒤 10점, 페이스 f인 복사본은 plan의 길을 f배 빠르기로 -> t초 뒤 = plan의 f t초 자리),
+'있음' 규칙(학습 타깃과 같음: 10 m(--pred-range) 안 + 1 s 안에 LiDAR 빔에 맞음), 두 차 거리를 `출력_pred.npz`에 남김.
+  ORACLE: policy가 읽는 예측 입력을 매 결정 오라클로 바꿔 몲(P(보임) = 규칙대로 1 / 0, 점 x P -- 머리 출력은 logit이고 몸통은 sigmoid를 읽음).
+    복사본의 plan을 우리 결정보다 먼저 만듦(복사본은 우리 plan을 안 읽어 값은 같음). 나머지는 보통 exam4 그대로.
+  PROBE: 주행은 그대로(기록이 보통 exam4와 비트까지 같아야 함). 결정마다 같은 입력으로 policy를 더 돌려 예측만 바꿨을 때 plan이 얼마나
+    움직이나: 예측 점 0.5 m 왼쪽 / 오른쪽 / 앞 / 뒤, P(보임) = 없음; 기준 = 우리 속도 입력(마지막 명령 속도 + 지난 plan 속도 10개) +0.5 m/s,
+    지난 plan 9점 0.5 m 왼쪽. 같은 입력으로 다시 돈 plan이 몬 plan과 같은지도 남김(base_err). 분석은 pred_check.py."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -113,6 +122,11 @@ TARGET = [float(x) for x in os.environ.get("F1SIM_EXAM_TARGET_NOISE", "").split(
 # (11-16) opponents crash ~0.55 times a minute per box present (they meet boxes on their own line): "1" keeps every box out of
 # the racing-line corridor the opponents drive (EnvConfig.procedural_raceline_corridor "on"; the training worlds run "off")
 CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
+# (11-24) a pred_opp checkpoint in race4: the other car's prediction fed from the copy's own plan (ORACLE), or extra forward
+# passes with the prediction perturbed, driving unchanged (PROBE); see the docstring
+PRED_ORACLE = os.environ.get("F1SIM_EXAM_PRED_ORACLE", "") == "1"
+PRED_PROBE = os.environ.get("F1SIM_EXAM_PRED_PROBE", "") == "1"
+assert not (PRED_ORACLE and PRED_PROBE), "F1SIM_EXAM_PRED_ORACLE or F1SIM_EXAM_PRED_PROBE, not both"
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -415,7 +429,80 @@ if RACE4:
 others = env.sim.other_idx[lid][:, 0]
 eid = env.sim.eid[lid]
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
-COLS = ("onsets_wall", "onsets_prop", "onsets_car", "hard_wall", "hard_prop", "hard_car")
+PRED = PRED_ORACLE or PRED_PROBE
+if PRED:
+    assert RACE4 and so is not None and getattr(actor, "pred_opp", False), "PRED_ORACLE / PRED_PROBE: race4 and a pred_opp checkpoint"
+    assert getattr(actor, "branches", 1) == 1 and not getattr(actor, "pace_levels", 0) and not ROLL and not SLIP
+    from f1sim.learn.plan_policy import PRED_N, PRED_SCALE, pred_points
+    from f1sim.learn.plan_reward import SEEN_S
+    PRED_RANGE = float(ck["args"].get("pred_range") or 10.0)
+    _orow = torch.full((env.B,), -1, dtype=torch.long, device=dev)
+    _orow[so.rows] = torch.arange(so.rows.numel(), device=dev)
+    O_OF = _orow[others]                                    # each learner's other car among the copy's rows
+    assert bool((O_OF >= 0).all())
+    PRD = {k: [] for k in ("there", "dist", "head", "head_p", "orc")}
+    _kk = torch.arange(1, PRED_N + 1, device=dev, dtype=torch.float32) * PS.SUB      # 0.1 .. 1.0 s on the dense grid
+
+    def opp_oracle(st_me: torch.Tensor) -> torch.Tensor:
+        """the copy's own plan of this decision (`so.plan` done) -> where it will be 0.1 .. 1.0 s on, (B_l, PRED_N, 2) [m] in
+        our car's frame at the decision (as plan_rl's --pred-opp targets). A copy at pace f drives its plan's path f times
+        as fast (`SelfOpponents.PACE_KEYS`): t s on = the plan's pose at f t (linear between the dense poses)"""
+        sub = {k_: so.p[k_][O_OF] for k_ in ("x", "y", "psi")}
+        xw, yw, _ = plan_world(sub, env.sim.state[so.rows[O_OF]])
+        tau = so.pace[O_OF].float()[:, None] * _kk[None, :]
+        i0 = tau.floor().long().clamp(0, xw.shape[1] - 2)
+        w = (tau - i0.float()).clamp(0.0, 1.0)
+        px = xw.gather(1, i0) * (1.0 - w) + xw.gather(1, i0 + 1) * w
+        py = yw.gather(1, i0) * (1.0 - w) + yw.gather(1, i0 + 1) * w
+        dx, dy = px - st_me[:, 0:1], py - st_me[:, 1:2]
+        c_, s_ = torch.cos(st_me[:, dyn.IYAW])[:, None], torch.sin(st_me[:, dyn.IYAW])[:, None]
+        return torch.stack([dx * c_ + dy * s_, -dx * s_ + dy * c_], -1)
+
+    def feed_of(pts_m: torch.Tensor, p_vis: torch.Tensor) -> torch.Tensor:
+        """what the trunk reads (`Actor2.pred_feed`'s layout): P(visible), then the points / PRED_SCALE x P(visible)"""
+        return torch.cat([p_vis[:, None], (pts_m / PRED_SCALE).reshape(pts_m.shape[0], -1) * p_vis[:, None]], 1)
+
+if PRED_PROBE:
+    # the perturbations (name, kind, value): the prediction's points shifted [m] (x ahead, y left, our car's frame), the
+    # prediction's P(visible) set to 0; references on our own inputs (STATE_DIM2's layout: imu 0-5, last steering 6, last
+    # speed 7, the last plan's points 2..10 8-25 (x, y), its speeds 26-35)
+    PROBES = [("pred_left", "shift", (0.0, 0.5)), ("pred_right", "shift", (0.0, -0.5)), ("pred_ahead", "shift", (0.5, 0.0)),
+              ("pred_behind", "shift", (-0.5, 0.0)), ("pred_gone", "gone", None),
+              ("own_speed+0.5", "state", ([7] + list(range(26, 36)), 0.5)), ("own_lastplan_left0.5", "state", (list(range(9, 26, 2)), 0.5))]
+    PCOLS = ("mean_disp", "disp_05", "disp_10", "dv_abs", "dy_10", "dx_10", "dv_mean")
+    PRD.update(probe=[], base_err=[])
+
+    def plan_from(scans: torch.Tensor, s_in: torch.Tensor, h_in: torch.Tensor, cmd_d: torch.Tensor, pin_of=None):
+        """one forward pass of the actor as `plan_v2` runs it (mean plan), touching neither `obs` nor the driving state;
+        `pin_of(q)` replaces what the trunk reads of the prediction q"""
+        f_ = actor.features(scans, s_in)
+        h1 = actor.mem_cell(f_, h_in)
+        q_ = actor.pred_q(scans, f_, h1)
+        pin = actor.pred_feed(q_) if pin_of is None else pin_of(q_)
+        m_, _, vh = actor.heads(actor.mem_trunk(f_, h1, pin))
+        return PS.roll(torch.tanh(m_), vh.clamp(-PS.V_REV, PS.V_FWD), cmd_d, lim), q_
+
+    def probe_all(scans, s_in, h_in, cmd_d, p_drv) -> torch.Tensor:
+        """(B_l, len(PROBES), len(PCOLS)): how far each perturbation moves the plan from the unperturbed one"""
+        pb, qb = plan_from(scans, s_in, h_in, cmd_d)
+        PRD["base_err"].append(torch.stack([(pb["pts"] - p_drv["pts"]).abs().amax(), (pb["pv"] - p_drv["pv"]).abs().amax()]).float().cpu())
+        out_ = []
+        for _nm, kind, val in PROBES:
+            if kind == "shift":
+                d_ = torch.tensor(val, device=dev) / PRED_SCALE
+                pin_of = lambda q, d_=d_: type(actor).pred_feed(torch.cat([(q[:, :2 * PRED_N].view(-1, PRED_N, 2) + d_).reshape(q.shape[0], -1), q[:, -1:]], 1))
+                pk, _ = plan_from(scans, s_in, h_in, cmd_d, pin_of)
+            elif kind == "gone":
+                pk, _ = plan_from(scans, s_in, h_in, cmd_d, lambda q: torch.zeros(q.shape[0], 2 * PRED_N + 1, device=dev))
+            else:
+                ix_, dv_ = val
+                s2 = s_in.clone(); s2[:, ix_] = s2[:, ix_] + dv_
+                pk, _ = plan_from(scans, s2, h_in, cmd_d)
+            dp = pk["pts"] - pb["pts"]; dd = dp.norm(dim=-1); dv = pk["pv"] - pb["pv"]
+            out_.append(torch.stack([dd.mean(1), dd[:, 4], dd[:, 9], dv.abs().mean(1), dp[:, 9, 1], dp[:, 9, 0], dv.mean(1)], 1))
+        return torch.stack(out_, 1)
+
+COLS =("onsets_wall", "onsets_prop", "onsets_car", "hard_wall", "hard_prop", "hard_car")
 I_CNT = [CC.index(k) for k in COLS]
 i_hk, i_hx, i_hy, i_hs = (CC.index(k) for k in ("held_kind", "held_x", "held_y", "held_severity"))
 KN = list(getattr(env, "alt_teacher_kinds", ())) + [str(json.loads(OPP_SLOT).get("kind", "raceline")) if OPP_SLOT else "raceline"]
@@ -590,10 +677,29 @@ for kd in range(T):
             _blk = (_bw | _bb) & ~r_full
             r_full = r_full | _blk
         R.setdefault("newp", []).append(r_full.to(torch.int8).cpu()); R.setdefault("blocked", []).append(_blk.to(torch.int8).cpu())
+    if PRED:
+        # the other car "there" by the rule plan_rl's --pred-opp target uses (not absent, within --pred-range, a beam on a car
+        # within SEEN_S)
+        _dist = (env.sim.state[others, :2] - st[:, :2]).norm(dim=1)
+        _there = (~absent[others]) & (_dist <= PRED_RANGE) & (pr.seen_t <= SEEN_S)
+        PRD["there"].append(_there.cpu()); PRD["dist"].append(_dist.float().cpu())
+    if PRED_ORACLE:
+        so.plan()                                               # the copy's plan first (it does not read ours): the oracle
+        _orc = opp_oracle(st)
+        PRD["orc"].append(_orc.float().cpu())
+        _pin = feed_of(_orc, _there.float())
+        actor.pred_feed = lambda q_, _p=_pin: _p.to(q_.dtype)    # the trunk reads the oracle (the head still runs: pred_out)
+    if PRED_PROBE:
+        _scans0, _s0 = obs.scans.clone(), obs.state().clone()
+        _h0 = (obs.mem_h.clone() if getattr(obs, "mem_h", None) is not None
+               else torch.zeros(Bl, actor.memory, device=dev))
     u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                              else plan_v2(actor, obs, lim, sample=SAMPLE))
     if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) every output the policy gave (pre-tanh), driven or not
         R.setdefault("uall", []).append(u_.float().cpu())
+    if PRED:                                                    # the head's own answer this decision (computed in either mode)
+        _hp, _hv = pred_points(actor.pred_out.float())
+        PRD["head"].append(_hp.cpu()); PRD["head_p"].append(_hv.cpu())
     if ROLL:                                                    # the committed 0.9 s rolled on, the policy's last step appended
         u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift_c(r_u, u_, ROLL_C))
         v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = cmd_d0
@@ -643,8 +749,12 @@ for kd in range(T):
         env.sim.ideal_vcap[lid] = 1e3
     restarted = torch.zeros(Bl, dtype=torch.bool, device=dev)
     if so is not None:
-        so.plan()
+        if not PRED_ORACLE:                                     # (ORACLE: made before our decision)
+            so.plan()
         cf_ = torch.zeros(Bl, device=dev)
+    if PRED_PROBE:                                              # driving above is done; these passes touch nothing it reads
+        PRD["orc"].append(opp_oracle(st).float().cpu())
+        PRD["probe"].append(probe_all(_scans0, _s0, _h0, cmd_d0, p).cpu())
     for j in range(PS.SUB):
         if mode == "ideal":
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
@@ -723,7 +833,7 @@ if RACE4:
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
+D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else "")); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
@@ -733,6 +843,16 @@ if SAVE_VALUE:
                         box_cols=np.array([_P0, _w]), box_range=np.array(_br))
 if SAVE_PLAN:
     np.savez_compressed(out_npz[:-4] + "_plan.npz", **{k: torch.stack(v).numpy() for k, v in PLN.items()})
+if PRED:
+    _pd = {k: torch.stack(v).numpy() for k, v in PRD.items() if v}
+    _pd.update(mode=np.array("oracle" if PRED_ORACLE else "probe"), pred_range=np.array(PRED_RANGE), seen_s=np.array(SEEN_S),
+               pace_of=so.pace[O_OF].float().cpu().numpy(), pred_scale=np.array(PRED_SCALE))
+    if PRED_PROBE:
+        _pd.update(probe_names=np.array([n_ for n_, _, _ in PROBES]), probe_cols=np.array(PCOLS))
+    np.savez_compressed(out_npz[:-4] + "_pred.npz", **_pd)
+    if PRED_PROBE:
+        _be = _pd["base_err"].max(0)
+        print(f"[pred probe] 같은 입력으로 다시 돈 plan과 몬 plan의 차 최대: 점 {_be[0]:.2e} m, 속도 {_be[1]:.2e} m/s", flush=True)
 if SAVE_SCAN:
     np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
                         range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
