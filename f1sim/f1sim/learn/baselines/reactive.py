@@ -49,6 +49,7 @@ class _Params:
 class FollowTheGap(BaselineDriver):
     KIND = "ftg"
     needs_speed = True          # the bubble radius grows with the car's speed (`set_vel`)
+    stateless = True            # a row's command is its own scan and speed's alone (`F1VecEnv.external_skip_unused`)
 
     PREPROCESS_CONV_SIZE = 3
     SCALE = 0.6                 # ".575 is max", as upstream
@@ -243,6 +244,7 @@ class FollowTheGap(BaselineDriver):
 class DisparityExtender(BaselineDriver):
     KIND = "disparity"
     needs_speed = False
+    stateless = True            # a row's command is its own scan's alone (`F1VecEnv.external_skip_unused`)
 
     def __init__(self, *, top_speed: float = 6.0, v_min: float = 0.5, car_width: float = 0.31,
                  tolerance: float = 0.1, disparity_threshold: float = 0.2, side_margin: float = 0.1,

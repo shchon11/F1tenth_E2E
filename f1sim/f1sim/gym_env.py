@@ -1133,6 +1133,9 @@ class F1VecEnv:
         self._all_external = False
         self.external_slot_rows: Dict[int, torch.Tensor] = {}
         self.external_drivers: Dict[int, object] = {}        # set_external_drivers()
+        #: (11-24) an external driver whose rows do not depend on each other (`stateless`) is asked only for the rows whose
+        #: command is driven this step (`_external_unused`). Training sets it (plan_rl); off, every row is asked as before
+        self.external_skip_unused = False
         if self.M > 1 and e.opponent == "teacher":
             self.teacher_driven[self.slot > 0] = True
         if self.slots is not None:
@@ -2088,6 +2091,7 @@ class F1VecEnv:
         def calibrated(c, rows):
             return torch.stack([(c[:, 0] - cal[rows, 0].to(c.dtype)) / cal[rows, 1].to(c.dtype),
                                 c[:, 1] / cal[rows, 2].to(c.dtype)], 1)
+        unused = self._external_unused() if self.external_skip_unused else None
         for i, rows in self.external_slot_rows.items():
             drv = self.external_drivers[i]
             if hasattr(drv, "command_env"):                  # a planner: privileged state, not a scan
@@ -2096,6 +2100,13 @@ class F1VecEnv:
                 speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
                 cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
                 continue
+            if unused is not None and getattr(drv, "stateless", False):
+                # (11-24) a row's command from this driver depends on that row alone: the rows nobody drives are not asked
+                # (race32a: Follow-the-Gap, per row in Python, for every empty seat and every copy-driven car -- 0.36 s of
+                # a 0.62 s decision at 608 envs); they keep the command they had, which is not driven either
+                rows = rows[~unused[rows]]
+                if rows.numel() == 0:
+                    continue
             rng = torch.nan_to_num(lr.scan[rows].float(), nan=rmax, posinf=rmax, neginf=0.0).clamp(0.0, rmax)
             v = lr.odom[rows, 3].float() if drv.needs_speed else None
             c = drv.command(drv.adapt(rng.cpu().numpy()), None if v is None else v.cpu().numpy())
@@ -2104,6 +2115,26 @@ class F1VecEnv:
             speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
             cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
         return cmd
+
+    def _external_unused(self) -> torch.Tensor:
+        """(B,) bool: the rows whose command this step is not driven -- replaced below by `ext_cmd` (`ext_mask`) or
+        `ideal_cmd` (ideal execution: the learner's rows, `ideal_extra`), or zeroed by the simulator (a parked car,
+        `Sim.park`). What an external driver would say for them reaches neither the physics nor any car's sensors."""
+        m = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if self._ext_ids:
+            m = m | self.ext_mask
+        if self.ideal_cmd is not None:
+            m = m | self._ideal_mask()
+        if getattr(self.sim, "absent_any", False):
+            m = m | self.sim.absent
+        return m
+
+    def _ideal_mask(self) -> torch.Tensor:
+        """(B,) bool: the rows on ideal execution this step (`enable_ideal`): the learner's and `ideal_extra`'s"""
+        m_i = self.learner if getattr(self, "ideal_extra", None) is None else (self.learner | self.ideal_extra)
+        if not getattr(self, "ideal_learner", True):
+            m_i = (torch.zeros_like(self.learner) if getattr(self, "ideal_extra", None) is None else self.ideal_extra)
+        return m_i
 
     def set_opponent_pool(self, pool):
         """Population that drives the opponent cars (opponent == "pool").
@@ -3365,9 +3396,7 @@ class F1VecEnv:
         if self.ideal_cmd is not None:
             # ideal execution (`enable_ideal`, 11-07 redesign): the learner's rows drive the command they were handed
             # exactly (`Sim.ideal_rows`); whatever the tracker made of their action is not used
-            m_i = self.learner if getattr(self, "ideal_extra", None) is None else (self.learner | self.ideal_extra)
-            if not getattr(self, "ideal_learner", True):
-                m_i = (torch.zeros_like(self.learner) if getattr(self, "ideal_extra", None) is None else self.ideal_extra)
+            m_i = self._ideal_mask()
             self.sim.ideal_rows.copy_(m_i)
             cmd = torch.where(m_i[:, None], self.ideal_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max

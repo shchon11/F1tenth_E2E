@@ -1368,6 +1368,9 @@ def main(argv=None):
               f"with boxes gone at {sg[3]:g}-{sg[4]:g} s, {int((grp == 2).sum())} races {short_s:g} s as before", flush=True)
     if args.opp_every > 0:
         env.opp_every = int(args.opp_every)
+    # (11-24) the empty seats' and the copy-driven cars' scripted driver is not asked for a command nobody drives
+    # (`F1VecEnv.external_skip_unused`)
+    env.external_skip_unused = True
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
     if args.plan_roll:                                             # the shaping reads the point a decision commits
@@ -1818,6 +1821,7 @@ def main(argv=None):
             for k_, r_ in enumerate(pick[:args.live_taps], start=1):
                 taps.append(LiveTap(env, run, row=r_, name=f"live_tap_{k_}.json", label=lab_(r_)))
     tap_pm = torch.zeros(10, 2, device=dev)
+    tap_rows = torch.tensor([tp_.row for tp_ in taps], dtype=torch.long, device=dev)
     t0 = time.time()
     trk = None
     ns_ema, b_noise = None, float("nan")       # --accum-actor-auto: smoothed |G|^2 and tr(Sigma) of the policy gradient
@@ -2114,13 +2118,17 @@ def main(argv=None):
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap_ if pace_on else None)
-                    for tp_ in taps:                               # the plan the mean action makes, for the live view
-                        _q = tp_.row
-                        _pm = PS.roll(torch.tanh(mean[_q:_q + 1]), v_hat[_q:_q + 1].clamp(-PS.V_REV, PS.V_FWD),
-                                      obs.cmd_d[_q:_q + 1], lim, cap_[_q:_q + 1] if pace_on else None)
-                        _xm, _ym, _ = plan_world(_pm, env.sim.state[lid[_q:_q + 1]])
-                        tp_.pm = torch.stack([_xm[0, PT_IDX.to(dev)], _ym[0, PT_IDX.to(dev)]], -1)
-                        tp_.pose0 = env.sim.state[lid[_q], :3].clone()   # where the memory's read-out is measured from
+                    if taps:                                       # the plan the mean action makes, for the live view
+                        # (11-24) one roll for every tap (a plan's rows are independent): eight one-row rolls were ~0.08 s a
+                        # decision of race32a's 0.62
+                        _qs = tap_rows
+                        _pm = PS.roll(torch.tanh(mean[_qs]), v_hat[_qs].clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d[_qs], lim,
+                                      cap_[_qs] if pace_on else None)
+                        _xm, _ym, _ = plan_world(_pm, env.sim.state[lid[_qs]])
+                        _ii = PT_IDX.to(dev)
+                        for k_, tp_ in enumerate(taps):
+                            tp_.pm = torch.stack([_xm[k_, _ii], _ym[k_, _ii]], -1)
+                            tp_.pose0 = env.sim.state[lid[tp_.row], :3].clone()   # where the memory's read-out is measured from
                     vest_err.append((v_hat - v_true).abs())
                     if tailc:
                         V0.append(v_hat.clamp(-PS.V_REV, PS.V_FWD).clone()); D0.append(obs.cmd_d.clone())
