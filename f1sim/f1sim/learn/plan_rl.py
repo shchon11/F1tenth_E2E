@@ -56,7 +56,7 @@ from .plan_reward import PlanReward, SEEN_S, T_REF
 from . import plan_car_cost as PCC
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
-from . import pts_policy as PTS
+from . import pts_policy as PTSP
 
 WORLD = os.path.join(os.path.dirname(__file__), "configs", "plan_world_korea25.json")
 
@@ -342,7 +342,7 @@ class SelfOpponents:
         Bo = int(self.rows.numel())
         # (11-25) copies of a --arch pts policy read their own row's point tokens (`pts_policy.PtsObs` on these rows)
         self.pts = bool(pts)
-        self.obs = (PTS.PtsObs(env, lim, None, rows=self.rows, odom_noise=odom_noise) if self.pts
+        self.obs = (PTSP.PtsObs(env, lim, None, rows=self.rows, odom_noise=odom_noise) if self.pts
                     else PlanObs2(env, lim, None, rows=self.rows))
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by a copy this race
         self.which = torch.zeros(Bo, dtype=torch.long, device=dev)    # by which of the pool
@@ -476,7 +476,7 @@ class SelfOpponents:
                         obs.mem_h = torch.zeros(Bo, actor.memory, device=dev)
                     h = obs.mem_h[idx]
                 if self.pts:                                    # (11-25) a --arch pts copy: its own tokens and free-space head
-                    m, _, vh = actor(PTS.PtsIn(*[x_[idx] for x_ in P_]), s[idx], h)
+                    m, _, vh = actor(PTSP.PtsIn(*[x_[idx] for x_ in P_]), s[idx], h)
                 elif getattr(actor, "pred_clear", False):       # (11-25) a --pred-clear copy reads its own last plan
                     if prev is None:
                         prev = obs.prev_poses()
@@ -545,7 +545,7 @@ class SelfOpponents:
 
     def keys(self) -> tuple:
         """the entries `snapshot` writes"""
-        return self.PACE_KEYS + (tuple("pts_" + k_ for k_ in PTS.PtsObs.PTS_KEYS) if self.pts else ())
+        return self.PACE_KEYS + (tuple("pts_" + k_ for k_ in PTSP.PtsObs.PTS_KEYS) if self.pts else ())
 
     def restore(self, oi: torch.Tensor, d: dict) -> None:
         """put a `snapshot` back on opponent rows `oi` (their race has just been loaded from a scene): the same copy at the
@@ -565,7 +565,7 @@ class SelfOpponents:
         o.cmd_d[oi] = d["cmd_d"]; o.cmd_v[oi] = d["cmd_v"]; o.plan_xy[oi] = d["plan_xy"]; o.plan_v[oi] = d["plan_v"]
         o.rel_psi[oi] = d["rel_psi"]; o.prev_ok[oi] = d["prev_ok"]
         if self.pts:
-            o.pts_restore(oi, {k_: d["pts_" + k_] for k_ in PTS.PtsObs.PTS_KEYS})
+            o.pts_restore(oi, {k_: d["pts_" + k_] for k_ in PTSP.PtsObs.PTS_KEYS})
         if getattr(o, "mem_h", None) is not None and o.mem_h.shape[1] == d["mem"].shape[1]:
             o.mem_h[oi] = d["mem"]
         r = self.env.last_result
@@ -809,11 +809,11 @@ def _arg_problem(args) -> str:
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
         if "pred.kin_k" in (ck.get("actor") or {}) and not args.pred_smooth:
             return "--init: the checkpoint's prediction head is the smooth kind: add --pred-smooth"
-        if PTS.is_pts(ck) != (args.arch == "pts"):
+        if PTSP.is_pts(ck) != (args.arch == "pts"):
             return "--init: the checkpoint's network is another --arch (pts / v2): train from scratch"
         if "pc_geom" in (ck.get("actor") or {}) and not args.pred_clear:
             return "--init: the checkpoint's trunk reads the plan clearances: add --pred-clear"
-        if not PTS.is_pts(ck) and bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
+        if not PTSP.is_pts(ck) and bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             return "--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch"
     rules = (
         (args.dist_world > 1 and (args.dump_rollout or args.track_steps or args.level_replay > 0
@@ -1547,7 +1547,7 @@ def main(argv=None):
         _why = _arg_problem(args)
         if _why:
             raise SystemExit(_why)
-    obs = (PTS.PtsObs(env, lim, pr.goal, odom_noise=args.pts_odom_noise) if pts_on else
+    obs = (PTSP.PtsObs(env, lim, pr.goal, odom_noise=args.pts_odom_noise) if pts_on else
            (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal))
     two = args.branches == 2
     if two:
@@ -1808,10 +1808,10 @@ def main(argv=None):
         # (11-25) the scanner's nominal place (the per-car random mount error is not known to the policy, as on the car)
         _lc = env.cfg.lidar
         pts_mount = (float(_lc.mount_x), float(getattr(_lc, "mount_y", 0.0) or 0.0), 0.0)
-        actor = PTS.PtsActor(env.sim.lidar.angles.detach().float(), pts_mount, float(_lc.range_max),
+        actor = PTSP.PtsActor(env.sim.lidar.angles.detach().float(), pts_mount, float(_lc.range_max),
                              state_dim=int(obs.state().shape[1]), memory=args.memory, std0=args.std0, residual=not args.pts_abs,
                              mem_value=memv_on, mem_keep_s=args.mem_keep_s, mem_keep_log=args.mem_keep_log).to(dev)
-        print(f"[plan_rl] 점 토큰 policy: 스캔 {actor.K}장, 토큰 {PTS.n_tokens(obs.beams, actor.K)}개 x {PTS.D_TOK}, query 11개 x {PTS.D_Q}, "
+        print(f"[plan_rl] 점 토큰 policy: 스캔 {actor.K}장, 토큰 {PTSP.n_tokens(obs.beams, actor.K)}개 x {PTSP.D_TOK}, query 11개 x {PTSP.D_Q}, "
               f"GRU {args.memory}, LiDAR 자리 {pts_mount[0]:.3f} m, 주행거리 잡음 x{args.pts_odom_noise:g} (0.1 s마다 2 cm, 0.5°), "
               f"plan = {'지난 plan 이어감 + 고침' if not args.pts_abs else '직접'}; 빈 공간 머리 따로 학습"
               + (" (정책은 참값을 읽음: oracle)" if args.free_oracle else ""), flush=True)
@@ -1892,7 +1892,7 @@ def main(argv=None):
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
         # commands take v2's step sizes, so a v2 policy's outputs mean the same commands -- start from one, RL on from there
         ck0 = torch.load(args.init, map_location=dev, weights_only=False)
-        if PTS.is_pts(ck0) != pts_on:
+        if PTSP.is_pts(ck0) != pts_on:
             raise SystemExit("--init: the checkpoint's network is another --arch (pts / v2): train from scratch")
         if not pts_on and bool((ck0.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             raise SystemExit("--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch")
@@ -1942,8 +1942,8 @@ def main(argv=None):
         free_params = actor.free_parameters()
         opt_free = torch.optim.Adam(free_params, lr=args.free_lr, eps=1e-5)
         # the free-space target's geometry: the walls' signed distance (negative inside), the boxes' rectangles, our footprint
-        fs_sdf = PTS.signed_wall_field(env.sim.track)
-        fs_rects = PTS.box_local_rects(env.procedural) if env.procedural is not None else None
+        fs_sdf = PTSP.signed_wall_field(env.sim.track)
+        fs_rects = PTSP.box_local_rects(env.procedural) if env.procedural is not None else None
         fs_L, fs_W = car_dims
         fs_mx = float(args.lidar_mount_x) if args.lidar_mount_x else 0.297
         fs_rmax = float(env.cfg.lidar.range_max)
@@ -1951,19 +1951,19 @@ def main(argv=None):
         fs_seen = torch.zeros(Bl, fs_C, dtype=torch.bool, device=dev)     # the boxes seen / passed this episode (knowable)
         fs_ds = torch.full((Bl, fs_C), float("nan"), device=dev)
         fs_pos = torch.zeros(Bl, fs_C, 2, device=dev)
-        pts_store = PTS.PtsStore(Bl, actor.K, dev)
+        pts_store = PTSP.PtsStore(Bl, actor.K, dev)
 
         def fs_static(anc):
             """(11-25) at the decision: world anchors (Bl, 10, 3) and the clearance of our footprint there to the walls and the
             boxes knowable now (Bl, 10)"""
             st_ = env.sim.state[lid, :3].float()
-            aw = PTS.se2_compose(st_[:, None].expand(-1, PS.N_STEP, -1), anc.float())
+            aw = PTSP.se2_compose(st_[:, None].expand(-1, PS.N_STEP, -1), anc.float())
             tid_ = env.sim.tid[lid][:, None, None]
-            wall_ = PTS.wall_clear(lambda xy_: env.sim.track.sample_edt(xy_, tid_, field=fs_sdf), aw, fs_L, fs_W)
+            wall_ = PTSP.wall_clear(lambda xy_: env.sim.track.sample_edt(xy_, tid_, field=fs_sdf), aw, fs_L, fs_W)
             if fs_rects is None or fs_C == 0:
                 return aw, wall_
-            bp_, bh_, bl_ = PTS.boxes_as_rects(env.procedural, lid, fs_rects)
-            return aw, torch.minimum(wall_, PTS.box_clear(aw, fs_L, fs_W, bp_, bh_, bl_ & fs_seen))
+            bp_, bh_, bl_ = PTSP.boxes_as_rects(env.procedural, lid, fs_rects)
+            return aw, torch.minimum(wall_, PTSP.box_clear(aw, fs_L, fs_W, bp_, bh_, bl_ & fs_seen))
         from torch.utils.checkpoint import checkpoint as _ckpt
 
         def _pieces(n_):
@@ -1975,7 +1975,7 @@ def main(argv=None):
             if not torch.is_grad_enabled():
                 return actor.stage1(P_, s_)
             def fn_(*a_):
-                q1, ctx, sn = actor.stage1(PTS.PtsIn(*a_[:7]), a_[7])
+                q1, ctx, sn = actor.stage1(PTSP.PtsIn(*a_[:7]), a_[7])
                 return (q1, sn) + tuple(ctx)
             outs = [_ckpt(fn_, *[x_[sl_] for x_ in P_], s_[sl_], use_reentrant=False) for sl_ in _pieces(s_.shape[0])]
             cat_ = [torch.cat([o_[j_] for o_ in outs], 0) for j_ in range(len(outs[0]))]
@@ -1993,7 +1993,7 @@ def main(argv=None):
         def pts_free(P_, sn_):
             """the free-space head on the update's decisions, in recomputed pieces"""
             def fn_(*a_):
-                return actor.free(actor.geom, PTS.PtsIn(*a_[:7]), a_[7])
+                return actor.free(actor.geom, PTSP.PtsIn(*a_[:7]), a_[7])
             outs = [_ckpt(fn_, *[x_[sl_] for x_ in P_], sn_[sl_], use_reentrant=False) for sl_ in _pieces(sn_.shape[0])]
             return torch.cat([o_[0] for o_ in outs], 0), torch.cat([o_[1] for o_ in outs], 0)
         print(f"[plan_rl] 빈 공간 머리: plan 점(지난 plan을 지금 틀로 옮긴 자리) 10곳에서 우리 차 {fs_L:.2f} x {fs_W:.2f} m와 가장 가까운 "
@@ -2349,7 +2349,7 @@ def main(argv=None):
                         if others is not None:
                             _o = env.sim.state[others[:, 0]].float()
                             _ook = (~env.sim.absent[others[:, 0]]) if getattr(env.sim, "absent_any", False) else torch.ones(Bl, dtype=torch.bool, device=dev)
-                            _kn = _ook & ((_o[:, :2] - env.sim.state[lid, :2].float()).norm(dim=1) <= PTS.FS_THERE_RANGE) & (pr.seen_t <= SEEN_S)
+                            _kn = _ook & ((_o[:, :2] - env.sim.state[lid, :2].float()).norm(dim=1) <= PTSP.FS_THERE_RANGE) & (pr.seen_t <= SEEN_S)
                             FOPP.append(_o[:, :3].clone()); FOOK.append(_ook.clone()); FKNOW.append(_kn)
                         fs_in_ = None
                         if args.free_oracle:
@@ -2357,7 +2357,7 @@ def main(argv=None):
                             if others is not None:
                                 # the other car's next second as known at the decision: the plan its copy drives, else its speed
                                 # and turn held
-                                _g = PTS.car_future_guess(_o)
+                                _g = PTSP.car_future_guess(_o)
                                 if drv.opp is not None and getattr(drv.opp, "p", None) is not None:
                                     _oi = opp_index[others[:, 0]]
                                     _cp = drv.opp.live[_oi] & ~drv.opp.restarted[_oi]
@@ -2365,12 +2365,12 @@ def main(argv=None):
                                         _pp = {k_: (v_[_oi] if k_ != "t" and torch.is_tensor(v_) and v_.dim()
                                                     and v_.shape[0] == drv.opp.rows.numel() else v_)
                                                for k_, v_ in drv.opp.p.items()}
-                                        _gp = PTS.plan_future_poses(_pp, drv.opp.st_plan[_oi].float(), drv.opp.pace[_oi])
+                                        _gp = PTSP.plan_future_poses(_pp, drv.opp.st_plan[_oi].float(), drv.opp.pace[_oi])
                                         _g = torch.where(_cp[:, None, None], _gp, _g)
                                 _hh = torch.tensor([0.5 * fs_L, 0.5 * fs_W], device=dev)
-                                _cg = PTS.rect_rect_sd(_aw, _hh.expand(Bl, PS.N_STEP, 2), _g, _hh.expand(Bl, PS.N_STEP, 2))
+                                _cg = PTSP.rect_rect_sd(_aw, _hh.expand(Bl, PS.N_STEP, 2), _g, _hh.expand(Bl, PS.N_STEP, 2))
                                 _oc = torch.where(_kn[:, None], torch.minimum(_oc, _cg), _oc)
-                            fs_in_ = PTS.fs_oracle_feed(_oc)
+                            fs_in_ = PTSP.fs_oracle_feed(_oc)
                         mean, log_std, v_hat = actor(P_, s, obs.mem_h, fs_in_)
                         obs.u_pending = mean.detach()                  # the next decision's anchor action (set_plan2)
                         pts_store.record(P_, actor.fs_out)
@@ -2674,7 +2674,7 @@ def main(argv=None):
                         if pts_on:
                             # (11-25) the moment's frames, their poses and anchors; the update reads the older frames from the
                             # store's table (they are not this rollout's rows)
-                            obs.pts_restore(g_l, {k_: Dd["pol_pts_" + k_][i_l] for k_ in PTS.PtsObs.PTS_KEYS})
+                            obs.pts_restore(g_l, {k_: Dd["pol_pts_" + k_][i_l] for k_ in PTSP.PtsObs.PTS_KEYS})
                             pts_store.loaded(g_l, obs, t)
                             fs_seen[g_l] = Dd["fs_seen"][i_l]; fs_ds[g_l] = Dd["fs_ds"][i_l]; fs_pos[g_l] = Dd["fs_pos"][i_l]
                         r_ = env.last_result
@@ -2767,7 +2767,7 @@ def main(argv=None):
                 cool += 1
                 if tailc:
                     ii_ = PT_IDX.to(dev)
-                    PTS.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
+                    PTSP.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
                 if remover is not None:
                     was = remover.removed.clone()
                     remover.step()
@@ -2932,12 +2932,12 @@ def main(argv=None):
                     _ook = (~env.sim.absent[others[:, 0]]) if getattr(env.sim, "absent_any", False) else torch.ones(Bl, dtype=torch.bool, device=dev)
                     OPF_ = torch.stack(FOPP + [_o[:, :3]]); OOK_ = torch.stack(FOOK + [_ook])
                     brk_f = (D_ > 0) | ((OPF_[1:, :, :2] - OPF_[:-1, :, :2]).norm(dim=-1) > 2.0)   # a restart / put elsewhere
-                    car_, unk_ = PTS.car_clear(torch.stack(ANCW), OPF_, OOK_, torch.stack(FKNOW), brk_f, fs_L, fs_W)
+                    car_, unk_ = PTSP.car_clear(torch.stack(ANCW), OPF_, OOK_, torch.stack(FKNOW), brk_f, fs_L, fs_W)
                 else:
                     car_ = torch.full_like(ST_, float("inf")); unk_ = torch.zeros_like(ST_, dtype=torch.bool)
-                fs_y, fs_m = PTS.free_target(ST_, car_, unk_)
+                fs_y, fs_m = PTSP.free_target(ST_, car_, unk_)
                 fs_y, fs_m = fs_y.reshape(T * Bl, PS.N_STEP), fs_m.reshape(T * Bl, PS.N_STEP)
-                fs_near_share = float((fs_y[fs_m] < PTS.FS_NEAR).float().mean()) if bool(fs_m.any()) else None
+                fs_near_share = float((fs_y[fs_m] < PTSP.FS_NEAR).float().mean()) if bool(fs_m.any()) else None
                 fs_car_share = float((torch.isfinite(car_) & (car_ <= ST_)).float().mean()) if others is not None else 0.0
                 fs_valid_share = float(fs_m.float().mean())
                 del ST_, car_, unk_
@@ -3059,7 +3059,7 @@ def main(argv=None):
             """(11-25) --arch pts: one step of the free-space head's own optimizer on this minibatch's decisions (the tokens built
             in `actor_on`; the head's own front end); every process steps every minibatch of the first --free-epochs epochs,
             with or without a target in it (the all-reduce count must match)"""
-            l_, st_ = PTS.free_head_step(actor, opt_free, aux_box["pts_P"], aux_box["pts_sn"].detach(), fs_y[mb_], fs_m[mb_],
+            l_, st_ = PTSP.free_head_step(actor, opt_free, aux_box["pts_P"], aux_box["pts_sn"].detach(), fs_y[mb_], fs_m[mb_],
                                          reduce_grads=dist_grads, max_grad=args.max_grad, run=pts_free)
             fs_ls.append(l_); fs_st.append(st_)
 

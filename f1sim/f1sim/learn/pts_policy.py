@@ -73,9 +73,22 @@ def se2_rel(ref: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
     return torch.stack([c * dx + s * dy, -s * dx + c * dy, p[..., 2] - ref[..., 2]], -1)
 
 
+_CONST = {}
+
+
+def _const(key, values, like: torch.Tensor) -> torch.Tensor:
+    """a small constant tensor on `like`'s device / dtype, made once (a `torch.tensor(list, device=cuda)` per call is a pageable
+    host copy: a device sync every time, and not allowed inside a CUDA graph capture)"""
+    k = (key, like.device, like.dtype)
+    t = _CONST.get(k)
+    if t is None:
+        t = _CONST[k] = torch.tensor(values, device=like.device, dtype=like.dtype)
+    return t
+
+
 def fourier(xy: torch.Tensor) -> torch.Tensor:
     """(..., 2) [m] -> (..., 16): per scale s (FOURIER_S) sin x', sin y', cos x', cos y' of (x, y) 2 pi / s -- the probe's order"""
-    sc = torch.tensor([2.0 * math.pi / v for v in FOURIER_S], device=xy.device, dtype=xy.dtype)
+    sc = _const("fourier", [2.0 * math.pi / v for v in FOURIER_S], xy)
     a = xy[..., None, :] * sc[:, None]                                       # (..., 4, 2)
     return torch.cat([torch.sin(a), torch.cos(a)], -1).flatten(-2)
 
@@ -561,7 +574,7 @@ class PtsObs(PlanObs2):
         od = self._odom()
         d = se2_rel(od, self.odom_last)                               # where the frame at the last push is, in the frame now
         if self.odom_noise > 0:
-            e = torch.randn_like(d) * torch.tensor(ODOM_SIG, device=d.device) * self.odom_noise
+            e = torch.randn_like(d) * _const("odom_sig", list(ODOM_SIG), d) * self.odom_noise
             d = se2_compose(d, e)
         K = self.K
         f = torch.cat([self._scan()[:, None, :], self.pts_frames[:, :-1]], 1)
@@ -754,7 +767,7 @@ def footprint_samples(pose: torch.Tensor, L: float, W: float, n_long: int = 3, n
     for i in range(1, n_short + 1):
         y = -hy + 2.0 * hy * i / (n_short + 1)
         pts += [(hx, y), (-hx, y)]
-    o = torch.tensor(pts, dtype=pose.dtype, device=pose.device)               # (S, 2)
+    o = _const(("fp", L, W, n_long, n_short), pts, pose)                     # (S, 2)
     c, s = torch.cos(pose[..., 2])[..., None], torch.sin(pose[..., 2])[..., None]
     return torch.stack([pose[..., 0:1] + c * o[:, 0] - s * o[:, 1], pose[..., 1:2] + s * o[:, 0] + c * o[:, 1]], -1)
 
@@ -772,7 +785,7 @@ def box_clear(poses: torch.Tensor, L: float, W: float, box_pose: torch.Tensor, b
     C = box_pose.shape[1]
     if C == 0:
         return torch.full((B, K), float("inf"), device=poses.device)
-    me_h = torch.tensor([0.5 * L, 0.5 * W], device=poses.device, dtype=poses.dtype)
+    me_h = _const(("half", L, W), [0.5 * L, 0.5 * W], poses)
     sd = rect_rect_sd(poses[:, :, None].expand(B, K, C, 3), me_h.expand(B, K, C, 2),
                       box_pose[:, None].expand(B, K, C, 3), box_half[:, None].expand(B, K, C, 2))
     sd = torch.where(box_ok[:, None, :], sd, torch.full_like(sd, float("inf")))
@@ -811,7 +824,7 @@ def car_clear(anc_w: torch.Tensor, op: torch.Tensor, op_ok: torch.Tensor, know: 
             continue
         opf[:n, :, j] = op[k:k + n]
         okf[:n, :, j] = op_ok[k:k + n]
-    h = torch.tensor([0.5 * L, 0.5 * W], device=anc_w.device, dtype=anc_w.dtype)
+    h = _const(("half", L, W), [0.5 * L, 0.5 * W], anc_w)
     sd = rect_rect_sd(anc_w, h.expand(T, B, K, 2), opf, h.expand(T, B, K, 2))
     counts = know[..., None] & kn & okf
     car = torch.where(counts, sd, torch.full_like(sd, float("inf")))
