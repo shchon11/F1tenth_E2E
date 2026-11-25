@@ -194,7 +194,9 @@ def pooled(m, n_all=None, h_all=None):
 
 print(f"== exam4 경주 시험 · {dict(map='MAP', track='시간 추종기', ideal='plan대로 정확히')[str(z['mode'])]} · {z['name']} · 상대 = "
       f"{os.path.basename(os.path.dirname(str(z['ref'])))}/{os.path.basename(str(z['ref']))}의 복사본 "
-      f"(세션 {B}개 x {secs:.0f} s, 상자는 {rm_t:g} s에 치움, 시드 {int(z['seed'])}, 상대 차 다시 출발 {int(ors.sum())}번) ==")
+      f"(세션 {B}개 x {secs:.0f} s, 상자는 {rm_t:g} s에 치움, 시드 {int(z['seed'])}, 상대 차 다시 출발 {int(ors.sum())}번)"
+      + {"clear_oracle": " · 간격 입력 = 상대 복사본 plan(오라클)", "oracle": " · 예측 입력 = 상대 복사본 plan(오라클)"}.get(
+          str(z["pred_mode"]) if "pred_mode" in z.files else "", "") + " ==")
 hdr = (f"{'조건':<22} | {'세션':>3} | {'바퀴 (상대)':>13} | {'앞지름':>15} | {'앞지름 당함':>6} | {'우리 책임 차 접촉':>14} | "
        f"{'세게 닿음 벽 · 상자 · 차':>20} | {'멈춘 세션':>14} | {'앞차 plan 겹침':>18} | {'지금 자리 지나되 실제와 안 겹친 plan':>18}")
 
