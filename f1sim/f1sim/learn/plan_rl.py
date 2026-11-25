@@ -56,6 +56,7 @@ from .plan_reward import PlanReward, SEEN_S, T_REF
 from . import plan_car_cost as PCC
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
+from . import pts_policy as PTS
 
 WORLD = os.path.join(os.path.dirname(__file__), "configs", "plan_world_korea25.json")
 
@@ -334,12 +335,15 @@ class SelfOpponents:
                  "rel_psi", "prev_ok")
 
     def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5, vcap=None,
-                 pace=None):
+                 pace=None, pts: bool = False, odom_noise: float = 0.0):
         self.env, self.lim, self.share = env, lim, float(share)
         self.rows = torch.nonzero(~env.learner).flatten()
         dev = env.device
         Bo = int(self.rows.numel())
-        self.obs = PlanObs2(env, lim, None, rows=self.rows)
+        # (11-25) copies of a --arch pts policy read their own row's point tokens (`pts_policy.PtsObs` on these rows)
+        self.pts = bool(pts)
+        self.obs = (PTS.PtsObs(env, lim, None, rows=self.rows, odom_noise=odom_noise) if self.pts
+                    else PlanObs2(env, lim, None, rows=self.rows))
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by a copy this race
         self.which = torch.zeros(Bo, dtype=torch.long, device=dev)    # by which of the pool
         # `vcap` (lo, hi) [m/s]: each copy-driven race draws a top speed for its copy (11-12: copies of our own pace gave
@@ -460,6 +464,7 @@ class SelfOpponents:
         if bool(live.any()):
             s = obs.state()
             prev = None
+            P_ = obs.pts_input() if self.pts else None
             for tag in sorted(set(int(t) for t in self.row_tag[live].tolist())):
                 actor = self.model(tag)
                 idx = torch.nonzero(live & (self.row_tag == tag)).flatten()
@@ -470,7 +475,9 @@ class SelfOpponents:
                     if getattr(obs, "mem_h", None) is None or obs.mem_h.shape[1] != actor.memory:
                         obs.mem_h = torch.zeros(Bo, actor.memory, device=dev)
                     h = obs.mem_h[idx]
-                if getattr(actor, "pred_clear", False):         # (11-25) a --pred-clear copy reads its own last plan
+                if self.pts:                                    # (11-25) a --arch pts copy: its own tokens and free-space head
+                    m, _, vh = actor(PTS.PtsIn(*[x_[idx] for x_ in P_]), s[idx], h)
+                elif getattr(actor, "pred_clear", False):       # (11-25) a --pred-clear copy reads its own last plan
                     if prev is None:
                         prev = obs.prev_poses()
                     m, _, vh = actor(obs.scans[idx], s[idx], h, prev=(prev[0][idx], prev[1][idx]))
@@ -480,6 +487,8 @@ class SelfOpponents:
                     obs.mem_h[idx] = actor.h_out
                 mean[idx] = m.float(); v_hat[idx] = vh.float()
         self.live = live
+        if self.pts:
+            obs.u_pending = mean.clone()                            # the next decision's anchor action (`after`'s set_plan2)
         v0 = v_hat.clamp(-PS.V_REV, PS.V_FWD)
         if self.pace_range is not None:
             # a slowed copy (PACE_KEYS' note) plans from the speed it would have at its own pace
@@ -525,11 +534,18 @@ class SelfOpponents:
         mem = (o.mem_h[oi].clone() if getattr(o, "mem_h", None) is not None
                else torch.zeros(n, max(1, int(getattr(self.pool[0], "memory", 1)) if self.pool else 1), device=dev))
         r = self.env.last_result
-        return {"on": self.on[oi].clone(), "tag": self.row_tag[oi].clone(), "pace": self.pace[oi].clone(),
-                "cap": self.cap[oi].clone(), "scans": o.scans[oi].clone(), "rel": o.rel[oi].clone(),
-                "rel_v": o.rel_v[oi].clone(), "cmd_d": o.cmd_d[oi].clone(), "cmd_v": o.cmd_v[oi].clone(),
-                "plan_xy": o.plan_xy[oi].clone(), "plan_v": o.plan_v[oi].clone(), "mem": mem,
-                "imu": r.imu[self.rows[oi]].float().mean(1), "rel_psi": o.rel_psi[oi].clone(), "prev_ok": o.prev_ok[oi].clone()}
+        out = {"on": self.on[oi].clone(), "tag": self.row_tag[oi].clone(), "pace": self.pace[oi].clone(),
+               "cap": self.cap[oi].clone(), "scans": o.scans[oi].clone(), "rel": o.rel[oi].clone(),
+               "rel_v": o.rel_v[oi].clone(), "cmd_d": o.cmd_d[oi].clone(), "cmd_v": o.cmd_v[oi].clone(),
+               "plan_xy": o.plan_xy[oi].clone(), "plan_v": o.plan_v[oi].clone(), "mem": mem,
+               "imu": r.imu[self.rows[oi]].float().mean(1), "rel_psi": o.rel_psi[oi].clone(), "prev_ok": o.prev_ok[oi].clone()}
+        if self.pts:                                                  # (11-25) its point-token inputs as they stand
+            out.update({"pts_" + k_: v_ for k_, v_ in o.pts_snapshot(oi).items()})
+        return out
+
+    def keys(self) -> tuple:
+        """the entries `snapshot` writes"""
+        return self.PACE_KEYS + (tuple("pts_" + k_ for k_ in PTS.PtsObs.PTS_KEYS) if self.pts else ())
 
     def restore(self, oi: torch.Tensor, d: dict) -> None:
         """put a `snapshot` back on opponent rows `oi` (their race has just been loaded from a scene): the same copy at the
@@ -548,6 +564,8 @@ class SelfOpponents:
         o.scans[oi] = d["scans"]; o.rel[oi] = d["rel"]; o.rel_v[oi] = d["rel_v"]
         o.cmd_d[oi] = d["cmd_d"]; o.cmd_v[oi] = d["cmd_v"]; o.plan_xy[oi] = d["plan_xy"]; o.plan_v[oi] = d["plan_v"]
         o.rel_psi[oi] = d["rel_psi"]; o.prev_ok[oi] = d["prev_ok"]
+        if self.pts:
+            o.pts_restore(oi, {k_: d["pts_" + k_] for k_ in PTS.PtsObs.PTS_KEYS})
         if getattr(o, "mem_h", None) is not None and o.mem_h.shape[1] == d["mem"].shape[1]:
             o.mem_h[oi] = d["mem"]
         r = self.env.last_result
@@ -791,9 +809,11 @@ def _arg_problem(args) -> str:
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
         if "pred.kin_k" in (ck.get("actor") or {}) and not args.pred_smooth:
             return "--init: the checkpoint's prediction head is the smooth kind: add --pred-smooth"
+        if PTS.is_pts(ck) != (args.arch == "pts"):
+            return "--init: the checkpoint's network is another --arch (pts / v2): train from scratch"
         if "pc_geom" in (ck.get("actor") or {}) and not args.pred_clear:
             return "--init: the checkpoint's trunk reads the plan clearances: add --pred-clear"
-        if bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
+        if not PTS.is_pts(ck) and bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             return "--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch"
     rules = (
         (args.dist_world > 1 and (args.dump_rollout or args.track_steps or args.level_replay > 0
@@ -847,8 +867,37 @@ def _arg_problem(args) -> str:
         (args.accum_actor > 1 and args.accum > 1, "--accum and --accum-actor: one or the other"),
         (args.mem_aux_lr > 0 and not args.mem_aux > 0, "--mem-aux-lr needs --mem-aux"),
         (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
+        (args.arch == "pts" and (args.format != "v2" or not args.memory), "--arch pts: --format v2 with --memory (its GRU)"),
+        (args.arch == "pts" and (args.pred_opp or args.pred_clear or args.box_memory or args.mem_aux > 0 or args.branches == 2
+                                 or bool(args.pace_caps) or bool(args.line_shifts) or args.plan_roll or args.roll_grow
+                                 or args.hold_p > 0 or bool(args.dump_rollout) or bool(args.track_steps) or args.grad_split
+                                 or args.level_replay > 0),
+         "--arch pts: not with --pred-opp / --pred-clear / --box-memory / --mem-aux / --branches 2 / pace / line / --plan-roll / "
+         "--roll-grow / --hold-p / --dump-rollout / --track-steps / --grad-split / --level-replay"),
+        (args.free_oracle and args.arch != "pts", "--free-oracle needs --arch pts"),
+        (args.arch == "pts" and args.free_epochs < 1, "--free-epochs: at least 1"),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+class _CountingDist:
+    """(11-25) torch.distributed with every collective this process makes counted (`n`): every process of a --dist-world run
+    must make exactly as many per update, or one waits forever on a collective the other never reaches (logged as
+    dist_calls)"""
+
+    def __init__(self, d):
+        self._d, self.n = d, 0
+
+    def all_reduce(self, *a, **k):
+        self.n += 1
+        return self._d.all_reduce(*a, **k)
+
+    def broadcast(self, *a, **k):
+        self.n += 1
+        return self._d.broadcast(*a, **k)
+
+    def __getattr__(self, k):
+        return getattr(self._d, k)
 
 
 def main(argv=None):
@@ -1350,6 +1399,29 @@ def main(argv=None):
     ap.add_argument("--scene-from", type=int, default=0,
                     help="no scene is taken before this update, so none is replayed either (11-16, the user: '이 장면 반복을 어떤 비율로, "
                          "언제 넣을지'): from scratch the first updates' hard contacts are the policy not driving yet, not edge cases")
+    ap.add_argument("--arch", default="v2", choices=("v2", "pts"),
+                    help="(11-25, net_redesign_v2 A/C, approved by the user) 'pts': the point-token policy (`pts_policy.PtsActor`) -- "
+                         "the last 5 scans as points dead-reckoned into the frame now (the car's own odometry), tokens by beam "
+                         "runs, 10 plan queries anchored at the previous plan's points + 1 ego query, two cross-attention blocks, "
+                         "the GRU (--memory) on the ego query, the free-space head (own optimizer, read detached); the plan "
+                         "decoded by plan_steps as v2's. 'v2': `plan_policy.Actor2`")
+    ap.add_argument("--pts-odom-noise", type=float, default=1.0,
+                    help="--arch pts: the odometry noise added to every 0.1 s increment in training, x (2 cm, 2 cm, 0.5 deg) -- "
+                         "the representation probes' model, on top of the odometry model's own errors (the console / car: 0)")
+    ap.add_argument("--pts-abs", action="store_true",
+                    help="--arch pts: the plan head's output is the plan itself, not a residual on the anchor action")
+    ap.add_argument("--pts-chunk", type=int, default=1024,
+                    help="--arch pts: decisions per recomputed (checkpointed) piece of the update's forward pass")
+    ap.add_argument("--free-lr", type=float, default=3e-4, help="--arch pts: the free-space head's own Adam learning rate")
+    ap.add_argument("--free-epochs", type=int, default=1,
+                    help="--arch pts: the free-space head steps on every minibatch of the update's first N epochs (1: each "
+                         "decision once per update)")
+    ap.add_argument("--free-oracle", action="store_true",
+                    help="--arch pts, for the gate: the policy reads the TRUE clearances instead of the head's (walls and seen boxes "
+                         "exact; the other car from the plan its copy is driving, or its speed and turn held) -- the head still learns")
+    ap.add_argument("--opp-present-ramp", default="",
+                    help="U0,U1 (11-25): the share of races with the other car (the world's opp_present) is 0 until update U0 and "
+                         "reaches the world's value at U1 -- copies of a fresh policy cannot drive")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dist-world", type=int, default=1, help="(11-14) processes training ONE policy together, one per GPU, each "
@@ -1387,6 +1459,7 @@ def main(argv=None):
                              "--accum (use --accum-actor)")
         dist.init_process_group(args.dist_backend, init_method=args.dist_init, rank=args.dist_rank, world_size=args.dist_world,
                                 timeout=datetime.timedelta(hours=24))    # gpu_guard3 may pause both while the console runs
+        dist = _CountingDist(dist)
         if args.dist_rank > 0 and not args.dist_same_seed:
             args.seed += 7919 * args.dist_rank          # its own cars, boxes, opponents and noise; the weights come from rank 0
     torch.manual_seed(args.seed)
@@ -1469,7 +1542,13 @@ def main(argv=None):
         pr.plan_hit_wall_n = int(round(args.plan_hit_wall_s / PS.DT * PS.SUB))
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
-    obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
+    pts_on = args.arch == "pts"                                    # (11-25) the point-token policy
+    if pts_on:
+        _why = _arg_problem(args)
+        if _why:
+            raise SystemExit(_why)
+    obs = (PTS.PtsObs(env, lim, pr.goal, odom_noise=args.pts_odom_noise) if pts_on else
+           (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal))
     two = args.branches == 2
     if two:
         if not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0 or args.init:
@@ -1488,7 +1567,7 @@ def main(argv=None):
             if len(pace_) != 3 or not (0.0 < pace_[0] <= pace_[1] <= 1.0 and 0.0 <= pace_[2] <= 1.0):
                 raise SystemExit("--self-opp-pace LO,HI,P: 0 < LO <= HI <= 1, 0 <= P <= 1")
         drv.opp = SelfOpponents(env, lim, args.self_opp, seed=args.seed, max_pool=args.self_opp_pool, p_newest=args.self_opp_newest,
-                                vcap=args.self_opp_vcap, pace=pace_)
+                                vcap=args.self_opp_vcap, pace=pace_, pts=pts_on, odom_noise=args.pts_odom_noise if pts_on else 0.0)
         opp_index = torch.full((env.B,), -1, dtype=torch.long, device=dev)      # env row -> its place in drv.opp's rows
         opp_index[drv.opp.rows] = torch.arange(drv.opp.rows.numel(), device=dev)
     if args.self_opp_pace and drv.opp is None:
@@ -1725,7 +1804,18 @@ def main(argv=None):
     AUXK = PRIV_V2_PROP_SLOTS
     AUXB = AUXK * len(PRIV_V2_PROP_KEYS)                            # the boxes' part of the read-out; the car's 5 follow
     aux_opp = aux_on and args.aux_opp > 0
-    actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
+    if pts_on:
+        # (11-25) the scanner's nominal place (the per-car random mount error is not known to the policy, as on the car)
+        _lc = env.cfg.lidar
+        pts_mount = (float(_lc.mount_x), float(getattr(_lc, "mount_y", 0.0) or 0.0), 0.0)
+        actor = PTS.PtsActor(env.sim.lidar.angles.detach().float(), pts_mount, float(_lc.range_max),
+                             state_dim=int(obs.state().shape[1]), memory=args.memory, std0=args.std0, residual=not args.pts_abs,
+                             mem_value=memv_on, mem_keep_s=args.mem_keep_s, mem_keep_log=args.mem_keep_log).to(dev)
+        print(f"[plan_rl] 점 토큰 policy: 스캔 {actor.K}장, 토큰 {PTS.n_tokens(obs.beams, actor.K)}개 x {PTS.D_TOK}, query 11개 x {PTS.D_Q}, "
+              f"GRU {args.memory}, LiDAR 자리 {pts_mount[0]:.3f} m, 주행거리 잡음 x{args.pts_odom_noise:g} (0.1 s마다 2 cm, 0.5°), "
+              f"plan = {'지난 plan 이어감 + 고침' if not args.pts_abs else '직접'}; 빈 공간 머리 따로 학습"
+              + (" (정책은 참값을 읽음: oracle)" if args.free_oracle else ""), flush=True)
+    actor = actor if pts_on else (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
@@ -1802,11 +1892,20 @@ def main(argv=None):
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
         # commands take v2's step sizes, so a v2 policy's outputs mean the same commands -- start from one, RL on from there
         ck0 = torch.load(args.init, map_location=dev, weights_only=False)
-        if bool((ck0.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
+        if PTS.is_pts(ck0) != pts_on:
+            raise SystemExit("--init: the checkpoint's network is another --arch (pts / v2): train from scratch")
+        if not pts_on and bool((ck0.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             raise SystemExit("--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch")
         if "pc_geom" in ck0["actor"] and not pc_on:
             raise SystemExit("--init: the checkpoint's trunk reads the plan clearances: add --pred-clear")
-        _added = init_actor(actor, ck0["actor"])
+        if pts_on:
+            # (11-25) a pts checkpoint (a fork, e.g. the --free-oracle gate): the same network, every weight taken as it is
+            if ck0["pts"] != actor.config():
+                raise SystemExit(f"--init: the checkpoint's pts network differs ({ck0['pts']} vs {actor.config()})")
+            actor.load_state_dict(ck0["actor"])
+            _added = ""
+        else:
+            _added = init_actor(actor, ck0["actor"])
         if pc_on and "pc_geom" not in ck0["actor"]:
             print("[plan_rl] plan-예측 간격 입력 10칸 새로 붙임: trunk가 읽는 가중치 0에서 시작 (부모와 같게 몲)", flush=True)
         if _added == "new":
@@ -1838,6 +1937,68 @@ def main(argv=None):
     if pred_on:
         pred_params = list(actor.pred.parameters())
         opt_pred = torch.optim.Adam(pred_params, lr=args.pred_lr, eps=1e-5)
+    opt_free = free_params = None                   # (11-25) --arch pts: the free-space head's own optimizer
+    if pts_on:
+        free_params = actor.free_parameters()
+        opt_free = torch.optim.Adam(free_params, lr=args.free_lr, eps=1e-5)
+        # the free-space target's geometry: the walls' signed distance (negative inside), the boxes' rectangles, our footprint
+        fs_sdf = PTS.signed_wall_field(env.sim.track)
+        fs_rects = PTS.box_local_rects(env.procedural) if env.procedural is not None else None
+        fs_L, fs_W = car_dims
+        fs_mx = float(args.lidar_mount_x) if args.lidar_mount_x else 0.297
+        fs_rmax = float(env.cfg.lidar.range_max)
+        fs_C = env.procedural.C if env.procedural is not None else 0
+        fs_seen = torch.zeros(Bl, fs_C, dtype=torch.bool, device=dev)     # the boxes seen / passed this episode (knowable)
+        fs_ds = torch.full((Bl, fs_C), float("nan"), device=dev)
+        fs_pos = torch.zeros(Bl, fs_C, 2, device=dev)
+        pts_store = PTS.PtsStore(Bl, actor.K, dev)
+
+        def fs_static(anc):
+            """(11-25) at the decision: world anchors (Bl, 10, 3) and the clearance of our footprint there to the walls and the
+            boxes knowable now (Bl, 10)"""
+            st_ = env.sim.state[lid, :3].float()
+            aw = PTS.se2_compose(st_[:, None].expand(-1, PS.N_STEP, -1), anc.float())
+            tid_ = env.sim.tid[lid][:, None, None]
+            wall_ = PTS.wall_clear(lambda xy_: env.sim.track.sample_edt(xy_, tid_, field=fs_sdf), aw, fs_L, fs_W)
+            if fs_rects is None or fs_C == 0:
+                return aw, wall_
+            bp_, bh_, bl_ = PTS.boxes_as_rects(env.procedural, lid, fs_rects)
+            return aw, torch.minimum(wall_, PTS.box_clear(aw, fs_L, fs_W, bp_, bh_, bl_ & fs_seen))
+        from torch.utils.checkpoint import checkpoint as _ckpt
+
+        def _pieces(n_):
+            return [slice(i_, min(n_, i_ + args.pts_chunk)) for i_ in range(0, n_, args.pts_chunk)]
+
+        def pts_stage1(P_, s_):
+            """the update's tokens + block 1, recomputed in pieces in the backward pass (the per-point layer of 5 x 1088 points
+            per decision is the memory: a 4864-decision minibatch would keep ~7 GB of it); no gradient: one piece"""
+            if not torch.is_grad_enabled():
+                return actor.stage1(P_, s_)
+            def fn_(*a_):
+                q1, ctx, sn = actor.stage1(PTS.PtsIn(*a_[:7]), a_[7])
+                return (q1, sn) + tuple(ctx)
+            outs = [_ckpt(fn_, *[x_[sl_] for x_ in P_], s_[sl_], use_reentrant=False) for sl_ in _pieces(s_.shape[0])]
+            cat_ = [torch.cat([o_[j_] for o_ in outs], 0) for j_ in range(len(outs[0]))]
+            return cat_[0], tuple(cat_[2:]), cat_[1]
+
+        def pts_trunk(q1_, ctx_, h1_, fs_, u_):
+            """the update's GRU-state add, free-space input, block 2, in recomputed pieces"""
+            if not torch.is_grad_enabled():
+                return actor.trunk(q1_, ctx_, h1_, fs_, u_)
+            def fn_(q, tok, pos, age, val, a2, h, fs, u):
+                return actor.trunk(q, (tok, pos, age, val, a2), h, fs, u)
+            return torch.cat([_ckpt(fn_, q1_[sl_], *[c_[sl_] for c_ in ctx_], h1_[sl_], fs_[sl_], u_[sl_], use_reentrant=False)
+                              for sl_ in _pieces(q1_.shape[0])], 0)
+
+        def pts_free(P_, sn_):
+            """the free-space head on the update's decisions, in recomputed pieces"""
+            def fn_(*a_):
+                return actor.free(actor.geom, PTS.PtsIn(*a_[:7]), a_[7])
+            outs = [_ckpt(fn_, *[x_[sl_] for x_ in P_], sn_[sl_], use_reentrant=False) for sl_ in _pieces(sn_.shape[0])]
+            return torch.cat([o_[0] for o_ in outs], 0), torch.cat([o_[1] for o_ in outs], 0)
+        print(f"[plan_rl] 빈 공간 머리: plan 점(지난 plan을 지금 틀로 옮긴 자리) 10곳에서 우리 차 {fs_L:.2f} x {fs_W:.2f} m와 가장 가까운 "
+              f"벽 · 본 상자 · 상대 차(t + 0.1 k에 실제 자리, 10 m 안 + 1 s 안에 빔에 맞은 때만)까지 부호 있는 간격, -1-3 m로 자름; "
+              f"자기 optimizer lr {args.free_lr:g}, update마다 처음 {args.free_epochs} epoch", flush=True)
     dist_w = 1.0                                    # this process's share of the update's decisions (--dist-world)
     opt_aux = aux_params = None                     # --mem-aux-lr: the side task's own optimizer on (memory, read-out)
     if args.mem_aux_lr > 0:
@@ -1991,7 +2152,17 @@ def main(argv=None):
         trk = {k_[4:]: torch.as_tensor(zt[k_], dtype=torch.float32, device=dev) for k_ in zt.files if k_.startswith("dir_")}
         trk_flat = lambda: torch.cat([p_.detach().reshape(-1) for p_ in trk_p])
         os.makedirs(os.path.join(run, "track"), exist_ok=True)
+    opp_p0 = None
+    if args.opp_present_ramp:
+        # (11-25) the share of races with the other car ramps up (the env draws a race's seats at its reset from `_present_p`)
+        if env.M < 2 or getattr(env, "_present_p", None) is None:
+            raise SystemExit("--opp-present-ramp needs a world whose other seat is filled in only some races (opp_present < 1)")
+        opp_p0 = env._present_p[1:].clone()
+        _q0, _q1 = (float(x_) for x_ in args.opp_present_ramp.split(","))
     for upd in range(1 + args.update_offset, args.updates + 1):
+        dist_n0 = dist.n if dist is not None else 0                # (11-25) this update's collectives (dist_calls)
+        if opp_p0 is not None:
+            env._present_p[1:] = opp_p0 * min(1.0, max(0.0, (upd - _q0) / max(1.0, _q1 - _q0)))   # in place: read at every reset
         if args.plan_hit_ramp:                                      # --plan-hit-ramp: the plan cost's share this update
             _h0, _h1 = (float(x_) for x_ in args.plan_hit_ramp.split(","))
             pr.plan_hit_share = float(args.plan_hit_share) * min(1.0, max(0.0, (upd - _h0) / max(1.0, _h1 - _h0)))
@@ -2050,6 +2221,9 @@ def main(argv=None):
         PRP, PRO, PROK, PRV, PRH = [], [], [], [], []           # --pred-opp: our pose, the other car's xy, there, 'visible', its yaw
         PCL = []                                               # --pred-clear: the trunk's clearance inputs, as the rollout read them
         PIN = []                                               # --pred-opp: the trunk's prediction inputs (pred_feed), as read
+        FSTAT, ANCW, FOPP, FOOK, FKNOW, FRAW = [], [], [], [], [], []   # --arch pts: the free-space target's parts per decision
+        if pts_on:
+            pts_store.begin(obs)                               # the rollout's first decision: the frames before it are kept
         CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
         car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
         opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
@@ -2083,8 +2257,11 @@ def main(argv=None):
                     snap.update(pol_scans=sc, pol_rel=obs.rel.clone(), pol_rel_v=obs.rel_v.clone(), pol_cmd_d=obs.cmd_d.clone(),
                                 pol_cmd_v=obs.cmd_v.clone(), pol_plan_xy=obs.plan_xy.clone(), pol_plan_v=obs.plan_v.clone(),
                                 pol_imu=env.last_result.imu[lid].float().mean(1))
-                    if pc_on:                                  # (11-25) the last plan's headings, whether there is one
+                    if pc_on or pts_on:                        # (11-25) the last plan's headings, whether there is one
                         snap.update(pol_rel_psi=obs.rel_psi.clone(), pol_prev_ok=obs.prev_ok.clone())
+                    if pts_on:                                 # (11-25) the point tokens' frames / poses / anchors as they stand
+                        snap.update({"pol_pts_" + k_: v_ for k_, v_ in obs.pts_snapshot().items()})
+                        snap.update(fs_seen=fs_seen.clone(), fs_ds=fs_ds.clone(), fs_pos=fs_pos.clone())
                     if args.memory:
                         snap["pol_mem"] = obs.mem_h.clone()
                     if aux_seen is not None:
@@ -2155,8 +2332,50 @@ def main(argv=None):
                         if aux_opp:
                             ax_ = torch.cat([ax_, track_opp(env, pr.goal, lid, args.aux_opp)], 1)
                         AX.append(ax_)
-                    mean, log_std, v_hat = (actor(sc, s, obs.mem_h, prev=obs.prev_poses()) if pc_on
-                                            else actor(sc, s, obs.mem_h))
+                    if pts_on:
+                        # (11-25) the point tokens' inputs; the free-space target's static part (walls, boxes known now) at the
+                        # anchors, the other car now (its future is read after the rollout)
+                        P_ = obs.pts_input()
+                        if fs_C:
+                            _ds, _live, _pos = box_along(env, pr.goal, lid)
+                            _mv = ((_pos - fs_pos).abs().sum(-1) > 0.05) | ~_live
+                            _ps = _live & ~_mv & (fs_ds > 0.0) & (fs_ds <= 3.0) & (_ds <= 0.0) & (_ds > -3.0)
+                            fs_seen = (fs_seen & ~_mv) | _ps | boxes_in_view(env, lid, _pos, _live, fs_mx, fs_rmax)
+                            fs_ds = torch.where(_live, _ds, torch.full_like(_ds, float("nan"))); fs_pos = _pos
+                        _aw, _fst = fs_static(P_.anc)
+                        ANCW.append(_aw); FSTAT.append(_fst)
+                        if others is not None:
+                            _o = env.sim.state[others[:, 0]].float()
+                            _ook = (~env.sim.absent[others[:, 0]]) if getattr(env.sim, "absent_any", False) else torch.ones(Bl, dtype=torch.bool, device=dev)
+                            _kn = _ook & ((_o[:, :2] - env.sim.state[lid, :2].float()).norm(dim=1) <= PTS.FS_THERE_RANGE) & (pr.seen_t <= SEEN_S)
+                            FOPP.append(_o[:, :3].clone()); FOOK.append(_ook.clone()); FKNOW.append(_kn)
+                        fs_in_ = None
+                        if args.free_oracle:
+                            _oc = _fst
+                            if others is not None:
+                                # the other car's next second as known at the decision: the plan its copy drives, else its speed
+                                # and turn held
+                                _g = PTS.car_future_guess(_o)
+                                if drv.opp is not None and getattr(drv.opp, "p", None) is not None:
+                                    _oi = opp_index[others[:, 0]]
+                                    _cp = drv.opp.live[_oi] & ~drv.opp.restarted[_oi]
+                                    if bool(_cp.any()):
+                                        _pp = {k_: (v_[_oi] if k_ != "t" and torch.is_tensor(v_) and v_.dim()
+                                                    and v_.shape[0] == drv.opp.rows.numel() else v_)
+                                               for k_, v_ in drv.opp.p.items()}
+                                        _gp = PTS.plan_future_poses(_pp, drv.opp.st_plan[_oi].float(), drv.opp.pace[_oi])
+                                        _g = torch.where(_cp[:, None, None], _gp, _g)
+                                _hh = torch.tensor([0.5 * fs_L, 0.5 * fs_W], device=dev)
+                                _cg = PTS.rect_rect_sd(_aw, _hh.expand(Bl, PS.N_STEP, 2), _g, _hh.expand(Bl, PS.N_STEP, 2))
+                                _oc = torch.where(_kn[:, None], torch.minimum(_oc, _cg), _oc)
+                            fs_in_ = PTS.fs_oracle_feed(_oc)
+                        mean, log_std, v_hat = actor(P_, s, obs.mem_h, fs_in_)
+                        obs.u_pending = mean.detach()                  # the next decision's anchor action (set_plan2)
+                        pts_store.record(P_, actor.fs_out)
+                        FRAW.append(actor.free_out[0].detach().clone() if actor.free_out is not None else _fst)
+                    else:
+                        mean, log_std, v_hat = (actor(sc, s, obs.mem_h, prev=obs.prev_poses()) if pc_on
+                                                else actor(sc, s, obs.mem_h))
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                     if pc_on:
                         PCL.append(actor.pc_out.detach().clone())  # the update reads exactly these
@@ -2356,6 +2575,11 @@ def main(argv=None):
                         CQ["pace"].append(pace_t)
                 out, p, (xw_, yw_, pw_) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
                                                        charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None)
+                if pts_on:
+                    # (11-25) a restart starts a new segment of frames (none older); the boxes known start again
+                    pts_store.restarted(out["restarted"], t)
+                    fs_seen &= ~out["restarted"][:, None]
+                    fs_ds = torch.where(out["restarted"][:, None], torch.full_like(fs_ds, float("nan")), fs_ds)
                 if car_on:
                     # the plan just driven, its 10 points (pose, world velocity) after our car at the decision; distance to go
                     if car_kofs is None:
@@ -2406,6 +2630,8 @@ def main(argv=None):
                                pred=actor.pred_out[_q] if (pred_on and getattr(actor, "pred_out", None) is not None) else None,
                                pred_pose=getattr(tp_, "pose0", None),
                                pred_clear=(actor.pc_out[_q] * PC_SCALE) if (pc_on and actor.pc_out is not None) else None,
+                               free_clear=FRAW[-1][_q] if (pts_on and FRAW) else None,
+                               free_pts=ANCW[-1][_q, :, :2] if (pts_on and ANCW) else None,
                                **tap_opp_plan(_q))
                 if args.dump_rollout:
                     DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
@@ -2429,7 +2655,7 @@ def main(argv=None):
                         oi_ = opp_index[others[g_l, 0]]
                         if scene_copies:
                             # (11-24) --scene-copies: the copy as it was at the scene -- which one, its pace, inputs, memory
-                            drv.opp.restore(oi_, {k_: scene.data["so_" + k_][i_l] for k_ in SelfOpponents.PACE_KEYS})
+                            drv.opp.restore(oi_, {k_: scene.data["so_" + k_][i_l] for k_ in drv.opp.keys()})
                         else:
                             # (11-16) --self-opp: a scene is replayed with the scripted driver it was taken with (scenes come
                             # from races without a copy, below); `SelfOpponents.after` has drawn this race already
@@ -2441,8 +2667,14 @@ def main(argv=None):
                         obs.rel[g_l] = Dd["pol_rel"][i_l]; obs.rel_v[g_l] = Dd["pol_rel_v"][i_l]
                         obs.cmd_d[g_l] = Dd["pol_cmd_d"][i_l]; obs.cmd_v[g_l] = Dd["pol_cmd_v"][i_l]
                         obs.plan_xy[g_l] = Dd["pol_plan_xy"][i_l]; obs.plan_v[g_l] = Dd["pol_plan_v"][i_l]
-                        if pc_on:
+                        if pc_on or pts_on:
                             obs.rel_psi[g_l] = Dd["pol_rel_psi"][i_l]; obs.prev_ok[g_l] = Dd["pol_prev_ok"][i_l]
+                        if pts_on:
+                            # (11-25) the moment's frames, their poses and anchors; the update reads the older frames from the
+                            # store's table (they are not this rollout's rows)
+                            obs.pts_restore(g_l, {k_: Dd["pol_pts_" + k_][i_l] for k_ in PTS.PtsObs.PTS_KEYS})
+                            pts_store.loaded(g_l, obs, t)
+                            fs_seen[g_l] = Dd["fs_seen"][i_l]; fs_ds[g_l] = Dd["fs_ds"][i_l]; fs_pos[g_l] = Dd["fs_pos"][i_l]
                         r_ = env.last_result
                         r_.imu[lid[g_l]] = Dd["pol_imu"][i_l][:, None, :].to(r_.imu.dtype)
                         if args.memory:
@@ -2685,6 +2917,28 @@ def main(argv=None):
                 del d0_, r0_
             del P_, O_, OK_, PT_, PM_, jmp_, brk_, cb_
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
+        fs_y = fs_m = None
+        if pts_on:
+            pts_store.finish(bX)                               # the update builds every decision's tokens again from these
+            with torch.no_grad():
+                # (11-25) the free-space targets: the static part as measured at each decision, the other car where it really
+                # was at t + t_k (inside this rollout and before a restart; a car 'there' whose future is past the rollout's
+                # end leaves that point out)
+                ST_ = torch.stack(FSTAT)                                                    # (T, Bl, 10)
+                if others is not None:
+                    _o = env.sim.state[others[:, 0]].float()
+                    _ook = (~env.sim.absent[others[:, 0]]) if getattr(env.sim, "absent_any", False) else torch.ones(Bl, dtype=torch.bool, device=dev)
+                    OPF_ = torch.stack(FOPP + [_o[:, :3]]); OOK_ = torch.stack(FOOK + [_ook])
+                    brk_f = (D_ > 0) | ((OPF_[1:, :, :2] - OPF_[:-1, :, :2]).norm(dim=-1) > 2.0)   # a restart / put elsewhere
+                    car_, unk_ = PTS.car_clear(torch.stack(ANCW), OPF_, OOK_, torch.stack(FKNOW), brk_f, fs_L, fs_W)
+                else:
+                    car_ = torch.full_like(ST_, float("inf")); unk_ = torch.zeros_like(ST_, dtype=torch.bool)
+                fs_y, fs_m = PTS.free_target(ST_, car_, unk_)
+                fs_y, fs_m = fs_y.reshape(T * Bl, PS.N_STEP), fs_m.reshape(T * Bl, PS.N_STEP)
+                fs_near_share = float((fs_y[fs_m] < PTS.FS_NEAR).float().mean()) if bool(fs_m.any()) else None
+                fs_car_share = float((torch.isfinite(car_) & (car_ <= ST_)).float().mean()) if others is not None else 0.0
+                fs_valid_share = float(fs_m.float().mean())
+                del ST_, car_, unk_
         bPCL = torch.cat(PCL) if pc_on else None               # (T Bl, PC_N): the trunk's clearance inputs as driven
         # (11-25) (T Bl, PRED_IN): the prediction as the trunk read it at the rollout. Until 11-25 the update fed the trunk the
         # head's prediction made again -- by a head its own optimizer moves every minibatch (`pred_step`), so the policy's
@@ -2737,7 +2991,14 @@ def main(argv=None):
                         aux_box["fc0"] = actor.features(bX[sel], lvl0(bS[sel]))
                 return heads_on(actor.features(bX[sel], bS[sel]), sel)
             mb_ = sel.reshape(-1)
-            f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
+            if pts_on:
+                # (11-25) the tokens built again from the stored scans and poses; the GRU reads the ego query after block 1
+                P_ = pts_store.gather(mb_)
+                q1_, ctx_, sn_ = pts_stage1(P_, bS[mb_])
+                aux_box["pts_P"], aux_box["pts_sn"] = P_, sn_
+                f = q1_[:, -1].reshape(sel.shape[0], sel.shape[1], -1)
+            else:
+                f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
             h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.mem_cell, *prev_mem, sel[0] % Bl, bHM[sel[0]])
             hs_ = []
             for i in range(sel.shape[0]):
@@ -2755,7 +3016,10 @@ def main(argv=None):
                 aux_box["pred_q"], aux_box["pred_pose"] = actor.pred_q(bX[mb_], fflat_, hcat_, pose=True)
                 pin_ = bPIN[mb_]                                   # (11-25) stored: the rollout's, not the moved head's
             pc_ = bPCL[mb_] if pc_on else None                 # (11-25) stored: the head moves during the update, the input must not
-            fc = (actor.mem_trunk(fflat_, hcat_, pin_, pc_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            if pts_on:                                         # the free-space input as the rollout read it (stored)
+                fc = pts_trunk(q1_, ctx_, hcat_, pts_store.fs_in(mb_), P_.u_anc)
+            else:
+                fc = (actor.mem_trunk(fflat_, hcat_, pin_, pc_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
             if pred_on and drift_box["on"] and not two:
                 # (11-25) what the update read before 11-25 -- the prediction made again by the head as it is now, on the
                 # memory as it is now -- against the stored one: the inputs' gap and the log-probability's (same weights)
@@ -2786,6 +3050,16 @@ def main(argv=None):
                 if memv_on:
                     aux_box["v"] = actor.vmem_read(hs)[:, 0]
             return heads_on(fc, mb_)
+
+        fs_st, fs_ls = [], []                                       # --arch pts: the free-space head's minibatch numbers, loss
+
+        def free_step(mb_):
+            """(11-25) --arch pts: one step of the free-space head's own optimizer on this minibatch's decisions (the tokens built
+            in `actor_on`; the head's own front end); every process steps every minibatch of the first --free-epochs epochs,
+            with or without a target in it (the all-reduce count must match)"""
+            l_, st_ = PTS.free_head_step(actor, opt_free, aux_box["pts_P"], aux_box["pts_sn"].detach(), fs_y[mb_], fs_m[mb_],
+                                         reduce_grads=dist_grads, max_grad=args.max_grad, run=pts_free)
+            fs_ls.append(l_); fs_st.append(st_)
 
         pe5, pe10, pauc, ploss = [], [], [], []                     # --pred-opp: errors at 0.5 / 1.0 s [m], 'visible' AUC, loss
         pfd, pfd_p, pdl, pdl90, pdlc = [], [], [], [], []           # (11-25) a recomputed prediction input's drift, per minibatch
@@ -3007,6 +3281,8 @@ def main(argv=None):
                         loss_line = torch.zeros((), device=dev)
                 if pred_on:
                     pred_step(mb)
+                if pts_on and ep < args.free_epochs:
+                    free_step(mb)
                 ratio = (lp - bLP[mb]).exp()
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0)
                 a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
@@ -3063,7 +3339,8 @@ def main(argv=None):
                         if args.tail_trunk and ep == 0 and len(tr_ratio) < 4:
                             # how hard the tail pulls on the shared weights next to the policy (11-14: the speed estimate's
                             # trunk gradient was 18x the policy's and set Adam's step size there)
-                            sh_ = [p_ for n_, p_ in actor.named_parameters() if p_.requires_grad and n_.startswith(("enc.", "trunk.", "gru."))]
+                            _shp = ("core.", "gru.", "h_in.", "fs_in.") if pts_on else ("enc.", "trunk.", "gru.")
+                            sh_ = [p_ for n_, p_ in actor.named_parameters() if p_.requires_grad and n_.startswith(_shp)]
                             gp_ = torch.autograd.grad(pl, sh_, retain_graph=True, allow_unused=True)
                             gt_ = torch.autograd.grad(args.tail_consistency * lc, sh_, retain_graph=True, allow_unused=True)
                             nrm_ = lambda gs: float(torch.sqrt(sum((g_.pow(2).sum() for g_ in gs if g_ is not None), torch.zeros((), device=dev))))
@@ -3175,7 +3452,8 @@ def main(argv=None):
             K_ = min(args.mem_prev, T)
             idx_ = torch.arange((T - K_) * Bl, T * Bl, device=dev)
             with torch.no_grad():
-                pF_ = torch.cat([actor.features(bX[c_], bS[c_]).half() for c_ in idx_.split(8192)]).view(K_, Bl, -1)
+                pF_ = torch.cat([(actor.gru_inputs(pts_store.gather(c_), bS[c_]) if pts_on else actor.features(bX[c_], bS[c_])).half()
+                                 for c_ in idx_.split(2048 if pts_on else 8192)]).view(K_, Bl, -1)
             prev_mem = (pF_, bHM[idx_].view(K_, Bl, -1).clone(), D_[T - K_:].clone())
         if args.tail_trunk and args.tail_trunk_ratio > 0 and (tr_ratio or dist is not None):
             # measured with the present share: move the share toward the target ratio (damped; the next update uses it)
@@ -3258,6 +3536,18 @@ def main(argv=None):
                        pred_feed_drift_first=pfd[0] if pfd else None,   # (before any step: ~0, the replay matches the rollout)
                        pred_logratio_drift=_mn(pdl), pred_logratio_drift_last=_mn(pdl[-_nl:]), pred_logratio_drift_p90=_mn(pdl90),
                        pred_logratio_past_clip=_mn(pdlc))
+        if pts_on:
+            # (11-25) the free-space head on this update's minibatches (the epochs it learnt in): the |error| median overall and
+            # where the true gap is < 0.5 m, the sign right there (the per-minibatch medians, weighted by their counts)
+            def _wm(k_, w_):
+                xs_ = [(d_[k_], d_[w_]) for d_ in fs_st if d_.get(k_) is not None and d_[w_] > 0]
+                return sum(a_ * b_ for a_, b_ in xs_) / sum(b_ for _, b_ in xs_) if xs_ else None
+            row.update(free_err_med=_wm("med", "n"), free_err_near=_wm("med_near", "n_near"), free_sign_near=_wm("sign_near", "n_near"),
+                       free_loss=(sum(fs_ls) / len(fs_ls)) if fs_ls else None, free_near_share=fs_near_share,
+                       free_car_share=fs_car_share, free_valid_share=fs_valid_share, free_oracle=bool(args.free_oracle),
+                       opp_present_p=float(env._present_p[1]) if getattr(env, "_present_p", None) is not None and env.M > 1 else None)
+        if dist is not None:
+            row["dist_calls"] = dist.n - dist_n0
         if others is not None:
             row["opp_present_share"] = opp_pres / max(T, 1)        # decisions of the ordinary races with the other car there
         if near_on:
@@ -3382,6 +3672,12 @@ def main(argv=None):
                  f"{row['pred_vis_share'] * 100:.0f} %), 꺾임 실제보다 "
                  f"{(row['pred_zigzag'] if row['pred_zigzag'] is not None else float('nan')):+.1f}° (p90 "
                  f"{(row['pred_zigzag_p90'] if row['pred_zigzag_p90'] is not None else float('nan')):.1f}°) | " if pred_on else "")
+              + (f"빈 공간 머리: 오차 중앙 {(row['free_err_med'] if row['free_err_med'] is not None else float('nan')) * 100:.1f} cm, "
+                 f"간격 0.5 m 안 {(row['free_err_near'] if row['free_err_near'] is not None else float('nan')) * 100:.1f} cm (부호 맞음 "
+                 f"{(row['free_sign_near'] if row['free_sign_near'] is not None else float('nan')) * 100:.0f} %, 0.5 m 안 점 "
+                 f"{(row['free_near_share'] or 0) * 100:.0f} %, 상대 차가 가장 가까운 점 {(row['free_car_share'] or 0) * 100:.1f} %)"
+                 + (" [정책은 참값을 읽음]" if args.free_oracle else "") + " | " if pts_on else "")
+              + (f"collective {row['dist_calls']}번 | " if dist is not None else "")
               + (f"복사본이 모는 상대 차 {row['self_opp_share'] * 100:.0f} % (update {row['self_opp_pool']}의 복사본) | " if drv.opp is not None else "")
               + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
                  f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
@@ -3410,7 +3706,7 @@ def main(argv=None):
         if (upd % args.save_every == 0 or upd == args.updates) and args.dist_rank == 0:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps",
-                        **({"roll_c": grow_c} if grow_on else {})},
+                        **({"roll_c": grow_c} if grow_on else {}), **({"pts": actor.config()} if pts_on else {})},
                        os.path.join(run, f"plan_u{upd}.pt"))
         if grow_on:
             # (11-22) --roll-grow: one more step committed once laps/min (the last 3 updates) is back to keep x its level before

@@ -166,6 +166,8 @@ from f1sim.learn import state_rl as SR
 from f1sim.learn.graph_runtime import prepare_graph_runtime
 from f1sim.learn.plan_reward import PlanReward
 from f1sim.learn.plan_policy import PlanObs2, load_actor2, plan_v2, plan_world, plan_segments, PT_IDX
+from f1sim.learn import pts_policy as PTSP          # (11-25) plan_rl --arch pts checkpoints
+PTS_CK = PTSP.is_pts(ck)
 from f1sim.learn.plan_rl import WORLD
 from f1sim import plan_steps as PS
 from f1sim import map_controller as M
@@ -268,7 +270,7 @@ if mode == "track":
         from f1sim.plan_mpc import PlanMPC
         follower = PlanMPC(Bl, dev, env.tracker.nominal, s_max=float(env.s_max), lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0))
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
-actor = load_actor2(ck, dev)
+actor = PTSP.load_pts_actor(ck, dev) if PTS_CK else load_actor2(ck, dev)
 if STEER_STD_FLOOR > 0:                     # the first step's turn: exploration at least this wide (plan_rl's log_std_floor)
     actor.log_std_floor[0] = float(np.log(STEER_STD_FLOOR))
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
@@ -320,7 +322,12 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
     return (w * (b_real - b_kin)).clamp(-0.35, 0.35)
 
 
-obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
+if PTS_CK:
+    # (11-25) the point tokens from this env's scans and the car's own odometry (no training noise), anchors from its own plans
+    assert not SLIP, "F1SIM_EXAM_SLIP_FRAME: not for a pts checkpoint"
+    obs = PTSP.PtsObs(env, lim, pr.goal)
+else:
+    obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
 if getattr(actor, "pace_levels", 0):                         # (11-21) a pace policy: its state inputs exist before the first read
     obs.pace_on(actor.pace_levels, actor.pace_hold)
 # (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
@@ -734,8 +741,9 @@ for kd in range(T):
             PC_PREV.update(psi=obs.rel_psi.clone(), ok=obs.prev_ok.clone())
         _h0 = (obs.mem_h.clone() if getattr(obs, "mem_h", None) is not None
                else torch.zeros(Bl, actor.memory, device=dev))
-    u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
-                             else plan_v2(actor, obs, lim, sample=SAMPLE))
+    _plan = PTSP.plan_pts if PTS_CK else plan_v2
+    u_, mean, _, v_hat, p = (_plan(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
+                             else _plan(actor, obs, lim, sample=SAMPLE))
     if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) every output the policy gave (pre-tanh), driven or not
         R.setdefault("uall", []).append(u_.float().cpu())
     if PRED:                                                    # the head's own answer this decision (computed in either mode)

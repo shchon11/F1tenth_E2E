@@ -115,14 +115,15 @@ class LiveTap:
                value: torch.Tensor, reward: torch.Tensor, lap: torch.Tensor, contact: torch.Tensor, shaping: torch.Tensor,
                vhat: torch.Tensor, noise: torch.Tensor, std: torch.Tensor, mem=None, replay: bool = False,
                copy_opp: bool = False, mem_read=None, mem_pose=None, known=None, parts=None, pred=None, pred_pose=None,
-               opp_plan=None, opp_live=None, pred_clear=None) -> None:
+               opp_plan=None, opp_live=None, pred_clear=None, free_clear=None, free_pts=None) -> None:
         """after a decision, learner `row`'s: `pts` (10, 2) the plan it drove (world), `pts_mean` (10, 2) the plan its mean
         action makes, `plan_v` (10,) the driven plan's speeds, the critic's `value`, the reward and its parts, the speed
         estimate `vhat`, the size of the noise drawn (`noise`, in std units) and the policy's mean std, `mem` (memory,) the
         memory after this decision. The car as it stands at the decision's end. (11-24) `parts` (n,) the reward's terms
         named by `set_parts`; `pred` (21,) the prediction head's raw output and `pred_pose` (3,) the pose the decision was
         made at; `opp_plan` (10, 2) the other car's copy's plan (world) and `opp_live` () whether a copy drives it. (11-25)
-        `pred_clear` (10,) [m] the clearance inputs this decision read."""
+        `pred_clear` (10,) [m] the clearance inputs this decision read. (11-25, --arch pts) `free_clear` (10,) [m] the free-space
+        head's clearances and `free_pts` (10, 2) the world points (the anchors) they are at."""
         env, sim, r, o = self.env, self.env.sim, self.r, self.o
         dev = sim.state.device
         st = sim.state[r, :4].float()
@@ -141,7 +142,8 @@ class LiveTap:
         e0 = torch.zeros(0, device=dev)
         extra = [sc(parts) if parts is not None else e0, sc(pred) if pred is not None else e0,
                  sc(pred_pose)[:3] if pred_pose is not None else e0, sc(opp_plan) if opp_plan is not None else e0,
-                 sc(opp_live) if opp_live is not None else e0, sc(pred_clear) if pred_clear is not None else e0]
+                 sc(opp_live) if opp_live is not None else e0, sc(pred_clear) if pred_clear is not None else e0,
+                 sc(free_clear) if free_clear is not None else e0, sc(free_pts) if free_pts is not None else e0]
         parts_l = [st, ost, present, sc(pts), sc(pts_mean), sc(plan_v), hard, sim.tid[r].float().reshape(1),
                    sc(value), sc(reward), sc(lap), sc(contact), sc(shaping), sc(vhat), sc(noise), sc(std), box, m, rng] + extra
         sizes = [int(p_.numel()) for p_ in parts_l]
@@ -150,7 +152,7 @@ class LiveTap:
         for n_ in sizes:
             out.append(flat[i:i + n_]); i += n_
         car, opp, pres, plan, plan_m, pv, hit, tid, val, rew, lap_, con, shp, vh, noi, sd, bx, mm, rr = out[:19]
-        npart, pq, ppose, oplan, olive, pclr = out[19:]
+        npart, pq, ppose, oplan, olive, pclr, fclr, fpts = out[19:]
         a = self.angles + car[2]
         sx, sy = car[0] + self.mount_x * np.cos(car[2]), car[1] + self.mount_x * np.sin(car[2])
         ok = np.isfinite(rr) & (rr > 0.05) & (rr < 29.0)
@@ -228,7 +230,9 @@ class LiveTap:
                "known": None if known is None else int(known),
                "parts": named, "parts_lag_s": lag, "parts_resid": round(self.resid_ep, 6),
                "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims,
-               "pred_clear": _r(pclr, 3) if pclr.size else None}
+               "pred_clear": _r(pclr, 3) if pclr.size else None,
+               "free_clear": _r(fclr, 3) if fclr.size else None,
+               "free_pts": _r(fpts.reshape(-1, 2), 3) if fpts.size else None}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))

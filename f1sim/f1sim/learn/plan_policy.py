@@ -260,6 +260,8 @@ class PlanRunner:
         self.lid = env.learner_ids
         self.v3 = ck.get("format") == "plan_steps3"
         self.v2 = ck.get("format") == "plan_steps2" or self.v3
+        from . import pts_policy as _pts
+        self.pts = _pts.is_pts(ck)                                # (11-25) plan_rl --arch pts: the point-token policy
         _mg = (ck.get("args") or {}).get("plan_lat_margin")      # the limit the checkpoint was trained with (11-10)
         self.lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device,
                                           margin=None if _mg is None else float(_mg))
@@ -274,8 +276,13 @@ class PlanRunner:
                 env.cfg.lidar.mount_x = mx
                 env.sim.params.set_all("mount_x", mx)
                 print(f"[plan] LiDAR {mx:.3f} m ahead of the CoG (the checkpoint's)", flush=True)
-            self.actor = load_actor2(ck, device, check_mount=False)
-            self.obs = PlanObs2(env, self.lim, None)
+            if self.pts:
+                # its tokens from this env's scans and odometry; the anchors from its own last plan (`pts_policy.PtsObs`)
+                self.actor = _pts.load_pts_actor(ck, device)
+                self.obs = _pts.PtsObs(env, self.lim, None)
+            else:
+                self.actor = load_actor2(ck, device, check_mount=False)
+                self.obs = PlanObs2(env, self.lim, None)
             if getattr(self.actor, "pace_levels", 0):            # its state inputs exist before anything reads the state
                 self.obs.pace_on(self.actor.pace_levels, self.actor.pace_hold)
             if self.actor.branches == 2:
@@ -447,7 +454,11 @@ class PlanRunner:
                           if getattr(self.obs, "pace_idx", None) is not None else None)
                 if self.roll:
                     self._roll_check(due)
-                u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                if self.pts:
+                    from .pts_policy import plan_pts
+                    u_, mean, _, v_hat, p = plan_pts(self.actor, self.obs, self.lim)
+                else:
+                    u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 if self.pred_w is not None and self.actor.pred_out is not None:
                     # the other car's predicted next second, from the pose this decision is made at, in the world
                     pts, pv = pred_points(self.actor.pred_out.float())
