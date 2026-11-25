@@ -3883,8 +3883,9 @@ def main(argv=None):
             row.update(pg_log)
         if ww_on:
             # (11-25) --wrong-way-cost over every process's ordinary races (one all_reduce, every process, every update)
-            _w = ww_acc[:, ordm].sum(1)
-            row.update(ww_totals(float(_w[0]), float(_w[1]), float(_w[2]), float(T * n_ord), mins, dist, dev))
+            # (own name: `_w` is the critic box block's width that priv_h reads)
+            ww_s_ = ww_acc[:, ordm].sum(1)
+            row.update(ww_totals(float(ww_s_[0]), float(ww_s_[1]), float(ww_s_[2]), float(T * n_ord), mins, dist, dev))
         if cm_on:
             # (11-25) --commit-plan: "std" stays the per-output std (each step's marginal under the coefficient noise, what the
             # site and tools read), "std_coef" the coefficients' own [turn deg 0..9, speed deg 0..9]
