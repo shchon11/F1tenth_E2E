@@ -185,7 +185,7 @@ def load_opp(bases):
         T, B = s["scan"].shape[:2]
         d = dict(scan=s["scan"], ego=s["ego"], mount=s["mount"], st=m["st"][:T + 1, :, :3], op=m["op"][:T + 1], on=m["on"][:T + 1],
                  rs=m["rs"][:T], ors=m["ors"][:T], there=p["there"][:T], dist=p["dist"][:T], head=p["head"][:T],
-                 head_p=p["head_p"][:T], orc=p["orc"][:T], pace=np.asarray(m["c_pace"], np.float32),
+                 head_p=p["head_p"][:T], orc=p["orc"][:T], pace=np.asarray(m["c_pace"], np.float32), pl=m["pl"][:T],
                  run=np.full(B, r, np.int16), idx=np.arange(B, dtype=np.int16))
         assert d["pace"].shape[0] == B and d["st"].shape[0] == T + 1, (d["pace"].shape, d["st"].shape, T, B)
         if angles is None:
@@ -256,6 +256,132 @@ class OppNet(nn.Module):
         return self.head(torch.cat([self.enc(x.float()), e], 1))
 
 
+
+# ------------------------------------------------------------------------------------------- point tokens (second test)
+# (11-25, net_redesign_v2.md §3 A / §5) the front end A/C: every return of the last K frames as an exact point in the frame now
+# (the dead-reckoned chain, no raster), grouped into runs of consecutive beams (8 in the newest frame, 16 in older ones), a
+# per-point MLP on Fourier(x, y) at 0.05 / 0.2 / 1 / 5 m + age + range, max-pooled per run -> N ~ 400 tokens (K = 5). Read by
+# 10 time-aligned queries anchored at plan points + 1 car query: 2 blocks of [cross-attention query -> tokens with the
+# RELATIVE position Fourier(token - anchor) and age in keys and values, self-attention among the queries, FFN], width 128,
+# 4 heads, pre-LN, no token-token attention.
+FOURIER_S = (0.05, 0.2, 1.0, 5.0)
+PAD_BEAMS, RUN_NEW, RUN_OLD = 1088, 8, 16
+
+
+def fourier(xy):
+    """(..., 2) [m] -> (..., 16): sin / cos of 2 pi x / s and 2 pi y / s at the four scales"""
+    sc = torch.tensor([2 * math.pi / v for v in FOURIER_S], device=xy.device, dtype=xy.dtype)
+    a = xy[..., None, :] * sc[:, None]                                       # (..., 4, 2)
+    return torch.cat([torch.sin(a), torch.cos(a)], -1).flatten(-2)
+
+
+def point_set(geo, sc, rel, mount, mirror):
+    """sc (n, K, beams) normalised ranges, rel (n, K, 3) each frame's pose in the frame now -> X, Y [m], r (range / max),
+    ok (n, K, PAD_BEAMS) in the frame now (padded beams invalid); mirror (n,) bool flips y"""
+    px, py, ok = geo.points(sc, mount)
+    c, s_ = torch.cos(rel[..., 2])[..., None], torch.sin(rel[..., 2])[..., None]
+    X = rel[..., 0:1] + c * px - s_ * py; Y = rel[..., 1:2] + s_ * px + c * py
+    Y = torch.where(mirror[:, None, None], -Y, Y)
+    pad = PAD_BEAMS - X.shape[-1]
+    return F.pad(X, (0, pad)), F.pad(Y, (0, pad)), F.pad(sc.float(), (0, pad), value=1.0), F.pad(ok, (0, pad), value=False)
+
+
+class PtsBlock(nn.Module):
+    def __init__(self, d: int, H: int, rel_d: int = 17):
+        super().__init__()
+        self.H = H
+        self.ln_q, self.ln_t = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.wq, self.wk, self.wv, self.wo = (nn.Linear(d, d) for _ in range(4))
+        self.rk, self.rv = nn.Linear(rel_d, d), nn.Linear(rel_d, d)
+        self.ln_s = nn.LayerNorm(d); self.sa = nn.MultiheadAttention(d, H, batch_first=True)
+        self.ln_f = nn.LayerNorm(d); self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+
+    def forward(self, q, tok, rel, valid):
+        n, Q, d = q.shape; N = tok.shape[1]; H = self.H; dh = d // H
+        t = self.ln_t(tok)
+        qq = self.wq(self.ln_q(q)).view(n, Q, H, dh)
+        k = (self.wk(t)[:, None] + self.rk(rel)).view(n, Q, N, H, dh)       # keys / values: token + relative position
+        v = (self.wv(t)[:, None] + self.rv(rel)).view(n, Q, N, H, dh)
+        lg = torch.einsum("nqhd,nqjhd->nhqj", qq, k).float() / math.sqrt(dh)
+        lg = lg.masked_fill(~valid[:, None, None, :], float("-inf"))
+        att = torch.softmax(lg, -1).to(v.dtype)
+        o = torch.einsum("nhqj,nqjhd->nqhd", att, v).reshape(n, Q, d)
+        q = q + self.wo(o)
+        h = self.ln_s(q)
+        q = q + self.sa(h, h, h, need_weights=False)[0]
+        return q + self.ffn(self.ln_f(q))
+
+
+class PtsNet(nn.Module):
+    """x = (X, Y, r, ok, anchors (n, 10, 2)), ego (n, 10, 2) -> (n, 10 q_out [+ ego_out])"""
+
+    def __init__(self, K: int, q_out: int = 2, ego_out: int = 1, d: int = 128, heads: int = 4, blocks: int = 2, n_q: int = 10):
+        super().__init__()
+        self.K, self.N, self.n_q, self.q_out, self.ego_out = K, K, n_q, q_out, ego_out
+        self.pmlp = nn.Sequential(nn.Linear(18, 64), nn.ReLU(), nn.Linear(64, 64))
+        self.tok = nn.Sequential(nn.Linear(64 + 16 + 1, d), nn.ReLU(), nn.Linear(d, d))
+        self.q0 = nn.Parameter(torch.randn(n_q + 1, d) * 0.02)               # learned embedding = the query's time slot
+        self.q_anchor = nn.Linear(16, d); self.q_ego = nn.Linear(20, d)
+        self.blocks = nn.ModuleList([PtsBlock(d, heads) for _ in range(blocks)])
+        self.ln = nn.LayerNorm(d)
+        self.out_q = nn.Linear(d, q_out)
+        self.out_e = nn.Linear(d, ego_out) if ego_out else None
+
+    def tokens(self, X, Y, r, ok):
+        n, K, P = X.shape
+        age = (torch.arange(K, device=X.device, dtype=X.dtype) * 0.1)[None, :, None].expand(n, K, P)
+        xy = torch.stack([X, Y], -1)
+        h = self.pmlp(torch.cat([fourier(xy), age[..., None], r[..., None]], -1))            # (n, K, P, 64)
+        h = h.masked_fill(~ok[..., None], float("-inf"))
+        okf = ok.to(X.dtype)
+
+        def runs(hh, oo, pp, aa, L):            # (n, F, P, ...) -> runs of L beams
+            nF = hh.shape[1]
+            hh = hh.reshape(n, nF, P // L, L, -1).amax(3)
+            cnt = oo.reshape(n, nF, P // L, L).sum(3)
+            pos = (pp * oo[..., None]).reshape(n, nF, P // L, L, 2).sum(3) / cnt.clamp_min(1.0)[..., None]
+            return hh.reshape(n, -1, hh.shape[-1]), pos.reshape(n, -1, 2), aa[:, :, ::L].reshape(n, -1), (cnt > 0).reshape(n, -1)
+        parts = [runs(h[:, :1], okf[:, :1], xy[:, :1], age[:, :1], RUN_NEW)]
+        if K > 1:
+            parts.append(runs(h[:, 1:], okf[:, 1:], xy[:, 1:], age[:, 1:], RUN_OLD))
+        hh, pos, ag, val = (torch.cat([p_[i] for p_ in parts], 1) for i in range(4))
+        hh = torch.where(val[..., None], hh, torch.zeros_like(hh))
+        val = val.clone(); val[:, 0] = val[:, 0] | ~val.any(1)                 # never an all-masked row
+        tok = self.tok(torch.cat([hh, fourier(pos), ag[..., None]], -1))
+        return tok, pos, ag, val
+
+    def forward(self, x, ego):
+        X, Y, r, ok, anc = x
+        X, Y, r, anc = X.float(), Y.float(), r.float(), anc.float()
+        tok, pos, ag, val = self.tokens(X, Y, r, ok)
+        n = X.shape[0]
+        a = torch.cat([anc, torch.zeros(n, 1, 2, device=anc.device)], 1)                     # the car query sits at the car
+        q = self.q0[None] + torch.cat([self.q_anchor(fourier(anc)), self.q_ego(ego.reshape(n, -1).float())[:, None]], 1)
+        Q, N = a.shape[1], pos.shape[1]
+        rel = torch.cat([fourier(pos[:, None] - a[:, :, None]), ag[:, None, :, None].expand(n, Q, N, 1)], -1)
+        for blk in self.blocks:
+            q = blk(q, tok, rel, val)
+        q = self.ln(q)
+        out = self.out_q(q[:, :-1]).reshape(n, -1)
+        return torch.cat([out, self.out_e(q[:, -1])], 1) if self.out_e is not None else out
+
+
+def make_opp_net(kind, beams, geo):
+    if kind.startswith("pts"):
+        net = PtsNet(int(kind[3:].split("_")[0]))
+        net.kind, net.noise = kind, (1.0 if kind.endswith("_noise") else 0.0)
+        return net
+    return OppNet(kind, beams, geo)
+
+
+def anchors_of(pl_w, st_now, mirror):
+    """plan points in the world (n, 10, 2) -> in the car frame now (n, 10, 2), y flipped where mirror"""
+    c, s_ = torch.cos(st_now[:, 2])[:, None], torch.sin(st_now[:, 2])[:, None]
+    d = pl_w - st_now[:, None, :2]
+    a = torch.stack([d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c], -1)
+    return torch.where(mirror[:, None, None], a * torch.tensor([1.0, -1.0], device=a.device), a)
+
+
 class OppData:
     """everything on the GPU; `batch(rows)` builds a model's inputs"""
 
@@ -269,7 +395,9 @@ class OppData:
         self.mount = torch.as_tensor(D["mount"], dtype=torch.float32, device=DEV)
         self.t = torch.as_tensor(meta["t"], device=DEV).long(); self.b = torch.as_tensor(meta["b"], device=DEV).long()
         self.tgt = torch.as_tensor(tgt, device=DEV); self.msk = torch.as_tensor(msk, device=DEV)
-        self.there = torch.as_tensor(meta["there"], device=DEV)
+        self.there = torch.as_tensor(meta["there"], device=DEV) if "there" in meta else None
+        self.pl = torch.as_tensor(D["pl"], dtype=torch.float32, device=DEV) if "pl" in D else None     # (T, B, 10, 2) world
+        self.anchor_now = False            # pts anchors: the previous plan (opponent probe) or this decision's plan (clearance)
         self.geo = Geo(angles)
 
     def gather(self, t_c, b_c, ages):
@@ -295,6 +423,18 @@ class OppData:
         elif k.startswith("polar"):
             x = self.gather(t_c, b_c, torch.arange(net.N))                                       # (n, N, beams)
             x = torch.where(mirror[:, None, None], x.flip(-1), x)
+        elif k.startswith("pts"):
+            N = net.K
+            sc = self.gather(t_c, b_c, torch.arange(N))
+            poses = self.st[(t[:, None] - torch.arange(N, device=DEV)[None]), b[:, None]]
+            rel = rel_chain(poses, net.noise, gen)
+            X, Y, r, ok = point_set(self.geo, sc, rel, self.mount[b], mirror)
+            if self.anchor_now:
+                pw = self.pl[t, b]
+            else:                           # the previous plan's points k = 1..9 are now 0.1 k ahead; the 10th extrapolated
+                pp = self.pl[t - 1, b]
+                pw = torch.cat([pp[:, 1:], 2.0 * pp[:, 9:10] - pp[:, 8:9]], 1)
+            x = (X, Y, r, ok, anchors_of(pw, self.st[t, b], mirror))
         else:
             N = net.N
             sc = self.gather(t_c, b_c, torch.arange(N))                                          # (n, N, beams)
@@ -305,9 +445,18 @@ class OppData:
             X = rel[..., 0:1] + c * px - s * py; Y = rel[..., 1:2] + s * px + c * py
             Y = torch.where(mirror[:, None, None], -Y, Y)
             x = raster(X, Y, ok)
+        if self.anchor_now:                 # the clearance probe: its own targets / mask (no 'there', mirror-invariant)
+            return x, ego, self.tgt[rows], self.msk[rows], None
         tg = self.tgt[rows]
         tg = torch.where(mirror[:, None, None], tg * torch.tensor([1.0, -1.0], device=DEV), tg)
         return x, ego, tg, self.msk[rows], self.there[rows]
+
+    def qpoints(self, rows, mirror=None):
+        """this decision's plan points in the car frame now (n, 10, 2) -- the clearance probe's query points"""
+        t, b = self.t[rows], self.b[rows]
+        if mirror is None:
+            mirror = torch.zeros(rows.numel(), dtype=torch.bool, device=DEV)
+        return anchors_of(self.pl[t, b], self.st[t, b], mirror)
 
 
 def opp_loss(out, tg, msk, there):
@@ -349,7 +498,7 @@ def run_opp(kind, out_dir, bases):
     data = OppData(D, angles, tgt, msk, meta)
     del D
     beams = data.scan.shape[-1]
-    net = OppNet(kind, beams, data.geo).to(DEV)
+    net = make_opp_net(kind, beams, data.geo).to(DEV)
     n_par = sum(p.numel() for p in net.parameters())
     tr = torch.as_tensor(np.nonzero(~val)[0], device=DEV); va = torch.as_tensor(np.nonzero(val)[0], device=DEV)
     g_tr = torch.Generator(device=DEV); g_tr.manual_seed(1)
@@ -390,7 +539,7 @@ def run_opp(kind, out_dir, bases):
     g = torch.Generator(device=DEV); g.manual_seed(11)
     P, Lg = opp_predict(net, data, va, gen=g)
     res = dict(pred=P, logit=Lg)
-    if kind == "bev10":
+    if kind in ("bev10", "pts5"):
         # the noise-free model read with noisy odometry (robustness without training on it)
         net.noise = 1.0; g.manual_seed(11)
         res["pred_noisy_in"], _ = opp_predict(net, data, va, gen=g); net.noise = 0.0
@@ -398,7 +547,8 @@ def run_opp(kind, out_dir, bases):
     r1 = va[:1]
     x1, e1, _, _, _ = data.batch(net, r1)
     net.eval()
-    fl = flops_of(net, x1, e1)
+    with torch.no_grad():
+        fl = flops_of(net, x1, e1)
     if kind == "polar_gru" and flops_of(net.gru, torch.zeros(1, 10, 258, device=DEV)) == 0:
         fl += 10 * 2 * 3 * (256 + 2 + 256) * 256        # the GRU's gates (FlopCounterMode does not count cudnn's GRU)
     fl_stream = fl
@@ -415,6 +565,207 @@ def run_opp(kind, out_dir, bases):
                    peak_gpu_mb=torch.cuda.max_memory_allocated() / 2 ** 20),
               open(os.path.join(out_dir, f"opp_{kind}.json"), "w"), indent=1)
     log(f"[{kind}] 끝: FLOPs {fl / 1e6:.1f} M, batch 1 {ms_net:.2f} ms (입력 만들기 포함 {ms_all:.2f} ms), GPU 최고 {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MB")
+
+
+
+# ---------------------------------------------------------------------------------------------- clearance precision probe
+# (11-25, net_redesign_v2 §5.2) how exactly does each front end read free space AT the plan's points? For each decision and
+# each plan point k = 1..10 (the plan this decision drew, `pl`, in the car frame now -- with exact execution the car is there
+# at t + 0.1 k for k = 1; later points are re-planned, see the note in the table), the signed gap from the point to the
+# nearest box edge (footprints from the record's fp_<shape>, poses static) and to the nearest wall (the walls-only EDT,
+# bilinear on its 1.25 cm grid), both clipped to [-0.5, 2] m. Solo box sessions (line3), split by box layout as the box probe.
+# Models (query points given as input): clr_polar_gru (today: pooled vector + points), clr_bev10 (pooled vector + points),
+# clr_bev10b (the same CNN read bilinearly at the points: 0.25 / 0.5 / 1 m feature maps), clr_pts5 (queries at the points).
+CLR_CLIP = (-0.5, 2.0)
+
+
+def load_clr(bases):
+    per_sess = ("mount", "run", "idx", "bxy", "byaw", "bhs", "blive")
+    L = {}; angles = wall = None
+    for r, b in enumerate(bases):
+        m = np.load(b + ".npz"); s = np.load(b + "_scan.npz"); v = np.load(b + "_boxvis.npz")
+        T, B = s["scan"].shape[:2]
+        sid0, pose0 = m["sid"][0], m["pose"][0]
+        assert (m["sid"][-1] == sid0).all() and np.allclose(m["pose"][-1], pose0, atol=1e-4), "boxes moved"
+        hs = np.zeros(sid0.shape + (2,), np.float32)
+        for k in np.unique(sid0[sid0 >= 0]):
+            hs[sid0 == k] = np.abs(m[f"fp_{k}"]).max(0)
+        d = dict(scan=s["scan"], ego=s["ego"], mount=s["mount"], st=m["st"][:T + 1, :, :3].astype(np.float32), rs=m["rs"][:T],
+                 pl=m["pl"][:T].astype(np.float32), view=v["view"][:T], bxy=pose0[..., :2].astype(np.float32),
+                 byaw=pose0[..., 2].astype(np.float32), bhs=hs, blive=sid0 >= 0,
+                 run=np.full(B, r, np.int16), idx=np.arange(B, dtype=np.int16))
+        if angles is None:
+            angles = s["angles"]
+            wall = (m["edt"].astype(np.float32), float(m["t_res"][0]), float(m["t_origin"][0, 0]), float(m["t_origin"][0, 1]),
+                    int(m["t_H"][0]), int(m["t_W"][0]))
+            assert int(m["t_off"].shape[0]) == 1, "one track"
+        for k, x in d.items():
+            L.setdefault(k, []).append(x)
+        log(f"기록 {b}: 결정 {T} x 세션 {B}")
+    return {k: np.concatenate(x, 0 if k in per_sess else 1) for k, x in L.items()}, angles, wall
+
+
+def edt_bilinear(P, wall):
+    """walls-only distance [m] at world points P (..., 2), bilinear between the EDT's cell centres (outside the grid = 0)"""
+    edt, res, ox, oy, H, W = wall
+    fx = (P[..., 0] - ox) / res; fy = (P[..., 1] - oy) / res
+    c0 = np.floor(fx).astype(np.int64); r0 = np.floor(fy).astype(np.int64)
+    wx = (fx - c0).astype(np.float32); wy = (fy - r0).astype(np.float32)
+
+    def at(r_, c_):
+        ins = (r_ >= 0) & (r_ < H) & (c_ >= 0) & (c_ < W)
+        return np.where(ins, edt[np.clip(r_, 0, H - 1) * W + np.clip(c_, 0, W - 1)], 0.0)
+    return ((1 - wx) * (1 - wy) * at(r0, c0) + wx * (1 - wy) * at(r0, c0 + 1)
+            + (1 - wx) * wy * at(r0 + 1, c0) + wx * wy * at(r0 + 1, c0 + 1)).astype(np.float32)
+
+
+def clr_samples(D, wall):
+    scan = D["scan"]; T, B = scan.shape[:2]
+    brk = D["rs"].astype(bool)
+    cb = np.concatenate([np.zeros((1, B), np.int64), np.cumsum(brk, 0)], 0)
+    t = np.arange(HIST, T)
+    clean = (cb[t] - cb[t - HIST]) == 0
+    tt, bb = np.nonzero(clean); tt = t[tt]
+    P = D["pl"][tt, bb]                                                       # (S, 10, 2) world
+    gb = np.empty(P.shape[:2], np.float32); cn = np.empty(P.shape[:2], np.int64)
+    for i0 in range(0, len(tt), 20000):                                       # in pieces (S x 10 x C)
+        sl = slice(i0, i0 + 20000); b_ = bb[sl]
+        d = P[sl, :, None, :] - D["bxy"][b_][:, None]
+        c, s_ = np.cos(D["byaw"][b_])[:, None], np.sin(D["byaw"][b_])[:, None]
+        lx = np.abs(d[..., 0] * c + d[..., 1] * s_) - D["bhs"][b_][:, None, :, 0]
+        ly = np.abs(-d[..., 0] * s_ + d[..., 1] * c) - D["bhs"][b_][:, None, :, 1]
+        sd = np.hypot(np.maximum(lx, 0), np.maximum(ly, 0)) + np.minimum(np.maximum(lx, ly), 0)
+        sd = np.where(D["blive"][b_][:, None], sd, np.inf)
+        gb[sl] = sd.min(2); cn[sl] = sd.argmin(2)
+    gw = edt_bilinear(P, wall)
+    vis = D["view"][tt[:, None], bb[:, None], cn]                              # the nearest box in view now
+    tgt = np.stack([np.clip(gb, *CLR_CLIP), np.clip(gw, *CLR_CLIP)], -1).astype(np.float32)
+    msk = np.ones(P.shape[:2], bool)
+    st = D["st"]
+    real = np.stack([np.linalg.norm(st[np.minimum(tt + k, T), bb, :2] - P[:, k - 1], axis=-1) for k in range(1, 11)], 1)
+    meta = dict(t=tt, b=bb, run=D["run"][bb], idx=D["idx"][bb], vis=vis, real=real.astype(np.float32),
+                gb_raw=gb, gw_raw=gw)
+    return tgt, msk, meta
+
+
+class ClrNet(nn.Module):
+    BASE = {"clr_polar_gru": "polar_gru", "clr_bev10": "bev10", "clr_bev10b": "bev10", "clr_pts5": "pts5"}
+
+    def __init__(self, ckind, beams):
+        super().__init__()
+        self.ckind, self.kind, self.noise = ckind, self.BASE[ckind], 0.0
+        if ckind == "clr_polar_gru":
+            self.enc = Enc1D(3, beams); self.gru = nn.GRU(256 + 2, 256, batch_first=True)
+            self.head = mlp_head(256 + 256 + 20 + 20, 20)
+        elif ckind == "clr_bev10":
+            self.N = 10; self.enc = Enc2D(10); self.head = mlp_head(256 + 20 + 20, 20)
+        elif ckind == "clr_bev10b":
+            self.N = 10; self.enc = Enc2D(10)
+            self.pt = mlp_head(32 + 64 + 128 + 16 + 20, 2)
+        else:
+            self.pts = PtsNet(5, q_out=2, ego_out=0); self.K = self.N = 5
+
+    def forward(self, x, ego, qp):
+        n = ego.shape[0]; e = ego.reshape(n, -1).float(); qf = qp.reshape(n, -1).float() / 5.0
+        if self.ckind == "clr_polar_gru":
+            f = self.enc(x.reshape(n * 10, 3, -1).float()).view(n, 10, 256)
+            h, _ = self.gru(torch.cat([f, ego.flip(1).float()], -1))
+            return self.head(torch.cat([h[:, -1], f[:, -1], e, qf], 1)).view(n, 10, 2)
+        if self.ckind == "clr_bev10":
+            return self.head(torch.cat([self.enc(x.float()), e, qf], 1)).view(n, 10, 2)
+        if self.ckind == "clr_bev10b":
+            maps, z = [], x.float()
+            for i, layer in enumerate(self.enc.conv):
+                z = layer(z)
+                if i in (1, 5, 7):                     # 0.25 m (32 ch), 0.5 m (64 ch), 1 m (128 ch) feature maps
+                    maps.append(z)
+                if i == 7:
+                    break
+            qq = qp.float()
+            g = torch.stack([2 * (qq[..., 1] - GY0) / (GW * RES) - 1, 2 * (qq[..., 0] - GX0) / (GH * RES) - 1], -1)[:, :, None]
+            fs = [F.grid_sample(mp, g.to(mp.dtype), mode="bilinear", align_corners=False)[..., 0].transpose(1, 2) for mp in maps]
+            z = torch.cat(fs + [fourier(qq).to(fs[0].dtype), e[:, None].expand(n, 10, 20).to(fs[0].dtype)], -1)
+            return self.pt(z)
+        return self.pts(x, ego).view(n, 10, 2)
+
+
+def run_clr(kind, out_dir, bases):
+    torch.manual_seed(0); np.random.seed(0)
+    D, angles, wall = load_clr(bases)
+    tgt, msk, meta = clr_samples(D, wall)
+    lay = meta["idx"].astype(int) % 64
+    val = (lay % 5) == 4
+    if os.environ.get("REPR_VAL_MOD"):
+        val = (meta["idx"].astype(int) % int(os.environ["REPR_VAL_MOD"])) == 0
+    log(f"[{kind}] 표본 {len(val)} (검증 {val.mean() * 100:.1f} %), 상자 틈 중앙 {np.median(tgt[..., 0]):.2f} m (< 0.3 m {np.mean(tgt[..., 0] < 0.3) * 100:.1f} %), "
+        f"벽 틈 중앙 {np.median(tgt[..., 1]):.2f} m (< 0.3 m {np.mean(tgt[..., 1] < 0.3) * 100:.1f} %), plan 점과 실제 자리 차 중앙 k=1 "
+        f"{np.median(meta['real'][:, 0]) * 100:.1f} cm / k=10 {np.median(meta['real'][:, 9]) * 100:.1f} cm")
+    data = OppData(D, angles, tgt, msk, meta); data.anchor_now = True
+    del D
+    net = ClrNet(kind, data.scan.shape[-1]).to(DEV)
+    n_par = sum(p.numel() for p in net.parameters())
+    tr = torch.as_tensor(np.nonzero(~val)[0], device=DEV); va = torch.as_tensor(np.nonzero(val)[0], device=DEV)
+    opt = torch.optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-4)
+    steps_ep = tr.numel() // BATCH; total = EPOCHS * steps_ep
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=total, pct_start=0.05, final_div_factor=100.0)
+    log(f"[{kind}] 매개변수 {n_par:,}, 학습 {tr.numel()}, 검증 {va.numel()}, {EPOCHS} epoch x {steps_ep}")
+    sub_tr = tr[torch.randperm(tr.numel(), device=DEV)[:20000]]
+
+    def predict(rows, bs=128):
+        net.eval(); P_ = []
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for i in range(0, rows.numel(), bs):
+                r = rows[i:i + bs]
+                x, ego, _, _, _ = data.batch(net, r)
+                P_.append(net(x, ego, data.qpoints(r)).float().cpu())
+        net.train()
+        return torch.cat(P_).numpy()
+
+    def errs(P_, ri):
+        e = np.abs(P_ - tgt[ri])
+        o = {}
+        for j, nm in ((0, "box"), (1, "wall")):
+            g = tgt[ri][..., j]
+            o[f"{nm}_med"] = float(np.median(e[..., j][g < CLR_CLIP[1]])); o[f"{nm}_near"] = float(np.median(e[..., j][g < 0.3]))
+        return o
+    curves = []; t0 = time.time()
+    for ep in range(EPOCHS):
+        perm = tr[torch.randperm(tr.numel(), device=DEV)]; tl = []
+        for i in range(steps_ep):
+            r = perm[i * BATCH:(i + 1) * BATCH]
+            mir = torch.rand(r.numel(), device=DEV) < 0.5
+            x, ego, tg, _, _ = data.batch(net, r, mir)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = net(x, ego, data.qpoints(r, mir))
+            loss = F.huber_loss(out.float(), tg, delta=0.05)
+            opt.zero_grad(set_to_none=True); loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step(); sch.step()
+            tl.append(float(loss))
+        row = {"epoch": ep + 1, "train_loss": float(np.mean(tl)), "s": time.time() - t0}
+        row.update({f"val_{k}": v for k, v in errs(predict(va), va.cpu().numpy()).items()})
+        row.update({f"trsub_{k}": v for k, v in errs(predict(sub_tr), sub_tr.cpu().numpy()).items()})
+        curves.append(row)
+        log(f"[{kind}] epoch {ep + 1}: 손실 {row['train_loss']:.5f} | 검증 상자 {row['val_box_med'] * 100:.1f} cm (가까움 "
+            f"{row['val_box_near'] * 100:.1f}), 벽 {row['val_wall_med'] * 100:.1f} cm (가까움 {row['val_wall_near'] * 100:.1f}) | 학습 일부 상자 "
+            f"{row['trsub_box_med'] * 100:.1f} 벽 {row['trsub_wall_med'] * 100:.1f} cm | {row['s']:.0f} s")
+    P_ = predict(va)
+    r1 = va[:1]
+    x1, e1, _, _, _ = data.batch(net, r1); q1 = data.qpoints(r1)
+    net.eval()
+    with torch.no_grad():
+        fl = flops_of(net, x1, e1, q1)
+    if kind == "clr_polar_gru" and flops_of(net.gru, torch.zeros(1, 10, 258, device=DEV)) == 0:
+        fl += 10 * 2 * 3 * (256 + 2 + 256) * 256
+    ms_net = latency_ms(lambda: net(x1, e1, q1))
+    ms_all = latency_ms(lambda: net(*data.batch(net, r1)[:2], data.qpoints(r1)))
+    vi = val.nonzero()[0]
+    np.savez_compressed(os.path.join(out_dir, f"{kind}.npz"), pred=P_, tgt=tgt[vi], vis=meta["vis"][vi], real=meta["real"][vi])
+    json.dump(dict(kind=kind, params=n_par, flops=fl, ms_net=ms_net, ms_with_input=ms_all, curves=curves, epochs=EPOCHS,
+                   batch=BATCH, lr=LR, n_train=int(tr.numel()), n_val=int(va.numel()),
+                   peak_gpu_mb=torch.cuda.max_memory_allocated() / 2 ** 20,
+                   real_dev_med_cm=[float(np.median(meta["real"][:, k]) * 100) for k in range(10)]),
+              open(os.path.join(out_dir, f"{kind}.json"), "w"), indent=1)
+    log(f"[{kind}] 끝: FLOPs {fl / 1e6:.1f} M, batch 1 {ms_net:.2f} ms (입력 포함 {ms_all:.2f} ms), GPU 최고 {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MB")
 
 
 # ------------------------------------------------------------------------------------------------------------ box probe
@@ -541,6 +892,10 @@ class SpatialMem:
     def reset(self, rows):
         self.last[rows] = -1e9; self.pose[rows] = 0.0
 
+    def advance(self, inc, rr):
+        """the 0.1 s increment (n, 3) of each session's dead-reckoned pose; rr (n,) rows just restarted keep pose 0"""
+        self.pose = torch.where(rr[:, None], self.pose, se2_compose(self.pose, inc))
+
     def to_cell(self, X, Y):
         """car-frame points (n, ...) -> flat cell index in the dead-reckoned grid, in-grid mask"""
         p = self.pose
@@ -567,6 +922,62 @@ class SpatialMem:
         hit = (last > -1e8) & (last < t) & inb
         rec = torch.where(hit, torch.exp(-(t - last) / 50.0), torch.zeros_like(last))
         return torch.stack([hit.float(), rec], 1)
+
+
+
+class PointMem:
+    """(11-25, net_redesign_v2 §5.3) a dead-reckoned POINT memory: M points per session kept in the car frame and moved by
+    every 0.1 s increment (exact SE(2), no re-sampling, never matched against the scan), written FIFO from the newest scan
+    sub-sampled 1/8 (every 8th beam's return) with no learned score. `dedup` > 0 (diagnostic variant): a new point within
+    `dedup` m of a stored one refreshes that one instead of taking a FIFO slot. Read out into the same two channels as the
+    grid memory (any point in the cell; recency exp(-(t - written) / 50 decisions)) so the decoder and scoring are identical"""
+
+    def __init__(self, n, M=1024, sub=8, dedup=0.0):
+        self.M, self.sub, self.dedup = M, sub, dedup
+        self.p = torch.zeros(n, M, 2, device=DEV)
+        self.tw = torch.full((n, M), -1e9, device=DEV)
+        self.ptr = torch.zeros(n, dtype=torch.long, device=DEV)
+
+    def reset(self, rows):
+        self.tw[rows] = -1e9; self.ptr[rows] = 0
+
+    def advance(self, inc, rr):
+        c, s_ = torch.cos(inc[:, 2])[:, None], torch.sin(inc[:, 2])[:, None]
+        d = self.p - inc[:, None, :2]
+        new = torch.stack([c * d[..., 0] + s_ * d[..., 1], -s_ * d[..., 0] + c * d[..., 1]], -1)
+        self.p = torch.where(rr[:, None, None], self.p, new)
+
+    def write(self, X, Y, ok, t: int):
+        P = torch.stack([X[:, ::self.sub], Y[:, ::self.sub]], -1); ok = ok[:, ::self.sub].clone()
+        n = P.shape[0]
+        rows = torch.arange(n, device=DEV)[:, None].expand(ok.shape)
+        if self.dedup > 0:
+            live = self.tw > -1e8
+            d2 = torch.cdist(P, self.p).masked_fill(~live[:, None, :], float("inf"))
+            dmin, j = d2.min(2)
+            near = ok & (dmin < self.dedup)
+            self.p[rows[near], j[near]] = P[near]; self.tw[rows[near], j[near]] = float(t)
+            ok = ok & ~near
+        rank = torch.cumsum(ok.long(), 1) - 1
+        slot = (self.ptr[:, None] + rank) % self.M
+        self.p[rows[ok], slot[ok]] = P[ok]; self.tw[rows[ok], slot[ok]] = float(t)
+        self.ptr = (self.ptr + ok.sum(1)) % self.M
+
+    def read(self, t: int):
+        n = self.p.shape[0]
+        live = (self.tw > -1e8) & (self.tw < t)
+        ix = torch.floor((self.p[..., 0] - IX0) / IRES).long(); iy = torch.floor((self.p[..., 1] - IY0) / IRES).long()
+        ok = live & (ix >= 0) & (ix < IH) & (iy >= 0) & (iy < IW)
+        flat = (torch.arange(n, device=DEV)[:, None] * (IH * IW) + ix * IW + iy)[ok]
+        hit = torch.zeros(n * IH * IW, device=DEV); hit[flat] = 1.0
+        rec = torch.zeros(n * IH * IW, device=DEV).scatter_reduce_(0, flat, torch.exp(-(t - self.tw[ok]) / 50.0), "amax")
+        return torch.stack([hit.view(n, IH, IW), rec.view(n, IH, IW)], 1)
+
+
+def make_mem(kind, n):
+    if kind in ("box_ptmem", "box_ptmemd"):
+        return PointMem(n, dedup=0.15 if kind == "box_ptmemd" else 0.0)
+    return SpatialMem(n) if kind in ("box_mem", "box_now") else None
 
 
 class BoxData:
@@ -643,7 +1054,7 @@ def stream(net, data, sess, train, noise=0.0, opt=None, sch=None, gen=None, keep
     n = sess.numel(); T = data.T
     kind = net.kind
     h = torch.zeros(n, 256, device=DEV)
-    mem = SpatialMem(n) if kind in ("box_mem", "box_now") else None
+    mem = make_mem(kind, n)
     out_rows, losses = [], []
     for t0 in range(0, T, CHUNK):
         ts = list(range(t0, min(t0 + CHUNK, T)))
@@ -682,10 +1093,10 @@ def stream(net, data, sess, train, noise=0.0, opt=None, sch=None, gen=None, keep
                             rr = data.rs[t - 1, sess]
                             if bool(rr.any()):
                                 mem.reset(rr.nonzero()[:, 0])
-                            mem.pose = torch.where(rr[:, None], mem.pose, se2_compose(mem.pose, mem_inc(data, t, sess, noise, gen)))
+                            mem.advance(mem_inc(data, t, sess, noise, gen), rr)
                         cur = data.scan_now(t, sess)
                         if t % stride == 0 or not train:
-                            m2 = mem.read(t) if kind == "box_mem" else torch.zeros(n, 2, IH, IW, device=DEV)
+                            m2 = mem.read(t) if kind != "box_now" else torch.zeros(n, 2, IH, IW, device=DEV)
                             crops.append(torch.cat([m2, cur], 1).to(torch.bfloat16)); tsel.append(t)
                         X, Y, ok = data.geo.points(data.scan[t, sess][:, None], data.mount[sess])
                         mem.write(X[:, 0], Y[:, 0], ok[:, 0], t)
@@ -830,7 +1241,7 @@ def run_box(kind, out_dir, bases):
         curves.append(row)
     thr = best_thr(evaluate(sub_tr, noise_tr), sub_tr)
     res = {}
-    for nz in ((0.0, 0.5, 1.0, 2.0) if base_kind == "box_mem" else (0.0,)):
+    for nz in ((0.0, 0.5, 1.0, 2.0) if base_kind in ("box_mem", "box_ptmem", "box_ptmemd") else (0.0,)):
         rows = evaluate(va_s, nz)
         sc = box_score(rows, tgt, age, neutral, rel, va_s, thr)
         res[f"n{nz:g}"] = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in sc.items()}
@@ -848,10 +1259,10 @@ def run_box(kind, out_dir, bases):
     else:
         x1 = torch.zeros(1, 3, IH, IW, device=DEV)
         fl = flops_of(net.unet, x1)
-        m1 = SpatialMem(1); s1 = torch.as_tensor([0], device=DEV)
+        m1 = make_mem(base_kind, 1) or SpatialMem(1); s1 = torch.as_tensor([0], device=DEV)
 
         def one():
-            m1.pose = se2_compose(m1.pose, mem_inc(data, 5, s1, 0.0, None))
+            m1.advance(mem_inc(data, 5, s1, 0.0, None), torch.zeros(1, dtype=torch.bool, device=DEV))
             cur = data.scan_now(5, s1)
             X, Y, ok = data.geo.points(data.scan[5, s1][:, None], data.mount[s1])
             m1.write(X[:, 0], Y[:, 0], ok[:, 0], 5)
@@ -869,10 +1280,14 @@ def run_box(kind, out_dir, bases):
 OPP_NAMES = [("polar_gru", "극좌표 스캔 + GRU 10결정 (지금 policy 방식)"), ("polar_stack5", "극좌표 5장 겹침 (GRU 없음)"),
              ("polar_stack10", "극좌표 10장 겹침 (GRU 없음)"), ("polar_wide10", "극좌표 10장 겹침, 채널 4배 (계산량 대조)"),
              ("bev5", "위에서 본 격자 5장 (참 자세)"), ("bev10", "위에서 본 격자 10장 (참 자세)"),
-             ("bev10_noise", "위에서 본 격자 10장 (거리계 잡음으로 학습·평가)")]
+             ("bev10_noise", "위에서 본 격자 10장 (거리계 잡음으로 학습·평가)"),
+             ("pts5", "점 토큰 5장 + 시간 query (참 자세)"), ("pts10", "점 토큰 10장 + 시간 query (참 자세)"),
+             ("pts5_noise", "점 토큰 5장 + 시간 query (거리계 잡음으로 학습·평가)")]
 REF_NAMES = [("head", "라이브 policy 머리 (race33b u925, 같은 결정)"), ("still", "[참값] 지금 자리에 그대로 선다고 봄"),
              ("cv", "[참값] 지금 자리 + 참 속도로 직진"), ("oracle", "[참값] 상대 복사본 자신의 plan")]
-BOX_NAMES = [("box_gru", "극좌표 스캔 + GRU (세션 전체, 지금 policy 방식)"), ("box_bevgru", "지금 스캔 격자 CNN + GRU (세션 전체)"), ("box_now", "지금 스캔만 격자로 (기억 없음: 바닥선)"),
+BOX_NAMES = [("box_ptmem_noise", "점 기억 1024점, 새 스캔 1/8 FIFO (거리계 잡음으로 학습)"),
+             ("box_ptmemd_noise", "점 기억 1024점, 0.15 m 안 점은 갱신 + FIFO (진단, 잡음으로 학습)"),
+             ("box_gru", "극좌표 스캔 + GRU (세션 전체, 지금 policy 방식)"), ("box_bevgru", "지금 스캔 격자 CNN + GRU (세션 전체)"), ("box_now", "지금 스캔만 격자로 (기억 없음: 바닥선)"),
              ("box_mem", "자기 움직임으로 옮기는 격자 기억 (참 움직임으로 학습)"), ("box_mem_noise", "같은 격자 기억 (거리계 잡음으로 학습)")]
 
 
@@ -897,6 +1312,8 @@ def table(out_dir):
         rows += [(n, R[k]["pred"], R[k]["logit"]) for k, n in have]
         if "bev10" in R and "pred_noisy_in" in R["bev10"].files:
             rows.append(("위에서 본 격자 10장, 참 자세로 학습 -> 잡음 자세로 평가", R["bev10"]["pred_noisy_in"], None))
+        if "pts5" in R and "pred_noisy_in" in R["pts5"].files:
+            rows.append(("점 토큰 5장, 참 자세로 학습 -> 잡음 자세로 평가", R["pts5"]["pred_noisy_in"], None))
         pr(f"(1) 상대 차 위치 예측 오차 [m] -- 따로 둔 세션의 '있음' 결정만 (0.5 s: {int((th & msk[:, 4]).sum())}개, 1.0 s: {int((th & msk[:, 9]).sum())}개)")
         pr(f"{'입력 / 모형':<52} | 0.1 s 중앙 / p90 | 0.5 s 중앙 / p90 | 1.0 s 중앙 / p90 | '있음' AUC")
         for n, P, sc in rows:
@@ -943,6 +1360,26 @@ def table(out_dir):
             best = min(c, key=lambda r: r["val_med10"])
             pr(f"  {n}: " + ", ".join(f"{r['epoch']}: {r['val_med10']:.2f}/{r['trsub_med10']:.2f}" for r in pick)
                + f" | 가장 좋은 검증 {best['val_med10']:.2f} (epoch {best['epoch']})")
+    CLR_NAMES = [("clr_polar_gru", "극좌표 스캔 + GRU (지금 방식; 묶은 벡터 + 점 좌표)"), ("clr_bev10", "격자 10장, 묶은 벡터 + 점 좌표"),
+                 ("clr_bev10b", "격자 10장, plan 점에서 특징 지도 쌍선형 읽기"), ("clr_pts5", "점 토큰 5장, plan 점에 query")]
+    hc = [(k, n) for k, n in CLR_NAMES if os.path.exists(os.path.join(out_dir, f"{k}.npz"))]
+    if hc:
+        pr("")
+        pr("(3) plan 점의 빈 공간 정밀도 -- 이 결정의 plan 10점에서 가장 가까운 상자 모서리 / 벽까지의 부호 있는 틈 [cm], 따로 둔 상자 배치의 세션")
+        pr(f"{'모형':<46} | 상자 중앙/p90 | 상자 <0.3m 중앙/p90 | 상자(지금 보임) 중앙 | 벽 중앙/p90 | 벽 <0.3m 중앙/p90 | MFLOP | ms 망/입력 포함")
+        for k, n in hc:
+            z = np.load(os.path.join(out_dir, f"{k}.npz")); j = json.load(open(os.path.join(out_dir, f"{k}.json")))
+            e = np.abs(z["pred"] - z["tgt"]) * 100; g = z["tgt"]
+            def mp(m_, jj):
+                v = e[..., jj][m_]
+                return f"{np.median(v):5.1f} / {np.percentile(v, 90):5.1f}" if v.size else "   -  "
+            cl = g[..., 0] < CLR_CLIP[1]
+            pr(f"{n:<46} | {mp(cl, 0)} | {mp(g[..., 0] < 0.3, 0):>17} | {np.median(e[..., 0][cl & z['vis']]):8.1f}           | "
+               f"{mp(g[..., 1] < CLR_CLIP[1], 1)} | {mp(g[..., 1] < 0.3, 1):>15} | {j['flops'] / 1e6:6.1f} | {j['ms_net']:.2f} / {j['ms_with_input']:.2f}")
+        z = np.load(os.path.join(out_dir, f"{hc[0][0]}.npz")); g = z["tgt"]
+        pr(f"(점 수: 상자 틈 < 2 m {int((g[..., 0] < CLR_CLIP[1]).sum())}, < 0.3 m {int((g[..., 0] < 0.3).sum())}; 벽 < 0.3 m {int((g[..., 1] < 0.3).sum())}. "
+           f"plan 점과 실제로 그 시각 차가 있던 자리의 차 중앙: k=1 {np.median(z['real'][:, 0]) * 100:.1f} cm, k=5 {np.median(z['real'][:, 4]) * 100:.1f} cm, "
+           f"k=10 {np.median(z['real'][:, 9]) * 100:.1f} cm -- 매 결정 다시 그리므로 k ≥ 2는 실제 자리와 다름: 타깃은 plan 점 자체)")
     hb = [(k, n) for k, n in BOX_NAMES if os.path.exists(os.path.join(out_dir, f"box_{k}.json"))]
     if hb:
         pr("")
@@ -987,6 +1424,9 @@ if __name__ == "__main__":
     elif mode == "box":
         os.makedirs(sys.argv[3], exist_ok=True)
         run_box(sys.argv[2], sys.argv[3], sys.argv[4:])
+    elif mode == "clr":
+        os.makedirs(sys.argv[3], exist_ok=True)
+        run_clr(sys.argv[2], sys.argv[3], sys.argv[4:])
     elif mode == "table":
         table(sys.argv[2])
     else:
