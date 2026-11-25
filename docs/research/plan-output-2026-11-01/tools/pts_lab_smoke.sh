@@ -2,6 +2,7 @@
 # (11-25) plan_rl --arch pts smoke on the lab PC: two ranks of --dist-world 2 on its one GPU, small env counts, a few updates,
 # from scratch, the proposed pts1a flags otherwise (copies join early, scenes from the start, so every path runs).
 # usage (on the lab, from the code copy's root): bash docs/research/plan-output-2026-11-01/tools/pts_lab_smoke.sh NAME [ENVS0 ENVS1 UPDATES HORIZON EXTRA...]
+#   ENVS1 = 0: one process, no --dist-world (when the lab's GPU has room for one only)
 # Refuses while an exam runs; one 10 GB scope for both ranks; a watchdog stops both (by PID) below 3 GB of available RAM.
 N=${1:?name}; E0=${2:-48}; E1=${3:-32}; U=${4:-6}; H=${5:-16}; shift $(( $# < 5 ? $# : 5 )); EXTRA=("$@")
 R=$(cd "$(dirname "$0")/../../../.." && pwd)
@@ -22,10 +23,15 @@ A=(--world $W --arch pts --updates $U --horizon $H --epochs 4 --minibatches 2 --
    --scene-replay 0.25 --scene-lag 20 --scene-size 1024 --live-tap 0 --live-taps 2 --scene-keep-unsolved --scene-episode-s 13
    --scene-from 0 --self-opp 1.0 --self-opp-every 2 --self-opp-pace 0.5,0.95,0.2 --scene-copies --scene-near-miss --car-fault
    --plan-car-cost 0.1 --plan-car-margin 0.05 --plan-car-w-end 0.3 --removal-p 0.5 --opp-present-ramp 0,3
-   --pts-odom-noise 1.0 --free-lr 3e-4 --free-epochs 1 --save-every 3 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT ${EXTRA[*]})
-/usr/bin/time -v $PY -u -W ignore -m f1sim.learn.plan_rl --name $N --envs $E1 --dist-rank 1 "\${A[@]}" > $O/${N}_r1.log 2>&1 &
-P1=\$!
-/usr/bin/time -v $PY -u -W ignore -m f1sim.learn.plan_rl --name $N --envs $E0 --dist-rank 0 "\${A[@]}" > $O/${N}_r0.log 2>&1 &
+   --pts-odom-noise 1.0 --free-lr 3e-4 --free-epochs 1 --save-every 3 ${EXTRA[*]})
+if [ $E1 -gt 0 ]; then
+  /usr/bin/time -v $PY -u -W ignore -m f1sim.learn.plan_rl --name $N --envs $E1 --dist-rank 1 --dist-world 2 --dist-init tcp://127.0.0.1:$PORT "\${A[@]}" > $O/${N}_r1.log 2>&1 &
+  P1=\$!
+  DW="--dist-world 2 --dist-init tcp://127.0.0.1:$PORT"
+else
+  P1=""; DW=""; echo "one process" > $O/${N}_r1.log
+fi
+/usr/bin/time -v $PY -u -W ignore -m f1sim.learn.plan_rl --name $N --envs $E0 --dist-rank 0 \$DW "\${A[@]}" > $O/${N}_r0.log 2>&1 &
 P0=\$!
 while kill -0 \$P0 2>/dev/null || kill -0 \$P1 2>/dev/null; do
   AV=\$(awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo)
