@@ -51,7 +51,13 @@ OK): race4 + 상대 차 예측 머리가 있는 checkpoint(plan_rl --pred-opp)�
     복사본의 plan을 우리 결정보다 먼저 만듦(복사본은 우리 plan을 안 읽어 값은 같음). 나머지는 보통 exam4 그대로.
   PROBE: 주행은 그대로(기록이 보통 exam4와 비트까지 같아야 함). 결정마다 같은 입력으로 policy를 더 돌려 예측만 바꿨을 때 plan이 얼마나
     움직이나: 예측 점 0.5 m 왼쪽 / 오른쪽 / 앞 / 뒤, P(보임) = 없음; 기준 = 우리 속도 입력(마지막 명령 속도 + 지난 plan 속도 10개) +0.5 m/s,
-    지난 plan 9점 0.5 m 왼쪽. 같은 입력으로 다시 돈 plan이 몬 plan과 같은지도 남김(base_err). 분석은 pred_check.py."""
+    지난 plan 9점 0.5 m 왼쪽. 같은 입력으로 다시 돈 plan이 몬 plan과 같은지도 남김(base_err). 분석은 pred_check.py.
+  SAVE (11-25, LiDAR 표현 시험 lidar_repr_test.py): 주행은 그대로, 머리의 예측·P(보임)·'있음'·거리·오라클만 남김 (교란 추가 계산 없음).
+F1SIM_EXAM4_PACES="a,b,c,d" (11-25, 표현 시험용 기록이지 exam4 점수가 아님): race4의 상대 페이스 4가지를 바꿈 (기본 0.6,0.8,0.95,1.0).
+F1SIM_EXAM_SAVE_SCAN=1이면 `_scan.npz`에 결정마다 우리 차의 참 속도·옆속도·회전 속도(ego: vx, vy, r)도 남김 (11-25).
+F1SIM_EXAM_SAVE_BOXVIS=1 (11-25, 상자 기억 시험): 결정마다 상자 칸마다 트랙 따라 앞 거리(plan_rl.box_along, 학습의 벽 기준 거리장 -- 타깃
+정의용이지 입력이 아님)·살아 있음·지금 LiDAR에 보이나(plan_rl.boxes_in_view: 거리·시야각·벽에 안 가림)를 `_boxvis.npz`에 남김.
+F1SIM_EXAM_ALL_BOXES=1 (11-25, line3): 모든 세션에 은행 배치를 차례로 깜 (기본은 리셋 추첨이 상자를 준 절반만)."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -126,7 +132,12 @@ CORRIDOR = os.environ.get("F1SIM_EXAM_CORRIDOR", "") == "1"
 # passes with the prediction perturbed, driving unchanged (PROBE); see the docstring
 PRED_ORACLE = os.environ.get("F1SIM_EXAM_PRED_ORACLE", "") == "1"
 PRED_PROBE = os.environ.get("F1SIM_EXAM_PRED_PROBE", "") == "1"
-assert not (PRED_ORACLE and PRED_PROBE), "F1SIM_EXAM_PRED_ORACLE or F1SIM_EXAM_PRED_PROBE, not both"
+# (11-25) the head's prediction, 'there' and the oracle recorded, driving unchanged and no extra passes (lidar_repr_test.py)
+PRED_SAVE = os.environ.get("F1SIM_EXAM_PRED_SAVE", "") == "1"
+assert (PRED_ORACLE + PRED_PROBE + PRED_SAVE) <= 1, "one of F1SIM_EXAM_PRED_ORACLE / _PROBE / _SAVE"
+# (11-25) the box memory probe: every box slot's along-track distance ahead, live, in view now (boxes_in_view)
+SAVE_BOXVIS = os.environ.get("F1SIM_EXAM_SAVE_BOXVIS", "") == "1"
+ALL_BOXES = os.environ.get("F1SIM_EXAM_ALL_BOXES", "") == "1"   # line3: a bank layout in every session
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -193,6 +204,9 @@ if RACE4:
     REF = os.path.expanduser(os.environ.get("F1SIM_EXAM_REF", "~/f1sim_runs/exam4_ref/plan_u500.pt"))
     PER = int(os.environ.get("F1SIM_EXAM4_PER", "8"))
     C_PACES = (0.6, 0.8, 0.95, 1.0)
+    if os.environ.get("F1SIM_EXAM4_PACES"):                 # (11-25) another set of 4 paces (not exam4's score)
+        C_PACES = tuple(float(x) for x in os.environ["F1SIM_EXAM4_PACES"].split(","))
+        assert len(C_PACES) == 4, C_PACES
     assert os.path.isdir(BANK), BANK
 a = argparse.Namespace(**json.load(open(WORLD)))
 if RACE4:
@@ -332,7 +346,7 @@ po = env.procedural
 if LINE3:
     # the races the reset gave boxes are exam1's (the draw takes the same random numbers whatever the bank holds); each gets bank
     # layout 0, 1, 2, ... in learner order, written into every car of its race
-    box_l = lid[(po.p_sid[lid] >= 0).any(1)]
+    box_l = lid if ALL_BOXES else lid[(po.p_sid[lid] >= 0).any(1)]
     n_lay = int(po.b_n[0])
     if box_l.numel() > n_lay:
         print(f"[exam2] 상자 경주 {box_l.numel()}개 > 은행 배치 {n_lay}개: 배치를 되풀이해 씀", flush=True)
@@ -429,7 +443,7 @@ if RACE4:
 others = env.sim.other_idx[lid][:, 0]
 eid = env.sim.eid[lid]
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
-PRED = PRED_ORACLE or PRED_PROBE
+PRED = PRED_ORACLE or PRED_PROBE or PRED_SAVE
 if PRED:
     assert RACE4 and so is not None and getattr(actor, "pred_opp", False), "PRED_ORACLE / PRED_PROBE: race4 and a pred_opp checkpoint"
     assert getattr(actor, "branches", 1) == 1 and not getattr(actor, "pace_levels", 0) and not ROLL and not SLIP
@@ -570,7 +584,12 @@ def snap():
 MEM = {"feat": [], "mem": []}
 if SAVE_MEM:
     assert getattr(actor, "memory", 0), "이 checkpoint에는 기억이 없습니다"
-SCN = {"scan": [], "typ": []}
+SCN = {"scan": [], "typ": [], "ego": []}
+BXV = {"ds": [], "live": [], "view": []}
+if SAVE_BOXVIS:
+    assert po is not None, "F1SIM_EXAM_SAVE_BOXVIS: a world with boxes"
+    from f1sim.learn.plan_rl import box_along as _box_along, boxes_in_view as _boxes_in_view
+    _bv_mx = float(_mx) if _mx else 0.297; _bv_rmax = float(env.cfg.lidar.range_max)
 VAL = {"priv": [], "value": []}
 if SAVE_VALUE:
     from f1sim.learn.plan_policy import Critic
@@ -606,6 +625,11 @@ for kd in range(T):
         MEM["feat"].append(torch.cat([actor.enc(obs.scans), actor.norm(obs.state())], 1).half().cpu())
     if SAVE_SCAN:
         SCN["scan"].append(obs.scans[:, 0].half().cpu()); SCN["typ"].append(env.last_result.scan_type[lid].to(torch.uint8).cpu())
+        SCN["ego"].append(st[:, [dyn.IVX, dyn.IVY, dyn.IR]].float().cpu())
+    if SAVE_BOXVIS:
+        _ds, _lv, _ps = _box_along(env, pr.goal, lid)
+        BXV["ds"].append(_ds.half().cpu()); BXV["live"].append(_lv.cpu())
+        BXV["view"].append(_boxes_in_view(env, lid, _ps, _lv, _bv_mx, _bv_rmax).cpu())
     if SAVE_VALUE:
         _pv = priv_now()
         VAL["priv"].append(_pv.half().cpu()); VAL["value"].append(critic(obs.scans, obs.state(), _pv).float().cpu())
@@ -769,8 +793,9 @@ for kd in range(T):
         if not PRED_ORACLE:                                     # (ORACLE: made before our decision)
             so.plan()
         cf_ = torch.zeros(Bl, device=dev)
-    if PRED_PROBE:                                              # driving above is done; these passes touch nothing it reads
+    if PRED_PROBE or PRED_SAVE:                                 # driving above is done; these passes touch nothing it reads
         PRD["orc"].append(opp_oracle(st).float().cpu())
+    if PRED_PROBE:
         PRD["probe"].append(probe_all(_scans0, _s0, _h0, cmd_d0, p).cpu())
     for j in range(PS.SUB):
         if mode == "ideal":
@@ -850,7 +875,7 @@ if RACE4:
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else "")); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
+D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else ("save" if PRED_SAVE else ""))); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
@@ -862,7 +887,7 @@ if SAVE_PLAN:
     np.savez_compressed(out_npz[:-4] + "_plan.npz", **{k: torch.stack(v).numpy() for k, v in PLN.items()})
 if PRED:
     _pd = {k: torch.stack(v).numpy() for k, v in PRD.items() if v}
-    _pd.update(mode=np.array("oracle" if PRED_ORACLE else "probe"), pred_range=np.array(PRED_RANGE), seen_s=np.array(SEEN_S),
+    _pd.update(mode=np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else "save")), pred_range=np.array(PRED_RANGE), seen_s=np.array(SEEN_S),
                pace_of=so.pace[O_OF].float().cpu().numpy(), pred_scale=np.array(PRED_SCALE))
     if PRED_PROBE:
         _pd.update(probe_names=np.array([n_ for n_, _, _ in PROBES]), probe_cols=np.array(PCOLS))
@@ -872,7 +897,12 @@ if PRED:
         print(f"[pred probe] 같은 입력으로 다시 돈 plan과 몬 plan의 차 최대: 점 {_be[0]:.2e} m, 속도 {_be[1]:.2e} m/s", flush=True)
 if SAVE_SCAN:
     np.savez_compressed(out_npz[:-4] + "_scan.npz", scan=torch.stack(SCN["scan"]).numpy(), typ=torch.stack(SCN["typ"]).numpy(),
+                        ego=torch.stack(SCN["ego"]).numpy(),
+                        mount=torch.stack([env.sim.P[k_][lid].float() for k_ in ("mount_x", "mount_y", "mount_yaw")], 1).cpu().numpy(),
                         range_max=np.array(obs.range), angles=env.sim.lidar.angles.float().cpu().numpy())
+if SAVE_BOXVIS:
+    np.savez_compressed(out_npz[:-4] + "_boxvis.npz", ds=torch.stack(BXV["ds"]).numpy(), live=torch.stack(BXV["live"]).numpy(),
+                        view=torch.stack(BXV["view"]).numpy(), mount_x=np.array(_bv_mx), rmax=np.array(_bv_rmax))
 c = D["cnt"][-1].sum(0)
 print(f"[{EXAM}{' · 진행 방향 틀(' + SLIP + ')' if SLIP else ''} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
       f"{int(D['rs'].sum())}번, 선 상대 차 다시 출발 {restarter.count if restarter is not None else 0}번 | 누적: "
