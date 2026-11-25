@@ -96,7 +96,7 @@ def strip_reward(monkeypatch, n):
                           corners=torch.tensor([[0.29, 0.155], [0.29, -0.155], [-0.29, -0.155], [-0.29, 0.155]]))
     env = SimpleNamespace(sim=sim, learner_ids=torch.arange(n), last_result=None, procedural=None)
     pr = R.PlanReward(env, 0.995, "cpu")
-    pr.ww_k = K
+    pr.ww_on, pr.ww_k = True, K
     return pr, state
 
 
@@ -161,12 +161,33 @@ def test_push_waiver_lasts_one_second(monkeypatch):
 
 def test_off_by_default_and_costs_nothing(monkeypatch):
     pr, st = strip_reward(monkeypatch, 1)
-    pr.ww_k = 0.0
+    pr.ww_on, pr.ww_k = False, 0.0
     place(st, [1.0], [math.pi], [2.0])
     pr.begin(torch.arange(1))
     place(st, [0.8], [math.pi], [2.0])
     out = pr.decision(torch.zeros(1, 10, 2), restarted=torch.zeros(1, dtype=torch.bool))
     assert float(out["wrong_way"]) == 0.0 and "ww_hit" not in out
+
+
+def test_ramped_to_zero_measures_without_charging(monkeypatch):
+    # --wrong-way-ramp before U0: K = 0, the state still measured (the log's share / metres), nothing in the reward
+    pr, st = strip_reward(monkeypatch, 2)
+    pr.ww_k = 0.0
+    place(st, [1.0, 1.0], [math.pi, 0.0], [2.0, 2.0])
+    pr.begin(torch.arange(2))
+    place(st, [0.8, 1.2], [math.pi, 0.0], [2.0, 2.0])
+    out = pr.decision(torch.zeros(2, 10, 2), restarted=torch.zeros(2, dtype=torch.bool))
+    assert out["wrong_way"].abs().sum() == 0.0
+    assert out["ww_hit"].tolist() == [1.0, 0.0] and torch.allclose(out["ww_m"], torch.tensor([0.2, 0.0]), atol=1e-5)
+    assert torch.allclose(out["reward"], out["lap"] + out["shaping"] + out["contact"] + out["plan_hit"])
+
+
+def test_ramp_share():
+    from f1sim.learn.plan_rl import ramp_w
+    assert ramp_w(5, "") == 1.0
+    assert [ramp_w(u, "80,120") for u in (1, 80, 100, 120, 500)] == [0.0, 0.0, 0.5, 1.0, 1.0]
+    assert ramp_w(1, "120,80") is None and ramp_w(1, "80") is None and ramp_w(1, "a,b") is None
+    assert [ramp_w(u, "50,50") for u in (49, 50)] == [0.0, 1.0]
 
 
 # ------------------------------------------------------------------------------------------ the flag in the checkpoint
@@ -188,6 +209,11 @@ def test_flag_round_trip_through_the_checkpoint_args(capsys, tmp_path):
     assert code == 0 and json.loads(out)["args"]["wrong_way_cost"] == 0.0
     code, _ = check_args(capsys, "--wrong-way-cost", "-0.1")
     assert "--wrong-way-cost" in str(code)
+    code, out = check_args(capsys, "--wrong-way-cost", "0.2", "--wrong-way-ramp", "80,120")
+    assert code == 0 and json.loads(out)["args"]["wrong_way_ramp"] == "80,120"
+    for bad in (["--wrong-way-ramp", "80,120"], ["--wrong-way-cost", "0.2", "--wrong-way-ramp", "120,80"]):
+        code, _ = check_args(capsys, *bad)
+        assert "--wrong-way-ramp" in str(code)
 
 
 # --------------------------------------------------------------------------------------------- --dist-world collectives

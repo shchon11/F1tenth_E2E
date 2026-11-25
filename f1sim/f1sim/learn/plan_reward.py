@@ -305,8 +305,10 @@ class PlanReward:
         self.car_fault_only = False
         #: (B_l,) car contacts charged since the last decision (the trainer's scene / level bookkeeping reads it)
         self.car_charged = torch.zeros(Bl, device=device)
-        #: (11-25, plan_rl --wrong-way-cost) K [laps per metre]; 0 = off. `ww_since` [s] since a car contact this car was not
-        #: responsible for (the waiver)
+        #: (11-25, plan_rl --wrong-way-cost) `ww_on`: the state is measured (and `out` carries ww_hit / ww_m); `ww_k` K [laps per
+        #: metre] this update (--wrong-way-ramp: 0 early on, the state still measured). `ww_since` [s] since a car contact this
+        #: car was not responsible for (the waiver)
+        self.ww_on = False
         self.ww_k = 0.0
         self.ww_since = torch.full((Bl,), 1e9, device=device)
         self.begin(torch.arange(Bl, device=device))
@@ -368,11 +370,11 @@ class PlanReward:
         imp = r.contact_impacts[self.lid].float().clamp_min(0.0)
         charge = on.clone()
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
-        if (self.car_fault_only or self.ww_k > 0) and bool(on[:, 2].any()):
+        if (self.car_fault_only or self.ww_on) and bool(on[:, 2].any()):
             fault = self.at_fault()
             if self.car_fault_only:
                 charge[:, 2] = charge[:, 2] * fault.float()
-            if self.ww_k > 0:                                  # pushed by a car: no wrong-way cost for WW_WAIVE_S
+            if self.ww_on:                                     # pushed by a car: no wrong-way cost for WW_WAIVE_S
                 self.ww_since = torch.where((on[:, 2] > 0) & ~fault, torch.zeros_like(self.ww_since), self.ww_since)
         ck = self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge) / T_REF
         self.cost = self.cost + ck.sum(1)
@@ -481,7 +483,7 @@ class PlanReward:
         if restarted is not None:
             adv = torch.where(restarted, torch.zeros_like(adv), adv)
         ww = None
-        if self.ww_k > 0:                                      # (11-25) --wrong-way-cost: facing backwards and driving
+        if self.ww_on:                                         # (11-25) --wrong-way-cost: facing backwards and driving
             st = self.env.sim.state[self.lid]
             dirn, known = self.goal.downhill(st[:, :2].float(), tid)
             yaw = st[:, IYAW].float()
@@ -493,8 +495,8 @@ class PlanReward:
         wc = ww["cost"] if ww is not None else torch.zeros_like(adv)
         out = {"lap": lap, "shaping": shaping, "contact": -self.cost, "plan_hit": -pp,
                "reward": lap + shaping - self.cost - pp - wc, "progress": adv, "wrong_way": -wc}
-        if ww is not None:
-            out["ww_hit"] = (wc > 0).float()
+        if ww is not None:                                     # charged at full K (whatever K is this update)
+            out["ww_hit"] = ((ww["metres"] > 0) | ww["head"]).float()
             out["ww_m"] = ww["metres"]
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
