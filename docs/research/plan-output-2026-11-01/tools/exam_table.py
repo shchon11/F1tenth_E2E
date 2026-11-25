@@ -82,7 +82,7 @@ WW_V, WW_M = 0.2, 1.0    # (11-25) facing backwards and driving: forward speed a
 
 
 def wrong_way(st, rem, rs, L, T):
-    """(11-25, the user: "후진은 상관없는데 뒤돌아서 가는경우가 있어서") per session: the longest stretch driven facing backwards [m]
+    """(11-25, the user: "후진은 상관없는데 뒤돌아서 가는경우가 있어서") per session: the metres driven facing backwards [m]
     and whether the car reversed at all (forward speed below -0.1 m/s; information only -- backing out is allowed).
     Facing backwards and driving = the body-frame forward speed above WW_V while the walls-only distance to go grows: moving
     forwards in the car's own frame and away from the finish means the nose points back along the track (plan_rl
@@ -98,10 +98,9 @@ def wrong_way(st, rem, rs, L, T):
     dr[~np.isfinite(dr)] = 0.0
     dr[rs[:T].astype(bool)] = 0.0
     ww = (vx > WW_V) & (dr > 0)
-    cur = np.zeros(vx.shape[1]); best = np.zeros(vx.shape[1])
-    for t in range(T):
-        cur = np.where(ww[t], cur + dr[t], 0.0); best = np.maximum(best, cur)
-    return best, (vx < -0.1).any(0)
+    # (11-26) the session's TOTAL, not the longest stretch: cp36c u600 exam3 session 85 drove 141.7 m backwards (3+ laps)
+    # but each lap stopped at the same wall, so its longest stretch read 41.8 m
+    return np.where(ww, dr, 0.0).sum(0), (vx < -0.1).any(0)
 
 
 def score(fn):
@@ -182,7 +181,7 @@ def score(fn):
         out.append(f"  깨끗한 세션(세게 닿음 0번·2 s 동안 1 m도 못 간 적 없음) {pct(clean[m])} | 한 번도 안 닿은 세션 {pct(anyc.sum((0, 2))[m] == 0)} | "
                    f"2 s 동안 1 m도 못 간 세션 {pct(stalls[m] > 0)} (그렇게 5 s 넘게 {pct(longest[m] * dt > 5.0)})")
         out.append(f"  세션당 세게 닿음: 벽 {mean(h_all[m, 0])} · 상자 {mean(h_all[m, 1])} · 차 {mean(h_all[m, 2])} | 달린 거리 {med(P[-1, m], ' m', '{:.0f}')}")
-        out.append(f"  뒤돌아 {WW_M:g} m 넘게 달린 세션 {pct(ww_m[m] > WW_M)} (가장 긴 것 {ww_m[m].max():.1f} m) | 후진한 세션(참고) {pct(rev[m])}")
+        out.append(f"  뒤돌아 {WW_M:g} m 넘게 달린 세션 {pct(ww_m[m] > WW_M)} (가장 많은 세션 {ww_m[m].max():.1f} m) | 후진한 세션(참고) {pct(rev[m])}")
         out.append(f"  한 바퀴(세션 중앙값) {med(lap_med[m], ' s')} · 세션에서 가장 빠른 바퀴 {med(lap_min[m], ' s')} · 세션 안 바퀴 흔들림 "
                    f"{med(lap_sd[m], ' s')} · 온전한 바퀴 수 {med(lap_n[m], '', '{:.0f}')} · 세게 닿지 않고 이어 달린 바퀴 {med(stk[m], '', '{:.0f}')}")
         em = m[ev_b] if len(ev_b) else np.zeros(0, bool)
