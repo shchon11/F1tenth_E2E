@@ -2161,6 +2161,8 @@ def main(argv=None):
         _q0, _q1 = (float(x_) for x_ in args.opp_present_ramp.split(","))
     for upd in range(1 + args.update_offset, args.updates + 1):
         dist_n0 = dist.n if dist is not None else 0                # (11-25) this update's collectives (dist_calls)
+        if dev.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(dev)                # (11-25) gpu_peak_mb: this update's own peak
         if opp_p0 is not None:
             env._present_p[1:] = opp_p0 * min(1.0, max(0.0, (upd - _q0) / max(1.0, _q1 - _q0)))   # in place: read at every reset
         if args.plan_hit_ramp:                                      # --plan-hit-ramp: the plan cost's share this update
@@ -3548,6 +3550,8 @@ def main(argv=None):
                        opp_present_p=float(env._present_p[1]) if getattr(env, "_present_p", None) is not None and env.M > 1 else None)
         if dist is not None:
             row["dist_calls"] = dist.n - dist_n0
+        if dev.type == "cuda":
+            row["gpu_peak_mb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 20
         if others is not None:
             row["opp_present_share"] = opp_pres / max(T, 1)        # decisions of the ordinary races with the other car there
         if near_on:

@@ -207,6 +207,10 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
         <div><h4>0.7-0.9배</h4><div class="cbox"><canvas id="c_pcar2"></canvas></div></div>
         <div><h4>0.9배 이상</h4><div class="cbox"><canvas id="c_pcar3"></canvas></div></div></div></div>
     <div class="card hide" data-opt="plan_now_clear_share"><h3>앞차 지금 자리 지나되 실제와 안 겹친 plan <span class="sub">%</span></h3><div class="cbox"><canvas id="c_pnow"></canvas></div></div>
+    <div class="card hide" data-opt="free_err_med" style="grid-column: 1 / -1"><h3>빈 공간 머리</h3>
+      <div class="trio"><div><h4>오차 중앙 <span class="sub">cm</span></h4><div class="cbox"><canvas id="c_fs1"></canvas></div></div>
+        <div><h4>0.5 m 안 오차 <span class="sub">cm</span></h4><div class="cbox"><canvas id="c_fs2"></canvas></div></div>
+        <div><h4>0.5 m 안 부호 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_fs3"></canvas></div></div></div></div>
     <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
     <div class="card hide" data-opt="pred_zigzag"><h3>상대 예측 꺾임 <span class="sub">°</span></h3><div class="cbox"><canvas id="c_pzz"></canvas></div></div>
@@ -460,6 +464,13 @@ async function refresh() {
     const has = own.some((r) => r.plan_car_share != null) || rrOwn.some((r) => r.plan_car_share != null);
     document.querySelector('[data-opt="plan_car_share"]').classList.toggle("hide", !has);
     for (const [id, k] of [["c_pcar1", "plan_car_share_lt07"], ["c_pcar2", "plan_car_share_07_09"], ["c_pcar3", "plan_car_share_ge09"]]) {
+      if (has) chart(id, two((r) => r[k] == null ? null : 100 * r[k])); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+    }
+  }
+  {   // (11-25, --arch pts) the free-space head: |error| median, where the true gap < 0.5 m, its sign right there
+    const has = own.some((r) => r.free_err_med != null) || rrOwn.some((r) => r.free_err_med != null);
+    document.querySelector('[data-opt="free_err_med"]').classList.toggle("hide", !has);
+    for (const [id, k] of [["c_fs1", "free_err_med"], ["c_fs2", "free_err_near"], ["c_fs3", "free_sign_near"]]) {
       if (has) chart(id, two((r) => r[k] == null ? null : 100 * r[k])); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
     }
   }
