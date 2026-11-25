@@ -31,7 +31,9 @@ FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts
           "plan_now_clear_share", "plan_now_clear_share_lt07", "plan_now_clear_share_07_09", "plan_now_clear_share_ge09",
           # (11-25) --plan-grad-cost: the direct gradient against PPO's, how often the car term is on, the PPO gradient's share
           # from the decisions with a car 0-4 m ahead
-          "pg_ratio", "pg_ratio_step_est", "pg_near_car", "pg_hard_car", "pg_rel_grad_share", "pg_rel_dec_share", "pg_lambda")
+          "pg_ratio", "pg_ratio_step_est", "pg_near_car", "pg_hard_car", "pg_rel_grad_share", "pg_rel_dec_share", "pg_lambda",
+          # (11-25) --commit-plan: the promise's gap at 0.5 / 1.0 s, honesty, the cost's share of the lap reward, the noise [m]
+          "cm_dev05_p50", "cm_dev10_p50", "cm_honest05_p50", "cm_honest10_p50", "cm_cost_share", "cm_noise05", "cm_noise10")
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()

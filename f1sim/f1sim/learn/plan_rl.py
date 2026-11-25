@@ -27,6 +27,10 @@ exploration floors, correlated noise, KL leashes): the world, the plan format, t
 * `--scene-replay` (11-13, the user: "1도 같이 해야하는거 아님?"): that share of the races restart from the state 1-3 s
   before a past hard contact and drive 5 s from it (`scene_replay`); the other races are as they were and are where the
   scenes come from. The regular statistics count the other races only.
+* `--commit-plan W` (11-25): the plan as a commitment (`plan_commit`). The whole plan is the action -- exploration noise on
+  the smooth shapes of its turn and speed profiles (an orthonormal polynomial basis per channel), the log-probability the
+  sum over the 20 coefficients -- and the reward charges every new plan's 0.1-0.9 s for leaving the previous plan's
+  0.2-1.0 s (positions and speeds, W laps at the reference gap). No tail loss: the tail is an action now.
 
 usage: python -m f1sim.learn.plan_rl --name NAME [--updates 2000] [--envs 1024] [--seed 1]"""
 from __future__ import annotations
@@ -55,6 +59,7 @@ from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
 from .plan_reward import PlanReward, SEEN_S, T_REF
 from . import plan_car_cost as PCC
 from . import plan_grad_cost as PG
+from . import plan_commit as PC
 from .pred_oracle import copy_oracle
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
@@ -857,8 +862,43 @@ def _arg_problem(args) -> str:
         (args.accum_actor > 1 and args.accum > 1, "--accum and --accum-actor: one or the other"),
         (args.mem_aux_lr > 0 and not args.mem_aux > 0, "--mem-aux-lr needs --mem-aux"),
         (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
+        (args.commit_plan > 0 and _commit_problem(args) != "", _commit_problem(args)),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+def _commit_problem(args) -> str:
+    """(11-25) --commit-plan's refusals ('' = none): the whole plan is the action and the reward prices leaving it, so nothing
+    else may own the plan's outputs or hold its noise"""
+    v3 = args.format == "v3"
+    if args.format != "v2" or v3:
+        return "--commit-plan needs --format v2"
+    if (args.hold_p > 0 or args.plan_roll or args.roll_grow or args.branches == 2 or args.pace_caps or args.line_shifts
+            or args.plan_grad_cost > 0 or args.dump_rollout or args.noise_corr_known or args.track_steps):
+        return ("--commit-plan: not with --hold-p / --plan-roll / --roll-grow / --branches 2 / --pace-caps / --line-shifts / "
+                "--plan-grad-cost / --dump-rollout / --noise-corr-known / --track-steps")
+    if args.noise_corr > 0 or args.noise_corr_stall or args.stuck_noise > 0:
+        # a promise-keeping mean already carries the last decision's noise in its promise; noise held on top of it is charged
+        # again every decision and adds up (a random walk of the plan), so each decision's noise is a fresh proposal
+        return "--commit-plan: no held noise (--noise-corr 0, no --noise-corr-stall / --stuck-noise)"
+    try:
+        s_ = [float(x) for x in args.commit_std.split(",")]
+        f_ = [float(x) for x in args.commit_floor.split(",")]
+    except ValueError:
+        return "--commit-std / --commit-floor: 3 numbers each (turn, speed, rest)"
+    if len(s_) != 3 or len(f_) != 3 or min(s_) <= 0 or min(f_) < 0:
+        return "--commit-std: 3 numbers > 0, --commit-floor: 3 numbers >= 0 (turn, speed, rest)"
+    if not 1 <= args.commit_smooth <= PS.N_STEP or args.commit_ref <= 0 or args.commit_v_s < 0 or args.commit_off_m <= 0 \
+            or args.commit_v_min < 0:
+        return "--commit-smooth in 1..10, --commit-ref > 0, --commit-v-s >= 0, --commit-off-m > 0, --commit-v-min >= 0"
+    if args.commit_ramp:
+        try:
+            r_ = [float(x) for x in args.commit_ramp.split(",")]
+        except ValueError:
+            r_ = []
+        if len(r_) != 2 or r_[1] < r_[0]:
+            return "--commit-ramp U0,U1 with U0 <= U1"
+    return ""
 
 
 def pg_line(row: dict) -> str:
@@ -874,6 +914,23 @@ def pg_line(row: dict) -> str:
             f"{g('pg_cos_ppo')} | 앞 4 m 안 차 결정 {pc('pg_rel_dec_share')} % -> PPO gradient의 {pc('pg_rel_grad_share', 0)} %, "
             f"앞차 겹침 비용의 advantage 분산 몫 {pc('pg_adv_var_share', 2)} % (가치 0으로 어림)"
             + (f", 해독 차이 {row['pg_dec_err']:.1e}" if row.get("pg_dec_err") is not None else "") + " | ")
+
+
+def cm_line(row: dict) -> str:
+    """(11-25) --commit-plan's part of the update's log line (Korean): the promise's gap at its 0.5 / 1.0 s points (median / p90,
+    the mean plan's median), the cost against the lap reward, honesty at 0.5 / 1.0 s, the noise in metres, the std"""
+    cm = lambda k: "-" if row.get(k) is None else f"{row[k] * 100:.1f}"       # [m] -> cm; shares -> %
+    pc = cm
+    ms = lambda k: "-" if row.get(k) is None else f"{row[k]:.2f}"
+    sc = row.get("std_coef") or []
+    st = (f"조향 {sc[0]:.2f}/{sc[1]:.2f}/{sc[2]:.2f} 속도 {sc[10]:.2f}/{sc[11]:.2f}/{sc[12]:.2f}" if len(sc) == 20 else "-")
+    wv = "-" if row.get("cm_w") is None else f"{row['cm_w']:.3g}"
+    return (f"plan 약속(W {wv}): 어긋남 0.5 s {cm('cm_dev05_p50')}/{cm('cm_dev05_p90')} cm 1.0 s {cm('cm_dev10_p50')}/{cm('cm_dev10_p90')} cm "
+            f"(평균 plan {cm('cm_mdev05_p50')}/{cm('cm_mdev10_p50')} cm, 1.0 s 속도 {ms('cm_dv10_p50')} m/s), "
+            f"비용 바퀴 보상의 {pc('cm_cost_share')} % (평균 plan이면 {pc('cm_cost_mean_share')} %, 매긴 결정 {pc('cm_ok_share')} %), "
+            f"정직 0.5 s {cm('cm_honest05_p50')}/{cm('cm_honest05_p90')} cm 1.0 s {cm('cm_honest10_p50')}/{cm('cm_honest10_p90')} cm "
+            f"(평균 plan {cm('cm_mhonest05_p50')}/{cm('cm_mhonest10_p50')} cm), 탐색 잡음 0.5 s {cm('cm_noise05')} 1.0 s "
+            f"{cm('cm_noise10')} cm, 계수 std {st} | ")
 
 
 def main(argv=None):
@@ -1342,6 +1399,39 @@ def main(argv=None):
     ap.add_argument("--plan-grad-measure", type=int, default=2,
                     help="--plan-grad-cost: minibatches of the first epoch whose separate gradients (PPO, direct by term, tail, "
                          "PPO of the decisions with a car within 4 m ahead) are measured each update")
+    ap.add_argument("--commit-plan", type=float, default=0.0,
+                    help="W [laps] (11-25, the plan as a COMMITMENT, `learn.plan_commit`): the whole plan is the action -- noise on "
+                         "the smooth shapes of its turn and speed profiles (orthonormal polynomials per channel, --commit-smooth of "
+                         "them explore), log-probability summed over the 20 coefficients -- and every decision pays W x the mean "
+                         "over the 9 compared points of huber(gap_k / (--commit-ref x t_k)): the new plan's point k (t_k = 0.1 k s) "
+                         "against the previous plan's point k+1 (the same moment), gap = sqrt(dpos^2 + (--commit-v-s x dspeed)^2). "
+                         "Not after a restart, a contact, or with the car > --commit-off-m off the promise's 0.1 s point. Turns the "
+                         "tail loss off (--tail-consistency 0: the tail is an action). Why: with the tail a forecast every cost on it "
+                         "was gamed (qual28d walls, dg35a car) and exploration was 0.1 s deep. 0 = off")
+    ap.add_argument("--commit-ref", type=float, default=0.75,
+                    help="--commit-plan: [m/s] the reference re-plan rate: a point whose gap is this x its time from now costs W "
+                         "(0.75 = a 0.3 m swerve of the promise's 0.5 s point; race33b u975 re-plans at 0.12 m/s median, 0.3 p90)")
+    ap.add_argument("--commit-v-s", type=float, default=0.2,
+                    help="--commit-plan: [s] a speed gap counts as the position gap it opens in this long")
+    ap.add_argument("--commit-smooth", type=int, default=3,
+                    help="--commit-plan: the exploring coefficients per channel (polynomial degrees 0 .. K-1: an arc, a lane "
+                         "change, an S / brake-or-go, brake-then-go, ..); the higher degrees keep a small noise (full rank)")
+    ap.add_argument("--commit-std", default="0.2,0.2,0.1",
+                    help="--commit-plan: TURN,SPEED,REST the coefficients' starting std (pre-tanh units; the smooth turn ones, the "
+                         "smooth speed ones, the rest) -- also on a fork, whose per-output std means something else")
+    ap.add_argument("--commit-floor", default="0.15,0.15,0.05",
+                    help="--commit-plan: TURN,SPEED,REST the std floors (the steer / speed floors' intent on the plan's shapes: "
+                         "exploration never collapses); --steer-std-floor / --speed-std-floor are not used in this mode")
+    ap.add_argument("--commit-v-min", type=float, default=0.3,
+                    help="--commit-plan: [m/s] a car slower than this at the decision re-plans freely (no charge): a stopped or "
+                         "stuck car backs out / starts off without paying for leaving its standing plan (roll29a-c, from scratch, "
+                         "stood still with a plan they could not leave)")
+    ap.add_argument("--commit-ramp", default="",
+                    help="U0,U1: --commit-plan's W is 0 until update U0 and reaches its value at U1 (as --plan-hit-ramp: a plan price "
+                         "from the first update stood qual28d still 29-64 %% of the time at u20-54); '' = W from the start")
+    ap.add_argument("--commit-off-m", type=float, default=0.05,
+                    help="--commit-plan: [m] the car farther than this from the promise's 0.1 s point (a push; the speed estimate's "
+                         "own error is ~4 mm median, 4 cm p99) -> no charge at that decision")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1843,6 +1933,31 @@ def main(argv=None):
                     pred_smooth=pred_smooth, pred_kin=pred_kin, pred_clear=pc_on,
                     pc_geom=(car_dims[0], car_dims[1], args.plan_car_margin) if pc_on else None) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
+    cm_on = args.commit_plan > 0                                   # (11-25) --commit-plan: the plan as a commitment
+    cm_parent = None                                               # --init: the parent actor, for the first decision's check
+    if cm_on:
+        why_ = _commit_problem(args)
+        if why_:
+            raise SystemExit(why_)
+        if args.tail_consistency > 0:
+            # the tail is an action now: the supervised tail loss (and its trunk share) goes; recorded as 0 in args / checkpoints
+            print(f"[plan_rl] plan 약속 모드: 뒷부분 지도 손실(--tail-consistency {args.tail_consistency:g}, --tail-target "
+                  f"{args.tail_target})은 끔 -- plan 뒷부분이 이제 행동", flush=True)
+            args.tail_consistency = 0.0; args.tail_trunk = False; args.tail_trunk_ratio = 0.0
+        cm_Q = PC.coef_basis().float().to(dev)                     # (10, 10) orthonormal rows: polynomial degree 0..9
+        cm_K = int(args.commit_smooth)
+        cm_std = [float(x_) for x_ in args.commit_std.split(",")]
+        cm_flo = [float(x_) for x_ in args.commit_floor.split(",")]
+        cm_gate = PC.PromiseGate(Bl, dev)                          # which rows' next plan is charged against a promise
+        pr.phi_car = True                                          # the shaping pays the car's progress, not a plan's promise
+        print(f"[plan_rl] plan 약속 모드(--commit-plan {args.commit_plan:g}): 행동 = plan 전체 20개. 잡음은 조향·속도 각각 10칸 "
+              f"모양의 다항식 기저 계수에 (낮은 차수 {cm_K}개가 탐색: 처음 표준편차 조향 {cm_std[0]:g} 속도 {cm_std[1]:g}, 바닥 "
+              f"{cm_flo[0]:g}/{cm_flo[1]:g}; 나머지 {cm_std[2]:g}, 바닥 {cm_flo[2]:g}), log-prob = 계수 20개의 합. 실행은 첫 0.1 s 그대로. "
+              f"약속 비용: 새 plan 0.1-0.9 s 점 k와 직전 plan의 같은 시각 점(k+1)의 차이 sqrt(위치^2 + ({args.commit_v_s:g} s x "
+              f"속도)^2)를 {args.commit_ref:g} m/s x 0.1k s로 나눈 값의 Huber, 9점 평균 x {args.commit_plan:g} 바퀴"
+              + (f" (update {args.commit_ramp.replace(',', '-')}에 걸쳐 0에서 올림)" if args.commit_ramp else "")
+              + f"; 다시 출발·접촉 뒤, 차가 약속 0.1 s 점에서 {args.commit_off_m:g} m 넘게 벗어나거나 {args.commit_v_min:g} m/s보다 "
+              f"느리면 안 매김(선 차·막힌 차는 마음대로 다시 그림). 전진 shaping은 plan 점이 아니라 차가 실제로 간 만큼", flush=True)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
         raise SystemExit("--tail-consistency needs --format v2 and no holding")
@@ -1854,6 +1969,9 @@ def main(argv=None):
 
     def set_floors(k_):                                        # the step decided: the first (--plan-roll: the last; grow: c+1)
         actor.log_std_floor.fill_(-math.inf)
+        if cm_on:                                              # --commit-plan: floors on the coefficients (`plan_commit`)
+            actor.log_std_floor.copy_(PC.floor_vec(cm_K, cm_flo[0], cm_flo[1], cm_flo[2], device=dev))
+            return
         if args.speed_std_floor > 0:
             actor.log_std_floor[PS.N_STEP + k_] = math.log(args.speed_std_floor)
         if args.steer_std_floor > 0:
@@ -1874,8 +1992,11 @@ def main(argv=None):
 
     def lp_scored(u_, mean_, log_std_, full_):
         """the log-probability PPO scores: --roll-grow the steps committed (a whole plan 1..c+1, a rolling decision c+1);
-        --plan-roll the last step (a whole plan: all); --tail-consistency the first step; else all"""
+        --plan-roll the last step (a whole plan: all); --tail-consistency the first step; --commit-plan the whole plan, summed
+        over its 20 basis coefficients; else all"""
         ls_ = log_std_.expand_as(mean_)
+        if cm_on:
+            return PC.commit_logp(u_, mean_, ls_, cm_Q)
         if grow_on:
             return tanh_logp_m(u_, mean_, ls_, torch.where(full_[:, None], gm_all, gm_new))
         if tailc:
@@ -1933,6 +2054,22 @@ def main(argv=None):
             else:
                 print("[plan_rl] critic NOT taken: its inputs differ", flush=True)
         print(f"[plan_rl] actor from {args.init} (update {ck0.get('update')}), critic's scan encoder too", flush=True)
+    if cm_on:
+        # the same 20 numbers `log_std` now mean the coefficients' std (`plan_commit`); a fork from a policy without the mode has
+        # per-output stds there (race33b: first-step turn 0.11 / speed 0.40, the tail 0.6 untouched) -- started afresh. The
+        # mean (every weight but log_std) is the checkpoint's: the fork drives as its parent
+        if args.init and float((ck0.get("args") or {}).get("commit_plan", 0) or 0) > 0:
+            print("[plan_rl] plan 약속 모드 checkpoint에서 이어 받음: 계수 표준편차도 그대로", flush=True)
+        else:
+            with torch.no_grad():
+                actor.log_std.copy_(PC.init_log_std(cm_K, cm_std[0], cm_std[1], cm_std[2], device=dev))
+        _sd = PC.step_std(torch.maximum(actor.log_std, actor.log_std_floor), cm_Q)
+        print(f"[plan_rl] plan 약속 잡음: 첫 0.1 s 출력의 표준편차 조향 {float(_sd[0]):.3f} 속도 {float(_sd[PS.N_STEP]):.3f}, 10칸 평균 "
+              f"{float(_sd[:PS.N_STEP].mean()):.3f} / {float(_sd[PS.N_STEP:].mean()):.3f} (부모 checkpoint의 첫 칸 바닥 조향 "
+              f"{args.steer_std_floor:g} 속도 {args.speed_std_floor:g}는 이 모드에서 안 씀)", flush=True)
+        if args.init and args.memory:
+            from .plan_policy import load_actor2
+            cm_parent = load_actor2(ck0, dev, check_mount=False)    # the first decision checks the mean against it
     if args.accum_actor > 1 and args.accum > 1:
         raise SystemExit("--accum and --accum-actor: one or the other")
     # (11-24) --pred-opp: the prediction head is not the policy's -- its own optimizer below, no policy gradient reaches it
@@ -2062,7 +2199,8 @@ def main(argv=None):
     tap_kinds = [0, 1] + ([2] if env.M > 1 else []) + ([3] if args.stall_s > 0 else [])
     tap_ph = args.plan_hit_share > 0
     tap_names = (["바퀴 완주", "전진 shaping", "벽 접촉", "상자 접촉"] + (["차 접촉(내 잘못)" if args.car_fault else "차 접촉"] if env.M > 1 else [])
-                 + (["멈춤"] if args.stall_s > 0 else []) + (["박는 plan(벽·상자)"] if tap_ph else []))
+                 + (["멈춤"] if args.stall_s > 0 else []) + (["박는 plan(벽·상자)"] if tap_ph else [])
+                 + (["plan 약속 바꿈"] if cm_on else []))
     for tp_ in taps:
         tp_.set_parts(tap_names, late="차 겹침 plan" if car_on else None)
     tap_kinds_t = torch.tensor(tap_kinds, dtype=torch.long, device=dev)
@@ -2072,6 +2210,8 @@ def main(argv=None):
         xs_ = [out_["lap"][q_:q_ + 1], out_["shaping"][q_:q_ + 1], out_["contact_kind"][q_, tap_kinds_t]]
         if tap_ph:
             xs_.append(out_["plan_hit_price"][q_:q_ + 1])
+        if cm_on:                                                   # (11-25) --commit-plan's cost
+            xs_.append(out_["commit"][q_:q_ + 1])
         return torch.cat([x_.float() for x_ in xs_])
 
     def tap_opp_plan(q_):
@@ -2107,6 +2247,11 @@ def main(argv=None):
         if args.shaping_fade:                                       # --shaping-fade: the distance shaping's weight this update
             _f0, _f1 = (float(x_) for x_ in args.shaping_fade.split(","))
             pr.shaping_w = 1.0 - min(1.0, max(0.0, (upd - _f0) / max(1.0, _f1 - _f0)))
+        if cm_on:                                                   # --commit-plan: W this update (--commit-ramp)
+            cm_w = float(args.commit_plan)
+            if args.commit_ramp:
+                _c0, _c1 = (float(x_) for x_ in args.commit_ramp.split(","))
+                cm_w *= min(1.0, max(0.0, (upd - _c0) / max(1.0, _c1 - _c0)))
         if grow_on:                                                 # --roll-grow: the shaping until c = 9 is passed, then a fade
             pr.shaping_w = 1.0 if grow_done is None else max(0.0, 1.0 - (upd - grow_done) / max(1, args.roll_grow_fade))
         if online_on and upd > 1 + args.update_offset:
@@ -2160,6 +2305,7 @@ def main(argv=None):
         PCL = []                                               # --pred-clear: the trunk's clearance inputs, as the rollout read them
         PIN = []                                               # --pred-opp: the trunk's prediction inputs (pred_feed), as read
         CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
+        CM = {k_: [] for k_ in ("ok", "cost", "costm", "dp", "dv", "dpm", "pts", "ptm", "xy", "off")}   # --commit-plan, per decision
         MN, PGB, PGD = [], [], None                            # --plan-grad-cost: the means, the seen boxes, the record (after)
         car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
         opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
@@ -2286,8 +2432,21 @@ def main(argv=None):
                                                 actor.pc_dims)
                         pc_x = (_pv, _use)
                         orc_n += torch.stack([(_use & ~_ab).sum(), _ab.sum(), (~_use).sum()]).float()
+                    if cm_parent is not None:
+                        # (11-25) --commit-plan from a checkpoint: the parent on the same inputs (its input statistics given the
+                        # same update as the fork's above) -- the fork's mean plan must be its parent's, bit for bit
+                        cm_parent.norm.update(s)
+                        _par = (cm_parent(sc, s, obs.mem_h, prev=obs.prev_poses(), pc_over=pc_x) if pc_on
+                                else cm_parent(sc, s, obs.mem_h))
                     mean, log_std, v_hat = (actor(sc, s, obs.mem_h, prev=obs.prev_poses(), pc_over=pc_x) if pc_on
                                             else actor(sc, s, obs.mem_h))
+                    if cm_parent is not None:
+                        _dm = float((mean - _par[0]).abs().max()); _dv = float((v_hat - _par[2]).abs().max())
+                        _dh = float((actor.h_out - cm_parent.h_out).abs().max())
+                        print(f"[plan_rl] 부모와 같은 평균 plan인지: 첫 결정 {Bl}대, 평균 출력 20개 최대 차이 {_dm:.3g}, 속도 짐작 {_dv:.3g}, "
+                              f"기억 {_dh:.3g}" + (" -> 비트까지 같음" if _dm == 0.0 and _dv == 0.0 and _dh == 0.0 else " -> 다름!"),
+                              flush=True)
+                        cm_parent = None; del _par
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                     if pc_on:
                         PCL.append(actor.pc_out.detach().clone())  # the update reads exactly these
@@ -2355,7 +2514,10 @@ def main(argv=None):
                     log_std = torch.cat([torch.where(kz, log_std[:, 0].clamp_min(kn_logstd), log_std[:, 0])[:, None],
                                          log_std[:, 1:]], 1)
                     KZ.append(kz); kz_n += float(kz.float().mean())
-                if tailc and grow_on:                              # the steps committed now drawn, the forecast its mean
+                if cm_on:                                          # --commit-plan: the whole plan, noise on the basis coefficients
+                    u = PC.sample(mean, log_std, cm_Q, eps)
+                    lp = PC.commit_logp(u, mean, log_std, cm_Q)
+                elif tailc and grow_on:                            # the steps committed now drawn, the forecast its mean
                     u = mean + log_std.exp() * eps * gm_all
                     lp = tanh_logp_m(u, mean, log_std.expand_as(mean), torch.where(roll_full[:, None], gm_all, gm_new))
                     FULL.append(roll_full.clone())
@@ -2419,6 +2581,18 @@ def main(argv=None):
                 elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap_ if pace_on else None)
+                    if cm_on:
+                        # (11-25) --commit-plan: the promise (the last plan, world points and speeds, `PlanObs.set_plan`), the pose
+                        # the new plan starts from, the contacts so far, and the MEAN plan in the world too -- what the policy
+                        # means against its promise, and the noise in metres
+                        cm_st = env.sim.state[lid].clone()
+                        cm_prom_xy, cm_prom_v = obs.plan_xy.clone(), obs.plan_v.clone()
+                        cm_n0 = pr.n_contacts.clone()
+                        _pmc = PS.roll(torch.tanh(mean), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
+                        _xc, _yc, _ = plan_world(_pmc, cm_st)
+                        _ic = PT_IDX.to(dev)
+                        cm_mean_xy, cm_mean_v = torch.stack([_xc[:, _ic], _yc[:, _ic]], -1), _pmc["pv"]
+                        del _pmc, _xc, _yc
                     if taps:                                       # the plan the mean action makes, for the live view
                         # (11-24) one roll for every tap (a plan's rows are independent): eight one-row rolls were ~0.08 s a
                         # decision of race32a's 0.62
@@ -2504,6 +2678,25 @@ def main(argv=None):
                     _mv = torch.cat([torch.zeros(Bl, 1, 2, device=dev), torch.stack([_pv * torch.cos(_pp), _pv * torch.sin(_pp)], -1)], 1)
                     _mr = pr.goal.remaining(_mxy.reshape(-1, 2), CQ["tid"][-1].repeat_interleave(PS.N_STEP + 1)).view(Bl, -1)
                     CQ["me"].append(torch.cat([_mxy, _mps[..., None], _mv, _mr[..., None]], -1))                 # (Bl, 11, 6)
+                if cm_on:
+                    # (11-25) --commit-plan: this decision's plan (as drawn, noise and all) against the promise -- the last
+                    # plan's points 2..10 / speeds at the same moments; charged unless there is no promise (a start), the last
+                    # decision had a contact, or the car is not on the promise's 0.1 s point (pushed)
+                    _ic = PT_IDX.to(dev)
+                    _nxy = torch.stack([xw_[:, _ic], yw_[:, _ic]], -1)
+                    _off = (cm_st[:, :2] - cm_prom_xy[:, 0]).norm(dim=-1)
+                    _okc = cm_gate.charge(_off, args.commit_off_m, cm_st[:, dyn.IVX].float(), args.commit_v_min)
+                    _cc = PC.promise_cost(_nxy, p["pv"], cm_prom_xy, cm_prom_v, _okc, cm_w, args.commit_ref, args.commit_v_s)
+                    _ccm = PC.promise_cost(cm_mean_xy, cm_mean_v, cm_prom_xy, cm_prom_v, _okc, cm_w, args.commit_ref,
+                                           args.commit_v_s)                 # the mean plan's (not charged: the noise's share)
+                    out["reward"] = out["reward"] - _cc["cost"]
+                    out["commit"] = -_cc["cost"]
+                    CM["ok"].append(_okc); CM["cost"].append(_cc["cost"]); CM["costm"].append(_ccm["cost"])
+                    CM["dp"].append(_cc["dp"]); CM["dv"].append(_cc["dv"]); CM["dpm"].append(_ccm["dp"])
+                    CM["pts"].append(_nxy); CM["ptm"].append(cm_mean_xy); CM["xy"].append(cm_st[:, :2].clone())
+                    CM["off"].append(_off)
+                    cm_gate.after(out["restarted"], (pr.n_contacts - cm_n0).sum(1) > 0)   # a restart: no promise (`reset_rows`)
+                    del _cc, _ccm, _nxy
                 if car_on or drv.opp is not None:
                     car_fault_b += (pb_t.float() * out["car_charged"][None]).sum(1); car_dec_b += pb_t.float().sum(1)
                     if drv.opp is not None:                        # the copies' speed by pace (--self-opp-pace's slow end)
@@ -2530,7 +2723,8 @@ def main(argv=None):
                                                                  and getattr(actor, "box_memory", 0)) else None)
                     tp_.record(upd, t, torch.stack([xw_[_q, _ii], yw_[_q, _ii]], -1), getattr(tp_, "pm", tap_pm), p["pv"][_q], v[_q],
                                out["reward"][_q], out["lap"][_q], out["contact"][_q], out["shaping"][_q], v_hat[_q],
-                               ((u - mean)[_q] / _ls[_q].exp()).pow(2).mean().sqrt(), _ls[_q].exp().mean(),
+                               ((PC.to_coef((u - mean)[_q:_q + 1], cm_Q)[0] if cm_on else (u - mean)[_q])   # (11-25) in
+                                / _ls[_q].exp()).pow(2).mean().sqrt(), _ls[_q].exp().mean(),               # its own units
                                mem=_mh[_q] if _mh is not None else None,
                                replay=bool(scene.in_replay[_q]) if scene is not None else False,
                                copy_opp=bool(drv.opp.on[opp_index[others[_q, 0]]]) if drv.opp is not None else False,
@@ -2592,6 +2786,8 @@ def main(argv=None):
                             hold_left[g_l] = 0
                         if roll_on:
                             roll_full[g_l] = True
+                        if cm_on:                                # (11-25) the scene's last plan is a promise (restored above)
+                            cm_gate.scene(g_l)
                     # 2. hard contacts of this decision (a car's only if the reward charges for it)
                     hd = (env.sim.contact_counts[lid, 3:6] - hard0).clamp_min(0).float()
                     hd[:, 2] = hd[:, 2] * ((out["car_charged"] > 0) if args.car_fault else (pr.seen_t <= SEEN_S + PS.DT)).float()
@@ -2804,6 +3000,43 @@ def main(argv=None):
             gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
             adv[t] = gae
         ret = adv + V_
+        cm_log = {}
+        if cm_on:
+            # (11-25) --commit-plan's numbers, this process's ordinary races: the promise's gap at its 0.5 s point (the new plan's
+            # point 4) and its 1.0 s point (point 9) where charged, as drawn and for the mean plan; the cost against the lap
+            # reward; honesty -- plan point k against where the car really was k decisions later (no restart between); the
+            # noise in metres (drawn - mean plan) at 0.5 / 1.0 s
+            with torch.no_grad():
+                OKc = torch.stack(CM["ok"]) & ordm[None]
+                DPc, DVc, DPMc = torch.stack(CM["dp"]), torch.stack(CM["dv"]), torch.stack(CM["dpm"])
+                _q = lambda x_, f_: float(torch.quantile(x_.float(), f_)) if x_.numel() else None
+                for nm_, j_ in (("05", 3), ("10", 8)):
+                    x_, xm_ = DPc[..., j_][OKc], DPMc[..., j_][OKc]
+                    cm_log.update({f"cm_dev{nm_}_p50": _q(x_, 0.5), f"cm_dev{nm_}_p90": _q(x_, 0.9),
+                                   f"cm_mdev{nm_}_p50": _q(xm_, 0.5), f"cm_mdev{nm_}_p90": _q(xm_, 0.9)})
+                cm_log["cm_dv10_p50"] = _q(DVc[..., 8][OKc], 0.5)
+                cm_log["cm_ok_share"] = float(OKc.float().sum()) / max(1.0, float(T * n_ord))
+                _cs = float(torch.stack(CM["cost"])[:, ordm].sum()); _csm = float(torch.stack(CM["costm"])[:, ordm].sum())
+                _lap = float(stats["lap"][ordm].sum())
+                _mins = T * PS.DT * n_ord / 60.0
+                cm_log.update(cm_cost_per_min=_cs / _mins, cm_cost_mean_per_min=_csm / _mins,
+                              cm_cost_share=(_cs / _lap) if _lap > 0 else None, cm_cost_mean_share=(_csm / _lap) if _lap > 0 else None)
+                PTS_, PTM_, XY_ = torch.stack(CM["pts"]), torch.stack(CM["ptm"]), torch.stack(CM["xy"])
+                cs_ = torch.cumsum((D_ > 0).long(), 0)
+                for k_ in (5, 10):
+                    if k_ >= T:
+                        continue
+                    before_ = torch.cat([torch.zeros(1, Bl, dtype=cs_.dtype, device=dev), cs_[:T - k_ - 1]], 0)
+                    clean_ = ((cs_[k_ - 1:T - 1] - before_) == 0) & ordm[None]
+                    e_ = (PTS_[:T - k_, :, k_ - 1] - XY_[k_:]).norm(dim=-1)[clean_]
+                    em_ = (PTM_[:T - k_, :, k_ - 1] - XY_[k_:]).norm(dim=-1)[clean_]
+                    nm_ = f"{k_:02d}"
+                    cm_log.update({f"cm_honest{nm_}_p50": _q(e_, 0.5), f"cm_honest{nm_}_p90": _q(e_, 0.9),
+                                   f"cm_mhonest{nm_}_p50": _q(em_, 0.5)})
+                nz_ = (PTS_ - PTM_)[:, ordm].norm(dim=-1)
+                cm_log.update(cm_noise05=float(nz_[..., 4].pow(2).mean().sqrt()), cm_noise10=float(nz_[..., 9].pow(2).mean().sqrt()))
+                cm_log["cm_off_p99"] = _q(torch.stack(CM["off"])[:, ordm], 0.99)
+                del OKc, DPc, DVc, DPMc, PTS_, PTM_, XY_, cs_, nz_
         pg_adv_share = None
         if pg_on and car_cost is not None:
             # (11-25) how much of the advantages' spread the plan-car cost makes: GAE of that reward part alone with a zero
@@ -3630,6 +3863,12 @@ def main(argv=None):
                            pred_clear_far_share=car_st["pc_far"])
         if pg_on:
             row.update(pg_log)
+        if cm_on:
+            # (11-25) --commit-plan: "std" stays the per-output std (each step's marginal under the coefficient noise, what the
+            # site and tools read), "std_coef" the coefficients' own [turn deg 0..9, speed deg 0..9]
+            _ls_eff = torch.maximum(actor.log_std, actor.log_std_floor).detach()
+            row.update(cm_log, cm_w=cm_w, std=[round(float(x), 3) for x in PC.step_std(_ls_eff, cm_Q)],
+                       std_coef=[round(float(x), 3) for x in _ls_eff.exp()])
         if car_on or drv.opp is not None:
             # at-fault car contacts per minute against each pace (<0.7, 0.7-0.9, >=0.9 / own), the ordinary races
             row["car_fault_per_min_by_pace"] = [float(f_) / (float(n_) * PS.DT / 60.0) if float(n_) > 0 else None
@@ -3744,6 +3983,7 @@ def main(argv=None):
               + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
               + (pg_line(row) if pg_on else "")
+              + (cm_line(row) if cm_on else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, " + (f"실제로 간 길과 0.5 s / 1.0 s 차이 {row['tail_next_05'] * 100:.0f} / {(row['tail_driven_10'] or 0) * 100:.0f} cm"
                  if args.tail_target == "driven" else f"다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm")
                  + (f", 몸통 gradient policy 대비 {row['tail_trunk_ratio']:.2f}배" if row.get("tail_trunk_ratio") is not None else "") + " | "
