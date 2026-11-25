@@ -2804,7 +2804,7 @@ def main(argv=None):
                 cool += 1
                 if tailc:
                     ii_ = PT_IDX.to(dev)
-                    PTSP.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
+                    PTS.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
                 if remover is not None:
                     was = remover.removed.clone()
                     remover.step()
