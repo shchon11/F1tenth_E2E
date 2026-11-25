@@ -18,6 +18,9 @@ BL = int(sys.argv[1]) if len(sys.argv) > 1 else 304
 L = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 S = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 dev = torch.device("cuda")
+import os
+if os.environ.get("PTS_COST_TF32") == "1":                  # TF32 matmuls (Ampere and later)
+    torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(0)
 BEAMS, CH = 1081, 128
 ang = torch.linspace(-math.radians(135), math.radians(135), BEAMS)
@@ -83,11 +86,14 @@ def mb_step():
 opt = torch.optim.Adam(actor.free_parameters(), lr=1e-4)
 
 
+def run(P_, s_):
+    outs = [checkpoint(lambda *a: actor.free(actor.geom, T.PtsIn(*a[:7]), a[7]), *[x[sl] for x in P_], s_[sl], use_reentrant=False)
+            for sl in pieces(n)]
+    return torch.cat([o[0] for o in outs], 0), torch.cat([o[1] for o in outs], 0)
+
+
 def free_step():
     sn = actor.norm(sm)
-    run = lambda P_, s_: tuple(torch.cat([o[j] for o in [checkpoint(lambda *a: actor.free(actor.geom, T.PtsIn(*a[:7]), a[7]),
-                                                                             *[x[sl] for x in P_], s_[sl], use_reentrant=False)
-                                                                  for sl in pieces(n)]], 0) for j in range(2))
     T.free_head_step(actor, opt, Pm, sn, torch.rand(n, 10, device=dev), torch.ones(n, 10, dtype=torch.bool, device=dev), run=run)
 
 
@@ -97,10 +103,10 @@ mem_mb = torch.cuda.max_memory_allocated() / 2 ** 20
 torch.cuda.reset_peak_memory_stats()
 t_free = timed(free_step, n=3, warm=1)
 mem_free = torch.cuda.max_memory_allocated() / 2 ** 20
-res = dict(gpu=torch.cuda.get_device_name(0), bl=BL, L=L, cars_per_mb=S, decisions_per_mb=n, s_roll_decision=t_roll,
+res = dict(gpu=torch.cuda.get_device_name(0), tf32=torch.backends.cuda.matmul.allow_tf32, bl=BL, L=L, cars_per_mb=S, decisions_per_mb=n, s_roll_decision=t_roll,
            s_minibatch=t_mb, s_free_step=t_free, mb_roll_peak=mem_roll, mb_update_peak=mem_mb, mb_free_peak=mem_free)
 print(json.dumps(res, indent=1))
-print(f"[비용] {res['gpu']}: rollout 결정 하나(차 {BL}대, policy + 빈 공간 머리) {t_roll * 1000:.1f} ms (최고 {mem_roll:.0f} MB); "
+print(f"[비용] {res['gpu']}{' TF32' if res['tf32'] else ''}: rollout 결정 하나(차 {BL}대, policy + 빈 공간 머리) {t_roll * 1000:.1f} ms (최고 {mem_roll:.0f} MB); "
       f"minibatch 하나({n} 결정 = {L} x {S}대) 앞뒤 {t_mb:.2f} s (최고 {mem_mb:.0f} MB), 빈 공간 머리 한 걸음 {t_free:.2f} s "
       f"(최고 {mem_free:.0f} MB)", flush=True)
 if len(sys.argv) > 4:
