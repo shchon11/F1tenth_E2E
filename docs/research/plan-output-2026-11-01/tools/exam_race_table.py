@@ -6,6 +6,8 @@
     반 바퀴 출발은 상대가 반 바퀴 앞에서 시작한 것으로 셈
   - 우리 책임 차 접촉: 차끼리 닿기 시작한 때 env 규칙(뒤 차, 또는 차 길이 안에 나란히)이 우리 탓으로 보는 것
   - 세게 닿음(벽 · 상자 · 차), 멈춤(2 s 동안 트랙을 따라 1 m도 못 간 적 있는 세션, 그렇게 보낸 시간)
+  - (11-25) 뒤돌아 1 m 넘게 달린 세션(앞으로 0.2 m/s 넘게 가는데 남은 거리가 늘어난 결정이 이어진 구간이 1 m 넘음), 후진한 세션(참고: 뒤로
+    빼는 것은 허용)
   - 앞차 plan 겹침(11-24, plan_rl --plan-car-cost와 같은 계산 `f1sim.learn.plan_car_cost`): 상대 차가 알 수 있게(10 m 안, 1 s 안에
     벽에 안 가린 시선) 트랙을 따라 앞에 있는 결정 중, plan 점이 같은 시각 상대 차의 실제 자리와 겹치고(차 크기 원 3개, 0.05 m 여유)
     env 규칙으로 우리 책임인 몫. 기록에 없는 것은 근사: LiDAR 빔 대신 스캐너에서 상대 차 중심까지의 시선(벽 칸 없음, +-135도),
@@ -75,6 +77,30 @@ def runs(mask, n_min):
         longest = np.maximum(longest, cur)
     return cnt, longest
 
+WW_V, WW_M = 0.2, 1.0    # (11-25) facing backwards and driving: forward speed above this [m/s]; a session counts past this many metres
+
+
+def wrong_way(st, rem, rs, L, T):
+    """(11-25, the user: "후진은 상관없는데 뒤돌아서 가는경우가 있어서") per session: the longest stretch driven facing backwards [m]
+    and whether the car reversed at all (forward speed below -0.1 m/s; information only -- backing out is allowed).
+    Facing backwards and driving = the body-frame forward speed above WW_V while the walls-only distance to go grows: moving
+    forwards in the car's own frame and away from the finish means the nose points back along the track (plan_rl
+    --wrong-way-cost's state; on race33b u975's exam4 this agreed with the field-direction test on 99.94 % of the decisions).
+    A stretch = consecutive such decisions, its metres the growth of the distance to go (a line crossing unwrapped, a restart
+    not counted)"""
+    vx = st[:T, :, 3].astype(float)
+    r = rem[:T + 1].astype(float).copy()
+    for t in range(1, r.shape[0]):                       # a wall / off-grid sample holds the last value
+        bad = ~np.isfinite(r[t]); r[t, bad] = r[t - 1, bad]
+    dr = r[1:] - r[:-1]
+    dr = np.mod(dr + 0.5 * L, L) - 0.5 * L
+    dr[~np.isfinite(dr)] = 0.0
+    dr[rs[:T].astype(bool)] = 0.0
+    ww = (vx > WW_V) & (dr > 0)
+    cur = np.zeros(vx.shape[1]); best = np.zeros(vx.shape[1])
+    for t in range(T):
+        cur = np.where(ww[t], cur + dr[t], 0.0); best = np.maximum(best, cur)
+    return best, (vx < -0.1).any(0)
 
 
 fn = sys.argv[1]
@@ -107,6 +133,7 @@ slow = adv < STUCK_M; slow[:n1] = False
 stalls, longest = runs(slow, 1)
 stuck_s = slow.sum(0) * dt
 laps, olaps = P[-1] / L, Po[-1] / L
+ww_m, rev = wrong_way(z["st"], z["rem"], z["rs"], L, T)
 
 
 def view_now(z, T1, mount_x, rmax=12.0, fov=np.radians(135.0), step=0.1, short=0.35, chunk=30):
@@ -198,7 +225,8 @@ print(f"== exam4 경주 시험 · {dict(map='MAP', track='시간 추종기', ide
       + {"clear_oracle": " · 간격 입력 = 상대 복사본 plan(오라클)", "oracle": " · 예측 입력 = 상대 복사본 plan(오라클)"}.get(
           str(z["pred_mode"]) if "pred_mode" in z.files else "", "") + " ==")
 hdr = (f"{'조건':<22} | {'세션':>3} | {'바퀴 (상대)':>13} | {'앞지름':>15} | {'앞지름 당함':>6} | {'우리 책임 차 접촉':>14} | "
-       f"{'세게 닿음 벽 · 상자 · 차':>20} | {'멈춘 세션':>14} | {'앞차 plan 겹침':>18} | {'지금 자리 지나되 실제와 안 겹친 plan':>18}")
+       f"{'세게 닿음 벽 · 상자 · 차':>20} | {'멈춘 세션':>14} | {'뒤돌아 1 m 넘게 달린 세션':>14} | {'후진한 세션(참고)':>14} | "
+       f"{'앞차 plan 겹침':>18} | {'지금 자리 지나되 실제와 안 겹친 plan':>18}")
 
 
 def line(label, m):
@@ -207,7 +235,7 @@ def line(label, m):
         return
     print(f"{label:<22} | {n:>3} | {laps[m].mean():5.2f} ({olaps[m].mean():4.2f}) | {mean(made[m]):>15} | {lost[m].mean():6.2f} | "
           f"{mean(fault[m]):>14} | {hard[m, 0].mean():5.2f} · {hard[m, 1].mean():4.2f} · {hard[m, 2].mean():4.2f} | {pct(stalls[m] > 0):>14} | "
-          f"{pooled(m):>18} | {pooled(m, mv_n, mv_want):>18}")
+          f"{pct(ww_m[m] > WW_M):>14} | {pct(rev[m]):>14} | {pooled(m):>18} | {pooled(m, mv_n, mv_want):>18}")
 
 
 START = {0: "반 바퀴", 1: "5 m 뒤"}

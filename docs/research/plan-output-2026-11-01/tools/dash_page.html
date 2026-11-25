@@ -202,6 +202,7 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
         <div><h4>상자</h4><div class="cbox"><canvas id="c_cb"></canvas></div></div>
         <div><h4>상대 차</h4><div class="cbox"><canvas id="c_cc2"></canvas></div></div></div></div>
     <div class="card hide" data-opt="car_fault_per_min"><h3>우리 책임 차 접촉 / 분</h3><div class="cbox"><canvas id="c_fault"></canvas></div></div>
+    <div class="card hide" data-opt="wrong_way_cost_per_min"><h3>역주행 <span class="sub">바퀴/분</span></h3><div class="cbox"><canvas id="c_ww"></canvas></div></div>
     <div class="card hide" data-opt="near_miss_per_min"><h3>아슬아슬 스침 / 분</h3><div class="cbox"><canvas id="c_near"></canvas></div></div>
     <div class="card hide" data-opt="plan_car_share" style="grid-column: 1 / -1"><h3>앞차 plan 겹침 <span class="sub">%</span></h3>
       <div class="trio"><div><h4>0.7배 미만</h4><div class="cbox"><canvas id="c_pcar1"></canvas></div></div>
@@ -461,7 +462,8 @@ async function refresh() {
   chart("c_cb", two((r) => r.contacts_prop_per_min));
   chart("c_cc2", two((r) => r.contacts_car_per_min));
   // (11-24) the race phase's numbers: a chart only where the run (or the comparison run) writes them
-  for (const [id, k] of [["c_fault", "car_fault_per_min"], ["c_near", "near_miss_per_min"], ["c_pe05", "pred_err_05"], ["c_pe10", "pred_err_10"], ["c_pzz", "pred_zigzag"], ["c_aux", "aux_auc"]]) {
+  // (11-25, plan_rl --wrong-way-cost) the wrong-way cost a minute
+  for (const [id, k] of [["c_fault", "car_fault_per_min"], ["c_ww", "wrong_way_cost_per_min"], ["c_near", "near_miss_per_min"], ["c_pe05", "pred_err_05"], ["c_pe10", "pred_err_10"], ["c_pzz", "pred_zigzag"], ["c_aux", "aux_auc"]]) {
     const has = own.some((r) => r[k] != null) || rrOwn.some((r) => r[k] != null);
     document.querySelector(`[data-opt="${k}"]`).classList.toggle("hide", !has);
     if (has) chart(id, two((r) => r[k]), k !== "aux_auc"); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
