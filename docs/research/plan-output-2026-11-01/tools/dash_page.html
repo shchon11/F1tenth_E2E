@@ -206,6 +206,10 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
       <div class="trio"><div><h4>0.7배 미만</h4><div class="cbox"><canvas id="c_pcar1"></canvas></div></div>
         <div><h4>0.7-0.9배</h4><div class="cbox"><canvas id="c_pcar2"></canvas></div></div>
         <div><h4>0.9배 이상</h4><div class="cbox"><canvas id="c_pcar3"></canvas></div></div></div></div>
+    <div class="card hide" data-opt="pg_ratio" style="grid-column: 1 / -1"><h3>plan 직접 gradient</h3>
+      <div class="trio"><div><h4>직접 / PPO gradient</h4><div class="cbox"><canvas id="c_pg1"></canvas></div></div>
+        <div><h4>차 항이 켜진 결정 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_pg2"></canvas></div></div>
+        <div><h4>앞 4 m 차 결정의 PPO gradient 몫 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_pg3"></canvas></div></div></div></div>
     <div class="card hide" data-opt="plan_now_clear_share"><h3>앞차 지금 자리 지나되 실제와 안 겹친 plan <span class="sub">%</span></h3><div class="cbox"><canvas id="c_pnow"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
@@ -461,6 +465,17 @@ async function refresh() {
     document.querySelector('[data-opt="plan_car_share"]').classList.toggle("hide", !has);
     for (const [id, k] of [["c_pcar1", "plan_car_share_lt07"], ["c_pcar2", "plan_car_share_07_09"], ["c_pcar3", "plan_car_share_ge09"]]) {
       if (has) chart(id, two((r) => r[k] == null ? null : 100 * r[k])); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+    }
+  }
+  {   // (11-25, --plan-grad-cost) the direct gradient against PPO's; how often the car term is on; the PPO share of cars ahead
+    const has = own.some((r) => r.pg_ratio != null) || rrOwn.some((r) => r.pg_ratio != null);
+    document.querySelector('[data-opt="pg_ratio"]').classList.toggle("hide", !has);
+    const pc = (k) => (r) => r[k] == null ? null : 100 * r[k];
+    const sec = (lab, f) => [Object.assign(ds(lab, series(rows, f, OFF.run), rgba(css("--run"), 0.6), false), {borderWidth: 1.4, borderDash: [5, 4]})];
+    for (const [id, sets] of [["c_pg1", [...two((r) => r.pg_ratio), ...sec("한 걸음", (r) => r.pg_ratio_step_est)]],
+                              ["c_pg2", [...two(pc("pg_near_car")), ...sec("실제 겹침", pc("pg_hard_car"))]],
+                              ["c_pg3", [...two(pc("pg_rel_grad_share")), ...sec("결정 몫", pc("pg_rel_dec_share"))]]]) {
+      if (has) chart(id, sets); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
     }
   }
   {   // (11-25) plans through the car-ahead's spot now that stay clear of its real future

@@ -28,7 +28,10 @@ FIELDS = ("update", "min", "t_roll", "t_upd", "laps_per_min", "speed", "contacts
           "plan_car_share", "plan_car_share_lt07", "plan_car_share_07_09", "plan_car_share_ge09",  # (11-25) --plan-car-cost
           "pred_zigzag", "pred_zigzag_p90",   # (11-25) the other car's predicted path: zig-zag against the realised [deg]
           # (11-25) plans through the car-ahead's spot now that stay clear of its real future (plan_car_cost.moving_read)
-          "plan_now_clear_share", "plan_now_clear_share_lt07", "plan_now_clear_share_07_09", "plan_now_clear_share_ge09")
+          "plan_now_clear_share", "plan_now_clear_share_lt07", "plan_now_clear_share_07_09", "plan_now_clear_share_ge09",
+          # (11-25) --plan-grad-cost: the direct gradient against PPO's, how often the car term is on, the PPO gradient's share
+          # from the decisions with a car 0-4 m ahead
+          "pg_ratio", "pg_ratio_step_est", "pg_near_car", "pg_hard_car", "pg_rel_grad_share", "pg_rel_dec_share", "pg_lambda")
 TYPES = {".png": "image/png", ".mp4": "video/mp4", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
          ".json": "application/json", ".jpg": "image/jpeg", ".md": "text/plain; charset=utf-8"}
 _memo, _lock = {}, threading.Lock()
