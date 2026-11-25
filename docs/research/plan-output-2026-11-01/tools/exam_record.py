@@ -53,6 +53,10 @@ OK): race4 + 상대 차 예측 머리가 있는 checkpoint(plan_rl --pred-opp)�
     움직이나: 예측 점 0.5 m 왼쪽 / 오른쪽 / 앞 / 뒤, P(보임) = 없음; 기준 = 우리 속도 입력(마지막 명령 속도 + 지난 plan 속도 10개) +0.5 m/s,
     지난 plan 9점 0.5 m 왼쪽. 같은 입력으로 다시 돈 plan이 몬 plan과 같은지도 남김(base_err). 분석은 pred_check.py.
   SAVE (11-25, LiDAR 표현 시험 lidar_repr_test.py): 주행은 그대로, 머리의 예측·P(보임)·'있음'·거리·오라클만 남김 (교란 추가 계산 없음).
+F1SIM_EXAM_PRED_CLEAR_ORACLE=1 (11-25, 오라클 관문 -- plan_rl --pred-clear-oracle로 배운 policy의 exam4는 이것으로 봐야 학습과 같은 입력):
+  race4 + --pred-clear checkpoint만. trunk가 읽는 간격 10개를 예측 head 대신 상대 복사본이 이번 결정에 그린 자기 plan으로 잼(학습과 같은
+  코드 pred_oracle.copy_oracle: 페이스 f인 복사본은 t초 뒤 = plan의 f t초 자리, 원 3개, '있음' 규칙 P = 1 / 0, 없으면 3 m). 예측 입력(점 20개 +
+  P(보임))은 head 그대로. 복사본 plan을 우리 결정보다 먼저 그림(값은 같음). `출력_pred.npz`에 there/dist/head/orc와 간격 입력(pc, pc_use)을 남김.
 F1SIM_EXAM4_PACES="a,b,c,d" (11-25, 표현 시험용 기록이지 exam4 점수가 아님): race4의 상대 페이스 4가지를 바꿈 (기본 0.6,0.8,0.95,1.0).
 F1SIM_EXAM_SAVE_SCAN=1이면 `_scan.npz`에 결정마다 우리 차의 참 속도·옆속도·회전 속도(ego: vx, vy, r)도 남김 (11-25).
 F1SIM_EXAM_SAVE_BOXVIS=1 (11-25, 상자 기억 시험): 결정마다 상자 칸마다 트랙 따라 앞 거리(plan_rl.box_along, 학습의 벽 기준 거리장 -- 타깃
@@ -134,7 +138,11 @@ PRED_ORACLE = os.environ.get("F1SIM_EXAM_PRED_ORACLE", "") == "1"
 PRED_PROBE = os.environ.get("F1SIM_EXAM_PRED_PROBE", "") == "1"
 # (11-25) the head's prediction, 'there' and the oracle recorded, driving unchanged and no extra passes (lidar_repr_test.py)
 PRED_SAVE = os.environ.get("F1SIM_EXAM_PRED_SAVE", "") == "1"
-assert (PRED_ORACLE + PRED_PROBE + PRED_SAVE) <= 1, "one of F1SIM_EXAM_PRED_ORACLE / _PROBE / _SAVE"
+# (11-25, the ORACLE gate) a --pred-clear checkpoint in race4: its 10 clearances against the copy's own plan (plan_rl
+# --pred-clear-oracle's input, `pred_oracle.copy_oracle`), the prediction inputs the head's own
+PRED_CLEAR_ORACLE = os.environ.get("F1SIM_EXAM_PRED_CLEAR_ORACLE", "") == "1"
+assert (PRED_ORACLE + PRED_PROBE + PRED_SAVE + PRED_CLEAR_ORACLE) <= 1, \
+    "one of F1SIM_EXAM_PRED_ORACLE / _PROBE / _SAVE / _CLEAR_ORACLE"
 # (11-25) the box memory probe: every box slot's along-track distance ahead, live, in view now (boxes_in_view)
 SAVE_BOXVIS = os.environ.get("F1SIM_EXAM_SAVE_BOXVIS", "") == "1"
 ALL_BOXES = os.environ.get("F1SIM_EXAM_ALL_BOXES", "") == "1"   # line3: a bank layout in every session
@@ -450,12 +458,13 @@ if RACE4:
 others = env.sim.other_idx[lid][:, 0]
 eid = env.sim.eid[lid]
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
-PRED = PRED_ORACLE or PRED_PROBE or PRED_SAVE
+PRED = PRED_ORACLE or PRED_PROBE or PRED_SAVE or PRED_CLEAR_ORACLE
 if PRED:
     assert RACE4 and so is not None and getattr(actor, "pred_opp", False), "PRED_ORACLE / PRED_PROBE: race4 and a pred_opp checkpoint"
     assert getattr(actor, "branches", 1) == 1 and not getattr(actor, "pace_levels", 0) and not ROLL and not SLIP
-    from f1sim.learn.plan_policy import PRED_N, PRED_SCALE, pred_points, pred_headings, prev_plan_poses
+    from f1sim.learn.plan_policy import PRED_N, PRED_SCALE, PC_SCALE, pred_points, pred_headings, prev_plan_poses
     PC_ON = bool(getattr(actor, "pred_clear", False))       # (11-25) --pred-clear: the clearances follow the probe / oracle too
+    assert PC_ON or not PRED_CLEAR_ORACLE, "F1SIM_EXAM_PRED_CLEAR_ORACLE: a --pred-clear checkpoint"
     PC_PREV = {}
     from f1sim.learn.plan_reward import SEEN_S
     PRED_RANGE = float(ck["args"].get("pred_range") or 10.0)
@@ -735,6 +744,14 @@ for kd in range(T):
             _qo = torch.cat([(_orc / PRED_SCALE).reshape(Bl, -1), (_there.float() * 60.0 - 30.0)[:, None]], 1)
             actor.clear_in = (lambda q_, prev_, psi=None, _q=_qo, _h=pred_headings(_orc.float()):
                               type(actor).clear_in(actor, _q, prev_, psi=_h))
+    if PRED_CLEAR_ORACLE:
+        so.plan()                                               # the copy's plan first (it does not read ours): the oracle
+        PRD["orc"].append(opp_oracle(st).float().cpu())
+        from f1sim.learn.pred_oracle import copy_oracle
+        _pcv, _pcu = copy_oracle(so, O_OF, st[:, :3], _there, absent[others], obs.prev_poses(), actor.pc_dims)
+        # the trunk reads these where a copy drives the other car (every race4 race) -- plan_rl's `pc_over`
+        actor.clear_in = (lambda q_, prev_, psi=None, _v=_pcv, _u=_pcu:
+                          torch.where(_u[:, None], _v, type(actor).clear_in(actor, q_, prev_, psi=psi)))
     if PRED_PROBE:
         _scans0, _s0 = obs.scans.clone(), obs.state().clone()
         if PC_ON:
@@ -749,6 +766,8 @@ for kd in range(T):
     if PRED:                                                    # the head's own answer this decision (computed in either mode)
         _hp, _hv = pred_points(actor.pred_out.float())
         PRD["head"].append(_hp.cpu()); PRD["head_p"].append(_hv.cpu())
+    if PRED_CLEAR_ORACLE:                                       # the clearances the trunk read [m], where the oracle gave them
+        PRD.setdefault("pc", []).append((actor.pc_out * PC_SCALE).float().cpu()); PRD.setdefault("pc_use", []).append(_pcu.cpu())
     if ROLL:                                                    # the committed 0.9 s rolled on, the policy's last step appended
         u_x = u_ if r_p is None else torch.where(r_full[:, None], u_, roll_shift_c(r_u, u_, ROLL_C))
         v_s = v_hat.detach().clamp(-PS.V_REV, PS.V_FWD); d_s = cmd_d0
@@ -798,7 +817,7 @@ for kd in range(T):
         env.sim.ideal_vcap[lid] = 1e3
     restarted = torch.zeros(Bl, dtype=torch.bool, device=dev)
     if so is not None:
-        if not PRED_ORACLE:                                     # (ORACLE: made before our decision)
+        if not (PRED_ORACLE or PRED_CLEAR_ORACLE):              # (ORACLE: made before our decision)
             so.plan()
         cf_ = torch.zeros(Bl, device=dev)
     if PRED_PROBE or PRED_SAVE:                                 # driving above is done; these passes touch nothing it reads
@@ -883,7 +902,7 @@ if RACE4:
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
-D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else ("save" if PRED_SAVE else ""))); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
+D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("clear_oracle" if PRED_CLEAR_ORACLE else ("probe" if PRED_PROBE else ("save" if PRED_SAVE else "")))); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 if SAVE_MEM:
@@ -895,7 +914,7 @@ if SAVE_PLAN:
     np.savez_compressed(out_npz[:-4] + "_plan.npz", **{k: torch.stack(v).numpy() for k, v in PLN.items()})
 if PRED:
     _pd = {k: torch.stack(v).numpy() for k, v in PRD.items() if v}
-    _pd.update(mode=np.array("oracle" if PRED_ORACLE else ("probe" if PRED_PROBE else "save")), pred_range=np.array(PRED_RANGE), seen_s=np.array(SEEN_S),
+    _pd.update(mode=np.array("oracle" if PRED_ORACLE else ("clear_oracle" if PRED_CLEAR_ORACLE else ("probe" if PRED_PROBE else "save"))), pred_range=np.array(PRED_RANGE), seen_s=np.array(SEEN_S),
                pace_of=so.pace[O_OF].float().cpu().numpy(), pred_scale=np.array(PRED_SCALE))
     if PRED_PROBE:
         _pd.update(probe_names=np.array([n_ for n_, _, _ in PROBES]), probe_cols=np.array(PCOLS))

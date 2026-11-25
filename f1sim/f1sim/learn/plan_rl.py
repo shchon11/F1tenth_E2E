@@ -54,6 +54,7 @@ from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
 from .plan_reward import PlanReward, SEEN_S, T_REF
 from . import plan_car_cost as PCC
+from .pred_oracle import copy_oracle
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
 from . import pts_policy as PTSP
@@ -638,10 +639,11 @@ class Driver:
         self.near_on = False                                   # --scene-near-miss: the closest the bodies came this decision
         self.near_gap = None
 
-    def decision(self, a: torch.Tensor, p=None, charge=None, charge_from=None, charge_to=None):
+    def decision(self, a: torch.Tensor, p=None, charge=None, charge_from=None, charge_to=None, opp_planned: bool = False):
         """drive one decision: `p` a plan already made (v2: from the policy's speed estimate and last command), else
         made from `a` at the car's true state (v1). `charge` (B_l,) bool: rows whose plan is new this decision -- the
-        plan-hit cost is charged once, when a plan is drawn (a held plan's later decisions pay none)"""
+        plan-hit cost is charged once, when a plan is drawn (a held plan's later decisions pay none). `opp_planned`
+        (--pred-clear-oracle): the copies' plans of this decision are drawn already (before ours)"""
         env, lid = self.env, self.lid
         st = env.sim.state[lid].clone()
         if p is None:
@@ -657,7 +659,7 @@ class Driver:
         pts = torch.stack([x[:, idx], y[:, idx]], -1)
         env.sim.ideal_vcap[lid] = 1e3
         restarted = torch.zeros(lid.numel(), dtype=torch.bool, device=a.device)
-        if self.opp is not None:
+        if self.opp is not None and not opp_planned:
             self.opp.plan()
         if self.near_on:
             self.near_gap = torch.full((lid.numel(),), float("inf"), device=a.device)
@@ -826,6 +828,7 @@ def _arg_problem(args) -> str:
         (args.pred_opp and not (args.memory and args.mem_front and v2 and not v3), "--pred-opp needs --memory --mem-front (v2)"),
         (args.pred_smooth and not args.pred_opp, "--pred-smooth needs --pred-opp"),
         (args.pred_clear and not args.pred_opp, "--pred-clear needs --pred-opp"),
+        (args.pred_clear_oracle and not (args.pred_clear and args.self_opp > 0), "--pred-clear-oracle needs --pred-clear and --self-opp"),
         (args.plan_car_cost > 0 and (not v2 or v3 or args.hold_p > 0 or bool(args.plan_roll) or bool(args.roll_grow)
                                      or args.branches == 2),
          "--plan-car-cost needs --format v2 without --hold-p / --plan-roll / --roll-grow / --branches 2"),
@@ -1302,6 +1305,14 @@ def main(argv=None):
                          "previous plan, clipped to [-1, 3] m, / 3. Count-agnostic (`plan_car_cost.clearance`: any number of "
                          "predicted things, the minimum). Its 10 trunk columns start at zero (a fork drives as its parent); the "
                          "values are stored per decision, so the update reads exactly what the rollout did")
+    ap.add_argument("--pred-clear-oracle", action="store_true",
+                    help="(11-25, the ORACLE gate, agreed with the user) with --pred-clear and --self-opp: the 10 clearances are "
+                         "measured against the other car's OWN plan of this decision (a frozen copy drives its plan exactly: "
+                         "0.07 m off at 0.5 s, 0.27 m at 1 s) instead of the head's prediction -- its points at t_k (a copy at "
+                         "pace f: the plan's pose at f t_k), the same 3 discs, 'there' rule (P = 1 / 0) and far value "
+                         "(`pred_oracle`). The copies' plans are drawn before our decision (they do not read ours). Rows whose "
+                         "other car a scripted driver drives keep the head's clearances. The copies themselves read their own "
+                         "head. Stored per decision as --pred-clear's; the exam: F1SIM_EXAM_PRED_CLEAR_ORACLE=1")
     ap.add_argument("--pred-lr", type=float, default=3e-4, help="--pred-opp: the head's own Adam learning rate")
     ap.add_argument("--pred-range", type=float, default=10.0,
                     help="--pred-opp: [m] the other car counts as there (target 'visible', and the positions taught) within "
@@ -1418,7 +1429,9 @@ def main(argv=None):
                          "decision once per update)")
     ap.add_argument("--free-oracle", action="store_true",
                     help="--arch pts, for the gate: the policy reads the TRUE clearances instead of the head's (walls and seen boxes "
-                         "exact; the other car from the plan its copy is driving, or its speed and turn held) -- the head still learns")
+                         "exact; the other car from the plan its copy draws this decision -- copies plan first, as with "
+                         "--pred-clear-oracle -- driven exactly at its pace; a scripted car: its speed and turn held) -- the head "
+                         "still learns")
     ap.add_argument("--opp-present-ramp", default="",
                     help="U0,U1 (11-25): the share of races with the other car (the world's opp_present) is 0 until update U0 and "
                          "reaches the world's value at U1 -- copies of a fresh policy cannot drive")
@@ -1596,6 +1609,10 @@ def main(argv=None):
     pc_on = bool(args.pred_clear)                                  # (11-25) --pred-clear
     if pc_on and not pred_on:
         raise SystemExit("--pred-clear needs --pred-opp")
+    pc_orc = bool(args.pred_clear_oracle)                          # (11-25) --pred-clear-oracle: the ORACLE gate
+    if pc_orc and not (pc_on and drv.opp is not None):
+        raise SystemExit("--pred-clear-oracle needs --pred-clear and --self-opp")
+    orc_n = torch.zeros(3, device=dev)                             # decisions: the copy's plan read, no other car, the head's
     car_on = args.plan_car_cost > 0                                # (11-24) --plan-car-cost
     if car_on and (not v2 or v3 or env.M < 2 or args.hold_p > 0 or args.plan_roll or args.roll_grow or two):
         raise SystemExit("--plan-car-cost needs --format v2, a world with another car, without --hold-p / --plan-roll / "
@@ -1611,6 +1628,10 @@ def main(argv=None):
         print(f"[plan_rl] plan-예측 간격 입력: 결정마다 직전 plan이 0.1-1.0 s에 우리 차를 둘 자리와 예측한 상대 차(P(있음) >= 0.5) 사이 "
               f"가장 좁은 간격 10개 (원 3개, 겹침 여유 {args.plan_car_margin:g} m, 없으면 3 m, -1-3 m로 자르고 /3), trunk 끝 10칸 0에서 시작",
               flush=True)
+    if pc_orc:
+        print("[plan_rl] 오라클 관문(--pred-clear-oracle): 간격 입력의 상대 차 자리를 예측 head 대신 상대 복사본이 이번 결정에 그린 "
+              "자기 plan에서 읽음 (페이스 f인 복사본은 t초 뒤 = plan의 f·t초 자리, 원 3개·'있음' 규칙·없으면 3 m는 같음); "
+              "복사본 plan을 우리 결정보다 먼저 그림. 대본 운전자가 모는 상대는 head 그대로", flush=True)
     hold = args.hold_p > 0
     if hold and not v2:
         raise SystemExit("--hold-p needs --format v2 or v3")
@@ -2251,6 +2272,7 @@ def main(argv=None):
         actor.eval(); critic.eval()
         for t in range(T):
             with torch.no_grad():
+                fo_planned = False                         # --free-oracle: the copies have drawn this decision's plans
                 sc, s = obs.scans.clone(), obs.state()
                 pv_ = priv_h()
                 if scene is not None:
@@ -2334,6 +2356,20 @@ def main(argv=None):
                         if aux_opp:
                             ax_ = torch.cat([ax_, track_opp(env, pr.goal, lid, args.aux_opp)], 1)
                         AX.append(ax_)
+                    pc_x = None
+                    if pc_orc:
+                        # (11-25) --pred-clear-oracle: the copies draw this decision's plans now (they read only their own
+                        # inputs: the same plans `drv.decision` would draw), and the clearances are read off them
+                        drv.opp.plan()
+                        _sm = env.sim.state[lid].float()
+                        _ox = env.sim.state[others[:, 0], :2].float()
+                        _ab = (env.sim.absent[others[:, 0]] if getattr(env.sim, "absent_any", False)
+                               else torch.zeros(Bl, dtype=torch.bool, device=dev))
+                        _th = (~_ab) & ((_ox - _sm[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S)
+                        _pv, _use = copy_oracle(drv.opp, opp_index[others[:, 0]], _sm[:, :3], _th, _ab, obs.prev_poses(),
+                                                actor.pc_dims)
+                        pc_x = (_pv, _use)
+                        orc_n += torch.stack([(_use & ~_ab).sum(), _ab.sum(), (~_use).sum()]).float()
                     if pts_on:
                         # (11-25) the point tokens' inputs; the free-space target's static part (walls, boxes known now) at the
                         # anchors, the other car now (its future is read after the rollout)
@@ -2355,18 +2391,18 @@ def main(argv=None):
                         if args.free_oracle:
                             _oc = _fst
                             if others is not None:
-                                # the other car's next second as known at the decision: the plan its copy drives, else its speed
-                                # and turn held
+                                # the other car's next second as known at the decision: a copy draws this decision's plan now
+                                # (it reads only its own inputs; --pred-clear-oracle's order) and drives it exactly, pace-
+                                # stretched (`pred_oracle.copy_plan_future`); a scripted driver: its speed and turn held
                                 _g = PTSP.car_future_guess(_o)
-                                if drv.opp is not None and getattr(drv.opp, "p", None) is not None:
+                                if drv.opp is not None:
+                                    from .pred_oracle import copy_plan_future
+                                    drv.opp.plan()
+                                    fo_planned = True
                                     _oi = opp_index[others[:, 0]]
-                                    _cp = drv.opp.live[_oi] & ~drv.opp.restarted[_oi]
-                                    if bool(_cp.any()):
-                                        _pp = {k_: (v_[_oi] if k_ != "t" and torch.is_tensor(v_) and v_.dim()
-                                                    and v_.shape[0] == drv.opp.rows.numel() else v_)
-                                               for k_, v_ in drv.opp.p.items()}
-                                        _gp = PTSP.plan_future_poses(_pp, drv.opp.st_plan[_oi].float(), drv.opp.pace[_oi])
-                                        _g = torch.where(_cp[:, None, None], _gp, _g)
+                                    _xy, _ps = copy_plan_future({k_: drv.opp.p[k_][_oi] for k_ in ("x", "y", "psi")},
+                                                                drv.opp.st_plan[_oi], drv.opp.pace[_oi])
+                                    _g = torch.where(drv.opp.live[_oi][:, None, None], torch.cat([_xy, _ps[..., None]], -1), _g)
                                 _hh = torch.tensor([0.5 * fs_L, 0.5 * fs_W], device=dev)
                                 _cg = PTSP.rect_rect_sd(_aw, _hh.expand(Bl, PS.N_STEP, 2), _g, _hh.expand(Bl, PS.N_STEP, 2))
                                 _oc = torch.where(_kn[:, None], torch.minimum(_oc, _cg), _oc)
@@ -2376,7 +2412,7 @@ def main(argv=None):
                         pts_store.record(P_, actor.fs_out)
                         FRAW.append(actor.free_out[0].detach().clone() if actor.free_out is not None else _fst)
                     else:
-                        mean, log_std, v_hat = (actor(sc, s, obs.mem_h, prev=obs.prev_poses()) if pc_on
+                        mean, log_std, v_hat = (actor(sc, s, obs.mem_h, prev=obs.prev_poses(), pc_over=pc_x) if pc_on
                                                 else actor(sc, s, obs.mem_h))
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                     if pc_on:
@@ -2576,7 +2612,8 @@ def main(argv=None):
                         CQ["know"].append(o_ok & ((o_xy - st_me[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S))
                         CQ["pace"].append(pace_t)
                 out, p, (xw_, yw_, pw_) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
-                                                       charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None)
+                                                       charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None,
+                                                       opp_planned=pc_orc or fo_planned)
                 if pts_on:
                     # (11-25) a restart starts a new segment of frames (none older); the boxes known start again
                     pts_store.restarted(out["restarted"], t)
@@ -3626,6 +3663,11 @@ def main(argv=None):
                        scene_solved=int((scene.clean[:scene.n] >= 2).sum()), scene_tries_mean=float(scene.tries[:scene.n].float().mean()) if scene.n else 0.0)
         if drv.opp is not None:
             row.update(self_opp_share=drv.opp.share_on(), self_opp_pool=[int(t_) for t_ in drv.opp.tags])
+        if pc_orc:                                                  # --pred-clear-oracle: where the clearances came from
+            _on = float(orc_n.sum().clamp_min(1.0))
+            row.update(pc_oracle_share=float(orc_n[0]) / _on, pc_oracle_nocar_share=float(orc_n[1]) / _on,
+                       pc_oracle_head_share=float(orc_n[2]) / _on)
+            orc_n.zero_()
         if levels is not None:
             n_new, n_rep = levels.n_new - lv0[0], levels.n_replay - lv0[1]
             n_end, n_hit = levels.ended - lv0[2], levels.ended_hit - lv0[3]
@@ -3683,6 +3725,8 @@ def main(argv=None):
                  + (" [정책은 참값을 읽음]" if args.free_oracle else "") + " | " if pts_on else "")
               + (f"collective {row['dist_calls']}번 | " if dist is not None else "")
               + (f"복사본이 모는 상대 차 {row['self_opp_share'] * 100:.0f} % (update {row['self_opp_pool']}의 복사본) | " if drv.opp is not None else "")
+              + (f"간격 입력(오라클): 복사본 plan {row['pc_oracle_share'] * 100:.1f} %, 상대 없음 {row['pc_oracle_nocar_share'] * 100:.1f} %, "
+                 f"head 그대로 {row['pc_oracle_head_share'] * 100:.1f} % | " if pc_orc else "")
               + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
                  f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "

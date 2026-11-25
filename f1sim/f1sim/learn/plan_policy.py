@@ -1024,9 +1024,12 @@ class Actor2(nn.Module):
             hs.append(h)
         return torch.cat(hs, 0)
 
-    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor], scans: Optional[torch.Tensor] = None, prev=None):
+    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor], scans: Optional[torch.Tensor] = None, prev=None,
+                 pc_over=None):
         """one decision of the memory: (features with the memory added, the new state). A `pred_opp` actor also needs the
-        `scans` (its prediction, left in `pred_out`), a `pred_clear` one `prev` (the clearances, left in `pc_out`)"""
+        `scans` (its prediction, left in `pred_out`), a `pred_clear` one `prev` (the clearances, left in `pc_out`).
+        `pc_over` (11-25, plan_rl --pred-clear-oracle): (clearances (n, PC_N) at the trunk's scale, rows (n,) bool) -- on those
+        rows the trunk reads these instead of the head's (`pred_oracle.copy_oracle`)"""
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
         h1 = self.mem_cell(f, h0)
         if self.mem_front:
@@ -1037,14 +1040,17 @@ class Actor2(nn.Module):
                 self.pred_out = self.pred_q(scans, f, h1)
                 pin = self.pred_feed(self.pred_out)
             if self.pred_clear:
-                pc = self.pc_out = self.clear_in(self.pred_out, prev)
+                pc = self.clear_in(self.pred_out, prev)
+                if pc_over is not None:
+                    pc = torch.where(pc_over[1][:, None], pc_over[0].to(pc.dtype), pc)
+                self.pc_out = pc
             return self.mem_trunk(f, h1, pin, pc), h1
         return f + self.mem_out(h1), h1
 
-    def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None, prev=None):
+    def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None, prev=None, pc_over=None):
         f = self.features(scans, state)
         if self.memory:
-            f, self.h_out = self.remember(f, h, scans, prev)
+            f, self.h_out = self.remember(f, h, scans, prev, pc_over)
         return self.heads(f)
 
     def policy_parameters(self):

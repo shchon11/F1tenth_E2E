@@ -898,22 +898,3 @@ def car_future_guess(op_state: torch.Tensor, K: int = N_PQ) -> torch.Tensor:
     dx = torch.where(small, v[:, None] * t * torch.cos(th[:, None]), v[:, None] / rr.where(~small, torch.ones_like(rr)) * (torch.sin(h) - torch.sin(th[:, None])))
     dy = torch.where(small, v[:, None] * t * torch.sin(th[:, None]), v[:, None] / rr.where(~small, torch.ones_like(rr)) * (torch.cos(th[:, None]) - torch.cos(h)))
     return torch.stack([x[:, None] + dx, y[:, None] + dy, h], -1)
-
-
-def plan_future_poses(p: dict, st_plan: torch.Tensor, pace: torch.Tensor, K: int = N_PQ, since: float = PS.DT) -> torch.Tensor:
-    """--free-oracle: where a copy-driven car will be at t_k after now, from the plan it is driving (drawn `since` s ago from
-    st_plan (B, 3), dense poses p['x'/'y'/'psi'] (B, M) at p['t'] (M,)), at its pace f (B,): the plan's time f (since + t_k);
-    past the plan's end its last speed x f along its last heading -> (B, K, 3) world"""
-    t_rel = since + torch.arange(1, K + 1, device=st_plan.device, dtype=torch.float32) * PS.DT     # (K,)
-    tau = pace.float()[:, None] * t_rel[None]                                                   # (B, K) plan time
-    M = p["x"].shape[1]
-    h = float(p["t"][1] - p["t"][0])
-    g = (tau / h).clamp(0.0, M - 1 - 1e-6)
-    i0 = g.floor().long(); w = g - i0.float()
-    pick = lambda a: a.gather(1, i0) * (1 - w) + a.gather(1, (i0 + 1).clamp_max(M - 1)) * w
-    x, y, psi = pick(p["x"].float()), pick(p["y"].float()), pick(p["psi"].float())
-    over = (tau - float(p["t"][-1])).clamp_min(0.0)
-    vl = p["v"][:, -1:].float() * 1.0
-    x = x + vl * over * torch.cos(p["psi"][:, -1:].float()); y = y + vl * over * torch.sin(p["psi"][:, -1:].float())
-    c, s = torch.cos(st_plan[:, 2:3]), torch.sin(st_plan[:, 2:3])
-    return torch.stack([st_plan[:, 0:1] + x * c - y * s, st_plan[:, 1:2] + x * s + y * c, st_plan[:, 2:3] + psi], -1)
