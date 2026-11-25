@@ -1,0 +1,26 @@
+11:12:19 start opp pts5
+12:07:42 end opp pts5 rc 0 	Maximum resident set size (kbytes): 3054876
+12:07:42 start clr clr_pts5
+12:32:39 end clr clr_pts5 rc 0 	Maximum resident set size (kbytes): 2447188
+12:32:39 start clr clr_bev10b
+12:41:28 end clr clr_bev10b rc 0 	Maximum resident set size (kbytes): 2628076
+12:41:28 start clr clr_bev10
+12:45:45 queue2.sh stopped by PID after the coordinator added the car-clearance probe; clr_bev10 keeps running, queue3.sh takes over
+12:49:49 end clr clr_bev10 (orphaned from queue2) 	Maximum resident set size (kbytes): 2695444
+12:49:49 start clr clr_polar_gru
+12:53:15 end clr clr_polar_gru rc 0 	Maximum resident set size (kbytes): 4084068
+12:53:15 start car car_pts5
+13:20:18 end car car_pts5 rc 0 	Maximum resident set size (kbytes): 2907784
+13:20:18 start car car_bev10b
+13:30:00 end car car_bev10b rc 0 	Maximum resident set size (kbytes): 3099168
+13:30:00 start car car_polar_gru
+13:34:00 end car car_polar_gru rc 0 	Maximum resident set size (kbytes): 3176572
+13:34:00 start box box_ptmem_noise
+13:39:12 end box box_ptmem_noise rc 0 	Maximum resident set size (kbytes): 2313372
+13:39:12 start box box_ptmemd_noise
+13:44:52 end box box_ptmemd_noise rc 0 	Maximum resident set size (kbytes): 2413944
+13:44:52 start opp pts5_noise
+14:40:34 end opp pts5_noise rc 0 	Maximum resident set size (kbytes): 3051424
+14:40:34 start opp pts10
+15:27:03 end opp pts10 rc 0 	Maximum resident set size (kbytes): 2962920
+15:27:03 all done

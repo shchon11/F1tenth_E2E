@@ -1553,8 +1553,10 @@ def table(out_dir):
         pr("")
         pr(f"(4) 움직이는 차와의 시간 맞춘 빈틈 -- 0.1 k s 뒤 우리 차(그 시각 실제 자세)와 같은 시각 상대 차 사이의 부호 있는 틈 [cm] "
            f"(두 차 0.58 x 0.31 m 상자, 정확한 상자-상자 거리, [-1, 3] m로 자름), 따로 둔 세션의 '있음' 결정, k = 1..10 모두")
-        pr(f"(점 수 {int(m.sum())}, 틈 < 0.5 m {int((m & (g < 0.5)).sum())}, 겹침 {int((m & (g < 0)).sum())})")
-        pr(f"{'모형':<46} | 전체 중앙/p90 | <0.5m 중앙/p90 | 페이스<0.7 | 0.7-0.9 | ≥0.9 (중앙; <0.5m 중앙) | <0.5m 부호 맞음")
+        mu = m & (g < CAR_CLIP[1])                     # not clipped: the other car within 3 m of our body at t + 0.1 k
+        pr(f"(점 수 {int(m.sum())}, 그중 3 m 안(잘리지 않음) {int(mu.sum())}, 틈 < 0.5 m {int((m & (g < 0.5)).sum())}, 겹침 {int((m & (g < 0)).sum())}; "
+           f"< 0.5 m 점 수 페이스별 " + ", ".join(f"{int((m & (g < 0.5) & (pc >= lo) & (pc < hi)).sum())}" for lo, hi in ((0, 0.7), (0.7, 0.9), (0.9, 9))) + ")")
+        pr(f"{'모형':<46} | 3 m 안 중앙/p90 | <0.5m 중앙/p90 | 페이스<0.7 | 0.7-0.9 | ≥0.9 (3 m 안 중앙; <0.5m 중앙) | <0.5m 부호 맞음 | 겹침 맞힘 | 헛겹침")
         for n, P_ in rows_k:
             e = np.abs(P_ - g) * 100
             def mq(mm):
@@ -1563,10 +1565,11 @@ def table(out_dir):
             near = m & (g < 0.5)
             pcs = []
             for lo, hi in ((0, 0.7), (0.7, 0.9), (0.9, 9)):
-                mm = m & (pc >= lo) & (pc < hi)
-                pcs.append(f"{np.median(e[mm]):5.1f};{np.median(e[mm & (g < 0.5)]):5.1f}")
+                mm = mu & (pc >= lo) & (pc < hi); mn = near & (pc >= lo) & (pc < hi)
+                pcs.append(f"{np.median(e[mm]) if mm.any() else float('nan'):5.1f};{np.median(e[mn]) if mn.any() else float('nan'):5.1f}")
             sg = np.mean((P_[near] < 0) == (g[near] < 0)) * 100
-            pr(f"{n:<46} | {mq(m)} | {mq(near):>14} | " + " | ".join(pcs) + f" | {sg:5.1f} %")
+            ov = near & (g < 0); cl = near & (g >= 0)
+            pr(f"{n:<46} | {mq(mu)} | {mq(near):>14} | " + " | ".join(pcs) + f" | {sg:5.1f} % | {np.mean(P_[ov] < 0) * 100:5.1f} % | {np.mean(P_[cl] < 0) * 100:5.1f} %")
         pr(f"{'모형':<46} | 매개변수 | MFLOP | ms 망 / 입력 포함")
         for k, n in hk:
             j = json.load(open(os.path.join(out_dir, f"{k}.json")))
