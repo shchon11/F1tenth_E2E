@@ -8,7 +8,7 @@ N=${1:?name}; E0=${2:-48}; E1=${3:-32}; U=${4:-6}; H=${5:-16}; shift $(( $# < 5 
 R=$(cd "$(dirname "$0")/../../../.." && pwd)
 O=$R/out; mkdir -p "$O"
 PY=$HOME/F1tenth/.venv/bin/python3
-W=$R/f1sim/f1sim/learn/configs/plan_world_korea26scan_race.json
+W=${PTS_SMOKE_WORLD:-$R/f1sim/f1sim/learn/configs/plan_world_korea26scan_race.json}   # PTS_SMOKE_WORLD: e.g. without its warps (less GPU)
 if [ "$(ps -eo args | grep -c '[e]xam_record')" != 0 ]; then echo "exam running: not started"; exit 1; fi
 PORT=$((54000 + RANDOM % 1000))
 cat > "$O/$N.job" <<EOF
