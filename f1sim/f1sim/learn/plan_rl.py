@@ -54,6 +54,7 @@ from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
 from .plan_reward import PlanReward, SEEN_S, T_REF
 from . import plan_car_cost as PCC
+from . import plan_grad_cost as PG
 from .pred_oracle import copy_oracle
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
@@ -813,6 +814,12 @@ def _arg_problem(args) -> str:
                                      or args.branches == 2),
          "--plan-car-cost needs --format v2 without --hold-p / --plan-roll / --roll-grow / --branches 2"),
         (args.plan_car_cost > 0 and not 0.0 <= args.plan_car_w_end <= 1.0, "--plan-car-w-end: in [0, 1]"),
+        (args.plan_grad_cost > 0 and not (args.plan_car_cost > 0 and args.tail_consistency > 0),
+         "--plan-grad-cost needs --plan-car-cost (its record and gates) and --tail-consistency (the decisions' start speed, "
+         "steering and pose)"),
+        (args.plan_grad_cost > 0 and (len(args.plan_grad_w.split(",")) != 3 or len(args.plan_grad_soft.split(",")) != 3
+                                      or len(args.plan_grad_clear.split(",")) != 2),
+         "--plan-grad-w / --plan-grad-soft: 3 numbers, --plan-grad-clear: 2"),
         (args.branches == 2 and (not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0
                                  or bool(args.init)),
          "--branches 2 needs --format v2 with --tail-consistency, from scratch, without --hold-p / --self-opp"),
@@ -852,6 +859,21 @@ def _arg_problem(args) -> str:
         (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+def pg_line(row: dict) -> str:
+    """(11-25) --plan-grad-cost's part of the update's log line (Korean, as the rest of it)"""
+    pc = lambda k, d=1: "-" if row.get(k) is None else f"{row[k] * 100:.{d}f}"
+    g = lambda k: "-" if row.get(k) is None else f"{row[k]:.3g}"
+    return (f"plan 직접 gradient: 람다 {g('pg_lambda')} | 결정당 비용 차 {g('pg_cost_car')} 벽 {g('pg_cost_wall')} 상자 "
+            f"{g('pg_cost_box')} m, 0 아닌 결정 차 {pc('pg_near_car')} % (실제 겹침 {pc('pg_hard_car')} %, 앞차 겹침 비용 "
+            f"{pc('pg_overlap_cost_share')} %) 벽 {pc('pg_near_wall')} % (가리지 않으면 {pc('pg_near_wall_all')} %) 상자 "
+            f"{pc('pg_near_box')} % (가리지 않으면 {pc('pg_near_box_all')} %) | gradient 크기 PPO "
+            f"{g('pg_g_ppo')} 직접 {g('pg_g_direct')} (비 {g('pg_ratio')}, 한 걸음 어림 {g('pg_ratio_step_est')}; 차 {g('pg_g_car')} 벽 "
+            f"{g('pg_g_wall')} 상자 {g('pg_g_box')}), 뒷부분 손실 {g('pg_g_tail')} (직접 항과 cos {g('pg_cos_tail')}), PPO와 cos "
+            f"{g('pg_cos_ppo')} | 앞 4 m 안 차 결정 {pc('pg_rel_dec_share')} % -> PPO gradient의 {pc('pg_rel_grad_share', 0)} %, "
+            f"앞차 겹침 비용의 advantage 분산 몫 {pc('pg_adv_var_share', 2)} % (가치 0으로 어림)"
+            + (f", 해독 차이 {row['pg_dec_err']:.1e}" if row.get("pg_dec_err") is not None else "") + " | ")
 
 
 def main(argv=None):
@@ -1284,6 +1306,42 @@ def main(argv=None):
                          "side-by-side pass at 0.35 m between centres is not one")
     ap.add_argument("--plan-car-w-end", type=float, default=0.3,
                     help="--plan-car-cost: the weight of the plan's last point (the first is 1.0, linear between)")
+    ap.add_argument("--plan-grad-cost", type=float, default=0.0,
+                    help="LAMBDA (11-25, the user: \"그려\"): a DIRECT gradient on the whole plan (`learn.plan_grad_cost`). In the PPO "
+                         "update every minibatch decision's plan from the policy's MEAN outputs (all 20, decoded exactly as the env "
+                         "decodes them) is priced against the rollout's record -- (a) our 3 discs against the other car's 3 at its "
+                         "REAL pose at t + t_k (--plan-car-cost's knowable / at-fault / prefix gates), (b) the footprint against "
+                         "the walls (the reward's track EDT made signed, bilinear), (c) against the boxes seen this episode -- a "
+                         "soft penetration in metres, weighted like the plan-car cost's points -- and LAMBDA x its mean is added to "
+                         "the actor's loss, so the gradient reaches every output and through them the trunk (the critic and the "
+                         "prediction head untouched). Why: with --tail-consistency PPO acts on the first 0.1 s only, the plan-car "
+                         "cost lands on the 0.2-1 s points, is ~1 %% of the lap reward and fires on 1-2 %% of decisions; the "
+                         "oracle gate (orc34a) did not move the 0.6x overlap. With --plan-grad-ratio > 0 LAMBDA is the start and is "
+                         "re-set at the first measured minibatch. Needs --plan-car-cost and --tail-consistency. 0 = off")
+    ap.add_argument("--plan-grad-ratio", type=float, default=0.5,
+                    help="--plan-grad-cost: auto-LAMBDA -- the direct term's gradient norm on the actor this many times the PPO "
+                         "term's (per minibatch, measured on --plan-grad-measure minibatches of the first epoch, all processes; "
+                         "set at once at the first measurement, then moved toward it every update, x (target / measured)^0.5 "
+                         "within x0.5..2). 0 = LAMBDA fixed")
+    ap.add_argument("--plan-grad-w", default="1,1,1", help="--plan-grad-cost: the weights of the car, wall and box terms")
+    ap.add_argument("--plan-grad-soft", default="0.05,0.02,0.02",
+                    help="--plan-grad-cost: [m] the soft widths s of the car, wall and box penetrations (s softplus((m - d) / s), 0 "
+                         "past m + 4 s)")
+    ap.add_argument("--plan-grad-clear", default="0.02,0.02",
+                    help="--plan-grad-cost: [m] the clearance the wall and box terms start at (the car term's limit is the "
+                         "plan-car cost's: 2 r - --plan-car-margin)")
+    ap.add_argument("--plan-grad-guard", default="car", choices=("car", "all"),
+                    help="--plan-grad-cost: where the wall and box terms price the plan -- 'car': only the decisions whose car "
+                         "term is on (they guard the dodge: the plan must not leave the other car's future into a wall or a box); "
+                         "'all': every decision. Why 'car' (11-25 smoke from race33b u975): priced everywhere the wall term was on "
+                         "in 30-33 %% of the decisions (plan tails grazing walls the car never touches), gave 90-99 %% of the "
+                         "direct gradient (car 0-0.4 vs wall 1.1-2.6) and pointed against the tail loss (cos -0.31 on one rank) "
+                         "-- a wall experiment instead of the car one")
+    ap.add_argument("--plan-grad-boxes", type=int, default=4,
+                    help="--plan-grad-cost: the nearest seen boxes within 12 m kept per decision")
+    ap.add_argument("--plan-grad-measure", type=int, default=2,
+                    help="--plan-grad-cost: minibatches of the first epoch whose separate gradients (PPO, direct by term, tail, "
+                         "PPO of the decisions with a car within 4 m ahead) are measured each update")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1543,6 +1601,38 @@ def main(argv=None):
         print(f"[plan_rl] 앞차 plan 겹침 비용: 접촉의 {args.plan_car_cost:g}배 (접촉 무게 {args.contact_scale:g}), 차 {car_dims[0]:.2f} x "
               f"{car_dims[1]:.2f} m를 원 3개(반지름 {PCC.disc_radius(*car_dims):.3f} m)로, 겹침 여유 {args.plan_car_margin:g} m, 점 무게 1.0 -> "
               f"{args.plan_car_w_end:g}", flush=True)
+    pg_on = args.plan_grad_cost > 0                                # (11-25) --plan-grad-cost: a direct gradient on the whole plan
+    pg_lam = float(args.plan_grad_cost)                            # LAMBDA now (auto: re-set at the first measurement)
+    pg_cal = pg_on and args.plan_grad_ratio > 0                    # the first measurement sets LAMBDA at once
+    pg_ema = None                                                  # auto-LAMBDA: the smoothed measured sums (PPO, direct)
+    pg_box = False
+    if pg_on:
+        if not (car_on and args.tail_consistency > 0 and v2 and not v3 and not two and args.hold_p <= 0
+                and not args.plan_roll and not args.roll_grow):
+            raise SystemExit("--plan-grad-cost needs --plan-car-cost and --tail-consistency (v2, one plan, no holding / rolling)")
+        pg_w = [float(x_) for x_ in args.plan_grad_w.split(",")]
+        pg_s = [float(x_) for x_ in args.plan_grad_soft.split(",")]
+        pg_m = [float(x_) for x_ in args.plan_grad_clear.split(",")]
+        pg_field = PG.WallField(env.sim.track)
+        pg_P8 = PG.outline8(car_dims[0], car_dims[1], dev)
+        pg_wk = torch.tensor(car_w, dtype=torch.float32, device=dev)
+        pg_box = env.procedural is not None and pg_w[2] > 0
+        if pg_box:
+            # the boxes this car has seen this episode (in view now or before, passed), as --plan-hit-seen keeps them -- own
+            # variables, the reward's are not touched
+            C_pg = env.procedural.C
+            pg_seen = torch.zeros(Bl, C_pg, dtype=torch.bool, device=dev)
+            pg_ds = torch.full((Bl, C_pg), float("nan"), device=dev)
+            pg_pos = torch.zeros(Bl, C_pg, 2, device=dev)
+            pg_mx = float(args.lidar_mount_x) if args.lidar_mount_x else 0.297
+            pg_rmax = float(env.cfg.lidar.range_max)
+        print(f"[plan_rl] plan 직접 gradient(--plan-grad-cost): 평균 출력 20개로 그린 plan을 롤아웃 기록에 대 봄 -- 상대 차 실제 자리(원 3개, "
+              f"앞차 plan 겹침 비용과 같은 알 수 있음·내 책임·끊김 규칙), 벽(트랙 EDT를 부호 있게, 격자 {pg_field.n_grids}개), 본 상자"
+              f"(가까운 {args.plan_grad_boxes}개, 12 m 안){'' if pg_box else ' 없음'}; 무게 차 {pg_w[0]:g} 벽 {pg_w[1]:g} 상자 {pg_w[2]:g}, "
+              f"부드러운 폭 {pg_s[0]:g}/{pg_s[1]:g}/{pg_s[2]:g} m, 벽·상자 여유 {pg_m[0]:g}/{pg_m[1]:g} m, 벽·상자는 "
+              f"{'차 항이 켜진 결정에서만' if args.plan_grad_guard == 'car' else '모든 결정에서'}; 람다 {pg_lam:g}"
+              + (f" -> 첫 측정에서 PPO gradient의 {args.plan_grad_ratio:g}배로 맞추고 update마다 따라감" if pg_cal else " 고정"),
+              flush=True)
     if pc_on:
         print(f"[plan_rl] plan-예측 간격 입력: 결정마다 직전 plan이 0.1-1.0 s에 우리 차를 둘 자리와 예측한 상대 차(P(있음) >= 0.5) 사이 "
               f"가장 좁은 간격 10개 (원 3개, 겹침 여유 {args.plan_car_margin:g} m, 없으면 3 m, -1-3 m로 자르고 /3), trunk 끝 10칸 0에서 시작",
@@ -2070,6 +2160,7 @@ def main(argv=None):
         PCL = []                                               # --pred-clear: the trunk's clearance inputs, as the rollout read them
         PIN = []                                               # --pred-opp: the trunk's prediction inputs (pred_feed), as read
         CQ = {k_: [] for k_ in ("st0", "tid", "op", "op_rem", "op_ok", "know", "pace", "me")}   # --plan-car-cost, per decision
+        MN, PGB, PGD = [], [], None                            # --plan-grad-cost: the means, the seen boxes, the record (after)
         car_fault_b = torch.zeros(3, device=dev); car_dec_b = torch.zeros(3, device=dev)    # at-fault contacts / decisions by pace
         opp_v_bins = torch.zeros(6, device=dev); opp_n_bins = torch.zeros(6, device=dev)   # copies' speed by pace (0.5..1.0)
         n_near = 0; n_near_gap = 0; n_fault = 0.0; opp_pres = 0.0   # near misses (of them: bodies < 10 cm), contacts charged to us,
@@ -2130,6 +2221,13 @@ def main(argv=None):
                     sb_seen = (sb_seen & ~_moved) | _passed | sb_view
                     sb_ds = torch.where(_live, _ds, torch.full_like(_ds, float("nan"))); sb_pos = _pos
                     pr.plan_known = sb_seen
+                if pg_box:                                         # --plan-grad-cost: boxes seen or passed this episode
+                    _ds2, _live2, _pos2 = box_along(env, pr.goal, lid)
+                    _mv2 = ((_pos2 - pg_pos).abs().sum(-1) > 0.05) | ~_live2
+                    _ps2 = _live2 & ~_mv2 & (pg_ds > 0.0) & (pg_ds <= 3.0) & (_ds2 <= 0.0) & (_ds2 > -3.0)
+                    pg_seen = (pg_seen & ~_mv2) | _ps2 | boxes_in_view(env, lid, _pos2, _live2, pg_mx, pg_rmax)
+                    pg_ds = torch.where(_live2, _ds2, torch.full_like(_ds2, float("nan"))); pg_pos = _pos2
+                    PGB.append(PG.box_record(env.procedural, lid, pg_seen, env.sim.state[lid, :2].float(), args.plan_grad_boxes, 12.0))
                 if args.hold_new_block and p_held is not None:
                     # a held plan runs into something it could not know when drawn: draw a new one now
                     inh = hold_left > 0
@@ -2272,6 +2370,8 @@ def main(argv=None):
                         lp = torch.where(roll_full, lp, tanh_logp(u[:, ri_], mean[:, ri_], log_std.expand_as(mean)[:, ri_]))
                         FULL.append(roll_full.clone())
                 u_keep = u                                         # the action kept for the update (--roll-grow: as driven)
+                if pg_on:
+                    MN.append(mean.detach().clone())               # --plan-grad-cost: the rollout's own mean plans, for its log
                 if two:
                     lp = lp + pb[ar_l, br].log()
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
@@ -2452,6 +2552,8 @@ def main(argv=None):
                                ~out["restarted"])
                 if two:
                     br_u = torch.where(out["restarted"], torch.rand(Bl, device=dev), br_u)
+                if pg_box:                                       # --plan-grad-cost: a new race has seen nothing yet
+                    pg_seen &= ~out["restarted"][:, None]
                 if aux_seen is not None:                         # a new race: nothing passed yet (a scene sets its own below)
                     aux_seen &= ~out["restarted"][:, None]
                     aux_prev_ds = torch.where(out["restarted"][:, None], torch.full_like(aux_prev_ds, float("nan")), aux_prev_ds)
@@ -2627,6 +2729,27 @@ def main(argv=None):
                 cc_ = {k_: torch.cat(v_, 1) for k_, v_ in cc_.items()}
                 mr_ = {k_: torch.cat(v_, 1) for k_, v_ in mr_.items()}
                 car_cost = pr.contact_scale * args.plan_car_cost * cc_["price"] / T_REF                          # (T, Bl) [laps]
+                if pg_on:
+                    # (11-25) --plan-grad-cost's record, flat like the update's batch (t Bl + b): the other car at every plan
+                    # point's time and the one before, which points are compared (prefix, knowable), our car at the decision
+                    # (x, y, heading, distance to go), the track, a car 0-4 m ahead (|lateral| < 1 m, our frame), the plan-car
+                    # cost charged, and the driven plan's points (the decode check)
+                    if car_kofs != list(range(1, PS.N_STEP + 1)):
+                        raise SystemExit("--plan-grad-cost: the plan's points are not 0.1 s apart")
+                    _lp = PG.later_poses(OP_[..., :2], OP_[..., 2], OR_, OK_, brk_, KN_, car_kofs)
+                    _me0 = ME_[:, :, 0]
+                    _d0 = OP_[:T, :, :2] - _me0[..., :2]
+                    _c0, _s0 = torch.cos(_me0[..., 2]), torch.sin(_me0[..., 2])
+                    _lon, _lat = _d0[..., 0] * _c0 + _d0[..., 1] * _s0, -_d0[..., 0] * _s0 + _d0[..., 1] * _c0
+                    NT_ = T * Bl
+                    PGD = {"op_xy": _lp["xy"].reshape(NT_, -1, 2), "op_psi": _lp["psi"].reshape(NT_, -1),
+                           "op_xy_prev": _lp["xy_prev"].reshape(NT_, -1, 2), "op_rem_prev": _lp["rem_prev"].reshape(NT_, -1),
+                           "ok": _lp["ok"].reshape(NT_, -1), "me0": _me0[..., [0, 1, 2, 5]].reshape(NT_, 4),
+                           "tid": torch.stack(CQ["tid"]).reshape(-1), "lap": LP_.reshape(-1),
+                           "rel": (OK_[:T] & (_lon > 0.0) & (_lon <= 4.0) & (_lat.abs() < 1.0)).reshape(-1),
+                           "ovl": (cc_["price"] > 0).reshape(-1),
+                           "drv": ME_[:, :, 1:, :3].reshape(NT_, PS.N_STEP, 3)}
+                    del _lp, _me0, _d0, _c0, _s0, _lon, _lat
                 del OP_, OR_, OK_, ME_, o_
                 # the log's numbers (the ordinary races): decisions with the other car knowable and ahead along the track, of
                 # them the plans charged, by the copy's pace
@@ -2681,6 +2804,15 @@ def main(argv=None):
             gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
             adv[t] = gae
         ret = adv + V_
+        pg_adv_share = None
+        if pg_on and car_cost is not None:
+            # (11-25) how much of the advantages' spread the plan-car cost makes: GAE of that reward part alone with a zero
+            # value (an approximation -- the critic's share of it is ignored), its variance against the advantages'
+            with torch.no_grad():
+                _ac = PG.gae_zero_baseline(-car_cost, D_, args.gamma, args.lam)
+                _fm = FM_ > 0
+                pg_adv_share = float(_ac[_fm].var() / adv[_fm].var().clamp_min(1e-12))
+                del _ac, _fm
         if args.dump_rollout:
             import numpy as np
             os.makedirs(args.dump_rollout, exist_ok=True)
@@ -2908,6 +3040,90 @@ def main(argv=None):
                 bDRV, bDRVV, bDRVM = DRV.reshape(NB, PS.N_STEP, 2), DRVV.reshape(NB, PS.N_STEP), DRVM.reshape(NB, PS.N_STEP)
                 c_ok = bDRVM[:, 1]                                  # at least the 0.2 s point is known
                 del DRV, DRVV, DRVM, S_
+        pg_log = {}
+        if pg_on:
+            # (11-25) --plan-grad-cost: the stored record of every decision (`PGD`, the seen boxes), and the terms on a set of
+            # rows for pre-tanh outputs (all 20; differentiable when they carry a gradient)
+            bPGB = [torch.cat([b_[j_] for b_ in PGB]) for j_ in range(5)] if pg_box else None
+            KP_ = PS.N_STEP
+
+            def pg_terms(a_raw, rows):
+                px, py, ppsi = PG.decode(a_raw, bV0[rows], bD0[rows], bST0[rows], lim, bCAP[rows] if pace_on else None)
+                n_r = px.shape[0]
+                with torch.no_grad():
+                    tid_ = PGD["tid"][rows]
+                    rem_ = pr.goal.remaining(torch.stack([px, py], -1).reshape(-1, 2), tid_.repeat_interleave(KP_)).view(n_r, KP_)
+                    me0_ = PGD["me0"][rows]
+                    gate_ = PG.fault_gate(me0_[:, :2], me0_[:, 2], me0_[:, 3], torch.stack([px, py], -1), ppsi, rem_,
+                                          PGD["op_xy_prev"][rows], PGD["op_rem_prev"][rows], PGD["lap"][rows])
+                    cmask_ = PGD["ok"][rows] & gate_
+                z_ = px.sum(-1) * 0.0
+                f_ = torch.zeros(n_r, dtype=torch.bool, device=dev)
+                o_ = {"cmask": cmask_}
+                if pg_w[0] > 0:
+                    o_["cost_car"], o_["near_car"], o_["hard_car"] = PG.car_term(
+                        px, py, ppsi, PGD["op_xy"][rows], PGD["op_psi"][rows], cmask_, pg_wk, car_dims[0], car_dims[1],
+                        args.plan_car_margin, pg_s[0])
+                else:
+                    o_["cost_car"], o_["near_car"], o_["hard_car"] = z_, f_, f_
+                # --plan-grad-guard car: walls and boxes priced only where the car term is on (the raw share is logged)
+                gd_ = o_["near_car"] if args.plan_grad_guard == "car" else torch.ones_like(f_)
+                if pg_w[1] > 0:
+                    cw_, nw_, kw_ = PG.wall_term(px, py, ppsi, tid_, pg_field, pg_P8, pg_wk, pg_m[0], pg_s[1])
+                    o_["cost_wall"], o_["near_wall"], o_["hard_wall"], o_["near_wall_all"] = cw_ * gd_, nw_ & gd_, kw_ & gd_, nw_
+                else:
+                    o_["cost_wall"], o_["near_wall"], o_["hard_wall"], o_["near_wall_all"] = z_, f_, f_, f_
+                o_["cost_box"], o_["near_box"], o_["hard_box"], o_["near_box_all"] = z_, f_, f_, f_
+                if pg_box:
+                    bm_ = bPGB[4][rows]
+                    hb_ = torch.nonzero(bm_.any(1))[:, 0]                 # only the rows with a seen box in reach
+                    if hb_.numel():
+                        g_ = lambda a_: a_[rows][hb_]
+                        cb_, nb_, kb_ = PG.box_term(px[hb_], py[hb_], ppsi[hb_], g_(bPGB[0]), g_(bPGB[1]), g_(bPGB[2]),
+                                                    g_(bPGB[3]), g_(bPGB[4]), pg_P8, pg_wk, car_dims[0], car_dims[1], pg_m[1], pg_s[2])
+                        gb_ = gd_[hb_]
+                        o_["cost_box"] = z_.index_add(0, hb_, cb_ * gb_)
+                        o_["near_box"] = f_.index_put((hb_,), nb_ & gb_)
+                        o_["hard_box"] = f_.index_put((hb_,), kb_ & gb_)
+                        o_["near_box_all"] = f_.index_put((hb_,), nb_)
+                o_["cost"] = pg_w[0] * o_["cost_car"] + pg_w[1] * o_["cost_wall"] + pg_w[2] * o_["cost_box"]
+                return o_
+
+            # the rollout's own mean plans, every decision (no gradient): how often each term is there, and the decode check
+            with torch.no_grad():
+                bMN = torch.cat(MN)
+                acc_ = collections.defaultdict(float)
+                fm_all = bFM > 0
+                for c0_ in range(0, N, 8192):
+                    r_ = torch.arange(c0_, min(N, c0_ + 8192), device=dev)
+                    o_ = pg_terms(bMN[r_], r_)
+                    fm_ = fm_all[r_]
+                    for k_ in ("car", "wall", "box"):
+                        acc_["cost_" + k_] += float((o_["cost_" + k_] * fm_).sum())
+                        acc_["near_" + k_] += float((o_["near_" + k_] & fm_).sum())
+                        acc_["hard_" + k_] += float((o_["hard_" + k_] & fm_).sum())
+                    acc_["know_pts"] += float((o_["cmask"].any(1) & fm_).sum())
+                    acc_["near_wall_all"] += float((o_["near_wall_all"] & fm_).sum())
+                    acc_["near_box_all"] += float((o_["near_box_all"] & fm_).sum())
+                    acc_["ovl"] += float((PGD["ovl"][r_] & fm_).sum())
+                    acc_["rel"] += float((PGD["rel"][r_] & fm_).sum())
+                    acc_["n"] += float(fm_.sum())
+                    del o_
+                # the update's decode against the env's: the driven actions (first step with its noise) decoded here vs the
+                # points the rollout drove (world x, y, heading)
+                r_ = torch.arange(0, min(N, 4096), device=dev)
+                dx_, dy_, dp_ = PG.decode(bU[r_], bV0[r_], bD0[r_], bST0[r_], lim, bCAP[r_] if pace_on else None)
+                _dr = PGD["drv"][r_]
+                pg_dec_err = float(torch.maximum((torch.stack([dx_, dy_], -1) - _dr[..., :2]).norm(dim=-1),
+                                                 (dp_ - _dr[..., 2]).abs()).max())
+                del bMN, dx_, dy_, dp_, _dr
+                nn_pg = max(acc_["n"], 1.0)
+                pg_log = {"pg_dec_err": pg_dec_err, "pg_adv_var_share": pg_adv_share,
+                          "pg_rel_dec_share": acc_["rel"] / nn_pg, "pg_overlap_cost_share": acc_["ovl"] / nn_pg,
+                          "pg_car_gated_share": acc_["know_pts"] / nn_pg,
+                          "pg_near_wall_all": acc_["near_wall_all"] / nn_pg, "pg_near_box_all": acc_["near_box_all"] / nn_pg,
+                          **{f"pg_{a_}_{k_}": acc_[f"{a_}_{k_}"] / nn_pg for a_ in ("cost", "near", "hard") for k_ in ("car", "wall", "box")}}
+            pg_meas = collections.defaultdict(list)                    # this update's measured minibatches
         if args.dump_rollout:
             # the direction this rollout alone would push the actor (no step is made): the policy loss of the first pass
             # (ratio 1, advantage normalised over the whole rollout), its gradient through the steering mean, the speed
@@ -2999,7 +3215,9 @@ def main(argv=None):
             T_terms = {}
         drift_box["on"] = True                                 # (11-25) measured in the epochs only
         for ep in range(args.epochs):
+            pg_mi = 0                                          # --plan-grad-cost: the minibatch's number in the epoch
             for sel in batches():
+                pg_mi += 1
                 aux_g = None
                 if v2:
                     mean, log_std, v_hat, mb, f_heads = actor_on(sel)
@@ -3102,6 +3320,57 @@ def main(argv=None):
                             gt_ = torch.autograd.grad(args.tail_consistency * lc, sh_, retain_graph=True, allow_unused=True)
                             nrm_ = lambda gs: float(torch.sqrt(sum((g_.pow(2).sum() for g_ in gs if g_ is not None), torch.zeros((), device=dev))))
                             tr_ratio.append(nrm_(gt_) / max(nrm_(gp_), 1e-12))
+                if pg_on:
+                    # (11-25) --plan-grad-cost: this minibatch's plans from the mean outputs (all 20), priced against the record;
+                    # LAMBDA x the mean over the decisions made joins the actor's loss -- its gradient reaches every output
+                    pgo_ = pg_terms(mean, mb)
+                    mpg_ = bFM[mb]
+                    cost_pg = (pgo_["cost"] * mpg_).sum() / n_
+                    if ep == 0 and pg_mi <= args.plan_grad_measure:
+                        # the separate gradients on the actor (one minibatch, before any all-reduce): PPO, the direct term by
+                        # part, the tail loss, PPO of the decisions with a car 0-4 m ahead alone (same normalisation)
+                        pp_ = [p_ for p_ in pol_params if p_.requires_grad]
+                        gfl_ = lambda l_: PG.flat_norm(torch.autograd.grad(l_, pp_, retain_graph=True, allow_unused=True), pp_)
+                        g_pl_ = gfl_(pl)
+                        g_pg_ = torch.zeros_like(g_pl_)
+                        for k_, w_ in (("car", pg_w[0]), ("wall", pg_w[1]), ("box", pg_w[2])):
+                            c_ = w_ * (pgo_["cost_" + k_] * mpg_).sum() / n_
+                            if w_ > 0 and float(c_.detach()) > 0:
+                                g_k_ = gfl_(c_)
+                                pg_meas["g_" + k_].append(float(g_k_.norm()))
+                                g_pg_ = g_pg_ + g_k_
+                                del g_k_
+                            else:
+                                pg_meas["g_" + k_].append(0.0)
+                        npl_, npg_ = float(g_pl_.norm()), float(g_pg_.norm())
+                        pg_meas["pl"].append(npl_); pg_meas["pg"].append(npg_)
+                        if "tail" in terms_:
+                            g_t_ = gfl_(terms_["tail"])
+                            pg_meas["tail"].append(float(g_t_.norm()))
+                            if npg_ > 0:
+                                pg_meas["cos_tail"].append(float(nn.functional.cosine_similarity(g_pg_, g_t_, dim=0)))
+                            del g_t_
+                        if npg_ > 0:
+                            pg_meas["cos_pl"].append(float(nn.functional.cosine_similarity(g_pg_, g_pl_, dim=0)))
+                        rel_ = PGD["rel"][mb].float() * m_
+                        pg_meas["rel_n"].append(float(rel_.sum() / n_))
+                        if float(rel_.sum()) > 0 and npl_ > 0:
+                            plr_ = -(torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_) * rel_).sum() / n_
+                            pg_meas["rel_g"].append(float(gfl_(plr_).norm()) / npl_)
+                            del plr_
+                        pg_meas["vec_pl"].append(g_pl_); pg_meas["vec_pg"].append(g_pg_)
+                        if pg_cal:
+                            # the first measurement sets LAMBDA: the direct term --plan-grad-ratio x PPO's (all processes)
+                            t_ = dist_sum(npl_ if npg_ > 0 else 0.0, npg_)
+                            if float(t_[1]) > 0 and float(t_[0]) > 0:
+                                pg_lam = args.plan_grad_ratio * float(t_[0]) / float(t_[1]); pg_cal = False
+                                print(f"[plan_rl] plan 직접 gradient: 첫 측정으로 람다 {pg_lam:.4g} (PPO gradient {float(t_[0]):.4g}, "
+                                      f"직접 항 {float(t_[1]):.4g} -> {args.plan_grad_ratio:g}배)", flush=True)
+                        del g_pl_, g_pg_
+                    loss = loss + pg_lam * cost_pg
+                    terms_["plangrad"] = pg_lam * cost_pg
+                    pg_meas["loss"].append(float(cost_pg.detach()))
+                    del pgo_
                 if aux_on:
                     pa_all, ta_all = aux_box["pred"], bAX[mb]
                     pa = pa_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS)); ta = ta_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS))
@@ -3203,6 +3472,46 @@ def main(argv=None):
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
         drift_box["on"] = False
+        if pg_on:
+            # (11-25) --plan-grad-cost: the measured gradient norms -> the log; auto-LAMBDA moves toward the target ratio (all
+            # processes the same LAMBDA: every process takes part in the sum, measured or not)
+            _mn = lambda x_: (sum(x_) / len(x_)) if x_ else None
+            hv_ = [(a_, b_) for a_, b_ in zip(pg_meas["pl"], pg_meas["pg"]) if b_ > 0]
+            pg_ratio = None
+            if args.plan_grad_ratio > 0 or dist is not None:
+                t_ = dist_sum(sum(a_ for a_, _ in hv_), sum(b_ for _, b_ in hv_))
+                if float(t_[0]) > 0 and float(t_[1]) > 0:
+                    pg_ratio = pg_lam * float(t_[1]) / float(t_[0])
+            elif hv_:
+                pg_ratio = pg_lam * sum(b_ for _, b_ in hv_) / sum(a_ for a_, _ in hv_)
+            # the optimizer step sums --accum-actor minibatches: PPO's minibatch gradients agree little (noise), the direct
+            # term's much -- the step's ratio estimated from the agreement of the two measured minibatches (|sum of N| =
+            # |g| sqrt(N + N (N - 1) cos))
+            pg_step = None
+            if len(pg_meas["vec_pl"]) >= 2 and pg_ratio is not None:
+                Na_ = float(max(1, args.accum_actor))
+                c_pl = max(0.0, float(nn.functional.cosine_similarity(pg_meas["vec_pl"][0], pg_meas["vec_pl"][1], dim=0)))
+                c_pg = (max(0.0, float(nn.functional.cosine_similarity(pg_meas["vec_pg"][0], pg_meas["vec_pg"][1], dim=0)))
+                        if float(pg_meas["vec_pg"][0].norm()) > 0 and float(pg_meas["vec_pg"][1].norm()) > 0 else 0.0)
+                pg_step = pg_ratio * math.sqrt((Na_ + Na_ * (Na_ - 1) * c_pg) / (Na_ + Na_ * (Na_ - 1) * c_pl))
+                pg_log.update(pg_agree_ppo=c_pl, pg_agree_direct=c_pg)
+            pg_log.update(pg_lambda=pg_lam, pg_ratio=pg_ratio, pg_ratio_step_est=pg_step,
+                          pg_g_ppo=_mn(pg_meas["pl"]), pg_g_direct=(pg_lam * _mn(pg_meas["pg"])) if pg_meas["pg"] else None,
+                          pg_g_car=(pg_lam * _mn(pg_meas["g_car"])) if pg_meas["g_car"] else None,
+                          pg_g_wall=(pg_lam * _mn(pg_meas["g_wall"])) if pg_meas["g_wall"] else None,
+                          pg_g_box=(pg_lam * _mn(pg_meas["g_box"])) if pg_meas["g_box"] else None,
+                          pg_g_tail=_mn(pg_meas["tail"]), pg_cos_tail=_mn(pg_meas["cos_tail"]), pg_cos_ppo=_mn(pg_meas["cos_pl"]),
+                          pg_rel_mb_share=_mn(pg_meas["rel_n"]), pg_rel_grad_share=_mn(pg_meas["rel_g"]),
+                          pg_loss=_mn(pg_meas["loss"]), pg_loss_lam=(pg_lam * _mn(pg_meas["loss"])) if pg_meas["loss"] else None)
+            if args.plan_grad_ratio > 0 and pg_ratio is not None and not pg_cal:
+                # the measured sums (PPO's, the direct term's without LAMBDA) smoothed over updates: a measured minibatch with a
+                # handful of car decisions reads a small direct term (smoke: 0.05 of the target) and alone would double LAMBDA
+                _n = (float(t_[0]), float(t_[1]))
+                pg_ema = _n if pg_ema is None else (0.7 * pg_ema[0] + 0.3 * _n[0], 0.7 * pg_ema[1] + 0.3 * _n[1])
+                _tgt = args.plan_grad_ratio * pg_ema[0] / pg_ema[1]          # the LAMBDA that would meet the target
+                pg_lam = pg_lam * min(2.0, max(0.5, (_tgt / pg_lam) ** 0.5))
+                pg_log["pg_lambda_target"] = _tgt
+            del pg_meas
         if args.mem_prev > 0:
             # --mem-prev: this rollout's last decisions for the next update's replay -- features with the weights just learnt
             # (fp16, no gradient), the state each decision began with, the restarts
@@ -3319,6 +3628,8 @@ def main(argv=None):
                 row.update(pred_clear_min_p50=car_st["pc_all_p50"], pred_clear_min_p10=car_st["pc_all_p10"],
                            pred_clear_min_p50_by_pace=car_st["pc_p50"], pred_clear_min_p10_by_pace=car_st["pc_p10"],
                            pred_clear_far_share=car_st["pc_far"])
+        if pg_on:
+            row.update(pg_log)
         if car_on or drv.opp is not None:
             # at-fault car contacts per minute against each pace (<0.7, 0.7-0.9, >=0.9 / own), the ordinary races
             row["car_fault_per_min_by_pace"] = [float(f_) / (float(n_) * PS.DT / 60.0) if float(n_) > 0 else None
@@ -3432,6 +3743,7 @@ def main(argv=None):
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
               + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
+              + (pg_line(row) if pg_on else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, " + (f"실제로 간 길과 0.5 s / 1.0 s 차이 {row['tail_next_05'] * 100:.0f} / {(row['tail_driven_10'] or 0) * 100:.0f} cm"
                  if args.tail_target == "driven" else f"다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm")
                  + (f", 몸통 gradient policy 대비 {row['tail_trunk_ratio']:.2f}배" if row.get("tail_trunk_ratio") is not None else "") + " | "
