@@ -21,6 +21,10 @@
   - A plan that runs into a wall or a box within its second (any footprint corner of its poses inside one) costs
     PLAN_HIT_SHARE of the contact it would be, at the plan's speed there: drawn every 0.1 s, a second of such plans
     costs about one contact.
+* (11-25, plan_rl --wrong-way-cost; the user: "후진은 상관없는데 뒤돌아서 가는경우가 있어서") facing backwards and driving --
+  the heading more than 90 deg from the distance field's downhill direction and the body-frame forward speed above WW_V --
+  pays K per metre the distance to go grows and, past WW_HEAD_DEG, K x WW_HEAD_M a decision (`wrong_way_cost`). Reversing
+  with the nose along the track is recovery and free; a push from a car this one is not responsible for is waived.
 * No stall price, no other shaping: standing still earns no laps. (11-13, the user: "저번에 분명히 서 있는거에 보상 매겨서
   후진하도록 유도했는데" -- the 11-06 stall price had gone with this redesign; policies stood nose-on at a box for 20 s, even
   after it was taken away: `stall_s` puts it back, off by default.)"""
@@ -32,6 +36,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
+from ..dynamics import IYAW, IVX
+
 T_REF = 7.5               # [s] a lap, to put seconds in laps
 CONTACT_S = 0.5           # [s] every contact
 CONTACT_S_PER_MPS = 1.0   # [s per m/s of impact normal speed]
@@ -39,6 +45,23 @@ SEEN_S = 1.0              # [s] a car contact counts if a beam hit a car this re
 PLAN_HIT_SHARE = 0.1      # a plan that hits something: this share of the contact it plans
 CACHE = os.path.expanduser("~/.cache/f1sim/goal_field")
 CLEAR = 0.5               # [m] the distance field's route keeps this far from the walls (`_field_one`)
+# (11-25, plan_rl --wrong-way-cost K [laps/m]) facing backwards and driving: the heading more than 90 deg from the distance
+# field's downhill direction (`GoalField.downhill`: the way to the finish through the free space -- no centreline, no racing
+# line) and the body-frame forward speed above WW_V. In that state a decision pays K x the metres the distance to go grew over
+# it (a line crossing unwrapped, a restart not counted) and, with the heading past WW_HEAD_DEG, K x WW_HEAD_M on top. Reversing
+# with the nose along the track (forward speed < 0) is recovery: never charged (the user: "후진은 상관없는데 뒤돌아서 가는경우가
+# 있어서"). Waived for WW_WAIVE_S after a car contact this car is not responsible for (`at_fault`: pushed, spun).
+# Why the heading term starts at 120 deg, not 90: the field's downhill direction is the SHORTEST way on, which hugs the inside
+# of a hairpin, and a wide racing line there points up to ~110-136 deg away from it while driving on normally (exam4 race33b
+# u975: 47 decisions past 90 deg in 183 min of sessions that never turned round, 4 past 110, 1 past 120; the six sessions that
+# did turn round: 222 decisions past 90, 202 past 120, median 164 deg). Past 90 at 0.1 laps a decision that was a cliff at
+# the hairpin's entry worth ~0.5 % of the lap reward; the metres term is proportional and costs those lines ~0 (0.49 m in 183
+# min against 43.4 m in the six wrong-way sessions)
+WW_V = 0.2                # [m/s] driving: the body-frame forward speed above this
+WW_HEAD_M = 0.5           # [m] the heading term per decision, in metres (x K)
+WW_HEAD_DEG = 120.0       # [deg] ... charged past this angle from the downhill direction
+WW_WAIVE_S = 1.0          # [s] no wrong-way cost this long after a car contact that was not ours
+WW_H = 0.2                # [m] the downhill direction: central differences over 2 WW_H
 
 
 def _grid_graph(node: np.ndarray, res: float):
@@ -151,6 +174,60 @@ class GoalField:
         d, inside = self.track.sample_edt(xy, tid, field=self.field, with_inside=True)
         return torch.where(inside, d, torch.full_like(d, float("nan")))
 
+    def downhill(self, xy: torch.Tensor, tid: torch.Tensor, h: float = WW_H):
+        """(11-25) (..., 2) the unit vector down the distance left (the way on to the finish through the free space) and
+        (...,) bool where it is defined. Central differences over 2h, one-sided where a sample is in a wall, each difference
+        unwrapped across the finish line (the field jumps by a lap there); |grad| < 0.3 (a field of distances has ~1) or no
+        two samples = not defined"""
+        tid = torch.broadcast_to(tid, xy.shape[:-1])
+        L = self.lap[tid.long()]
+        wrap = lambda d: torch.remainder(d + 0.5 * L, L) - 0.5 * L
+        c = self.remaining(xy, tid)
+        g = []
+        for ax in (0, 1):
+            off = torch.zeros_like(xy)
+            off[..., ax] = h
+            p, m = self.remaining(xy + off, tid), self.remaining(xy - off, tid)
+            fp, fm, fc = torch.isfinite(p), torch.isfinite(m), torch.isfinite(c)
+            nan = torch.full_like(c, float("nan"))
+            g.append(torch.where(fp & fm, wrap(p - m) / (2 * h),
+                                 torch.where(fp & fc, wrap(p - c) / h, torch.where(fm & fc, wrap(c - m) / h, nan))))
+        g = torch.stack(g, -1)
+        n = g.norm(dim=-1)
+        known = torch.isfinite(n) & (n > 0.3)
+        d = torch.where(known[..., None], -g / n.clamp_min(1e-9)[..., None], torch.zeros_like(g))
+        return d, known
+
+
+def wrong_way_cost(back: torch.Tensor, cos_h: torch.Tensor, known: torch.Tensor, vx: torch.Tensor, k: float,
+                   ok: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    """(11-25, plan_rl --wrong-way-cost) a decision's wrong-way cost [laps] (see WW_*). `back` (B,) [m] how much the distance
+    left grew over the decision (a line crossing unwrapped, 0 across a restart), `cos_h` (B,) the cosine of the angle between
+    the car's heading and the field's downhill direction at the decision's end, `known` (B,) where that direction is defined
+    (elsewhere -- a wall within WW_H -- the motion decides: facing backwards = the distance left grew), `vx` (B,) the
+    body-frame forward speed [m/s], `ok` (B,) bool: not waived, not restarted. -> cost, in the state, the metres charged,
+    the heading term on"""
+    facing = torch.where(known, cos_h < 0.0, back > 0.0)
+    state = facing & (vx > WW_V)
+    if ok is not None:
+        state = state & ok
+    head = state & known & (cos_h < math.cos(math.radians(WW_HEAD_DEG)))
+    metres = torch.where(state, back.clamp_min(0.0), torch.zeros_like(back))
+    return {"cost": float(k) * (metres + WW_HEAD_M * head.float()), "state": state, "metres": metres, "head": head}
+
+
+def ww_totals(cost: float, charged: float, metres: float, decisions: float, minutes: float, dist=None,
+              device="cpu") -> Dict[str, float]:
+    """(11-25) an update's wrong-way numbers over every process: one all_reduce, which every process makes every update the
+    cost is on (--dist-world: a collective only some processes reach leaves the others waiting) -> cost [laps/min], the
+    share of decisions charged, the metres charged a minute"""
+    t = torch.tensor([cost, charged, metres, decisions, minutes], dtype=torch.float64, device=device)
+    if dist is not None:
+        dist.all_reduce(t)
+    c, n, m, d, mi = (float(x) for x in t)
+    return {"wrong_way_cost_per_min": c / max(mi, 1e-9), "wrong_way_share": n / max(d, 1.0),
+            "wrong_way_m_per_min": m / max(mi, 1e-9)}
+
 
 def _outline(corners: torch.Tensor, step: float) -> torch.Tensor:
     """(k, 2) points round a rectangle given by its four corners (any order, symmetric about the origin), at most `step`
@@ -228,6 +305,10 @@ class PlanReward:
         self.car_fault_only = False
         #: (B_l,) car contacts charged since the last decision (the trainer's scene / level bookkeeping reads it)
         self.car_charged = torch.zeros(Bl, device=device)
+        #: (11-25, plan_rl --wrong-way-cost) K [laps per metre]; 0 = off. `ww_since` [s] since a car contact this car was not
+        #: responsible for (the waiver)
+        self.ww_k = 0.0
+        self.ww_since = torch.full((Bl,), 1e9, device=device)
         self.begin(torch.arange(Bl, device=device))
 
     def _d_car(self) -> torch.Tensor:
@@ -264,6 +345,7 @@ class PlanReward:
         self.cost[rows] = 0.0
         self.cost_kind[rows] = 0.0
         self.seen_t[rows] = 1e9
+        self.ww_since[rows] = 1e9
         if self._st_buf is not None:
             self._st_buf[:, rows] = 0.0; self._st_sum[rows] = 0.0; self._st_n[rows] = 0
             self._st_d[rows] = d
@@ -276,6 +358,7 @@ class PlanReward:
         if self.stall_s > 0:
             self._stall(dt, restarted)
         self.seen_t = self.seen_t + dt
+        self.ww_since = self.ww_since + dt
         if seen_car is not None:
             self.seen_t = torch.where(seen_car, torch.zeros_like(self.seen_t), self.seen_t)
         r = env.last_result
@@ -285,8 +368,12 @@ class PlanReward:
         imp = r.contact_impacts[self.lid].float().clamp_min(0.0)
         charge = on.clone()
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
-        if self.car_fault_only and bool(on[:, 2].any()):
-            charge[:, 2] = charge[:, 2] * self.at_fault().float()
+        if (self.car_fault_only or self.ww_k > 0) and bool(on[:, 2].any()):
+            fault = self.at_fault()
+            if self.car_fault_only:
+                charge[:, 2] = charge[:, 2] * fault.float()
+            if self.ww_k > 0:                                  # pushed by a car: no wrong-way cost for WW_WAIVE_S
+                self.ww_since = torch.where((on[:, 2] > 0) & ~fault, torch.zeros_like(self.ww_since), self.ww_since)
         ck = self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge) / T_REF
         self.cost = self.cost + ck.sum(1)
         self.cost_kind[:, :3] += ck
@@ -393,8 +480,22 @@ class PlanReward:
         adv = self.d_prev - d + lap * L
         if restarted is not None:
             adv = torch.where(restarted, torch.zeros_like(adv), adv)
+        ww = None
+        if self.ww_k > 0:                                      # (11-25) --wrong-way-cost: facing backwards and driving
+            st = self.env.sim.state[self.lid]
+            dirn, known = self.goal.downhill(st[:, :2].float(), tid)
+            yaw = st[:, IYAW].float()
+            cos_h = torch.cos(yaw) * dirn[:, 0] + torch.sin(yaw) * dirn[:, 1]
+            ok = self.ww_since >= WW_WAIVE_S
+            if restarted is not None:
+                ok = ok & ~restarted
+            ww = wrong_way_cost(-adv, cos_h, known, st[:, IVX].float(), self.ww_k, ok)
+        wc = ww["cost"] if ww is not None else torch.zeros_like(adv)
         out = {"lap": lap, "shaping": shaping, "contact": -self.cost, "plan_hit": -pp,
-               "reward": lap + shaping - self.cost - pp, "progress": adv}
+               "reward": lap + shaping - self.cost - pp - wc, "progress": adv, "wrong_way": -wc}
+        if ww is not None:
+            out["ww_hit"] = (wc > 0).float()
+            out["ww_m"] = ww["metres"]
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
         out["contact_kind"] = -self.cost_kind                  # (B_l, 4) wall, box, car, stall [laps]; sums to "contact"

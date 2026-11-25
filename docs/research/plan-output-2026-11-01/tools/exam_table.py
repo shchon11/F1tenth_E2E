@@ -1,6 +1,7 @@
 """시험 점수표 (exam1): exam_record.py 기록(npz)을 세션 단위로 채점. 세션 = 차 한 대의 90 s(상자는 50 s에 치움).
 경우마다(혼자·빈 트랙 / 혼자·상자 / 상대 차 / 상대 차·상자):
   - 깨끗한 세션(세게 닿음 0번, 2 s 넘게 선 적 없음) 비율, 한 번도 안 닿은 세션 비율, 세션당 세게 닿음(벽·상자·차)
+  - (11-25) 뒤돌아 1 m 넘게 달린 세션(앞으로 0.2 m/s 넘게 가는데 남은 거리가 늘어난 결정이 이어진 구간이 1 m 넘음), 후진한 세션(참고)
   - 한 바퀴 시간(세션 중앙값들의 중앙), 세션 안 흔들림, 세게 닿지 않고 이어 달린 바퀴 수
   - 출발(처음 5 s)에 세게 닿은 세션, 세게 닿은 뒤 5 s 안에 서 버린 비율과 선 뒤 다시 2 m/s로 달리기까지 걸린 시간(스스로 빠져나오나)
   - 상자 세션: 상자 있는 동안 / 치운 뒤로 나눔, 치운 뒤 한 바퀴가 빈 트랙 세션과 얼마나 다른가, 같은 배치에서 바퀴 번호별 상자에 세게 닿음
@@ -77,6 +78,31 @@ def runs(mask, n_min):
         longest = np.maximum(longest, cur)
     return cnt, longest
 
+WW_V, WW_M = 0.2, 1.0    # (11-25) facing backwards and driving: forward speed above this [m/s]; a session counts past this many metres
+
+
+def wrong_way(st, rem, rs, L, T):
+    """(11-25, the user: "후진은 상관없는데 뒤돌아서 가는경우가 있어서") per session: the longest stretch driven facing backwards [m]
+    and whether the car reversed at all (forward speed below -0.1 m/s; information only -- backing out is allowed).
+    Facing backwards and driving = the body-frame forward speed above WW_V while the walls-only distance to go grows: moving
+    forwards in the car's own frame and away from the finish means the nose points back along the track (plan_rl
+    --wrong-way-cost's state; on race33b u975's exam4 this agreed with the field-direction test on 99.94 % of the decisions).
+    A stretch = consecutive such decisions, its metres the growth of the distance to go (a line crossing unwrapped, a restart
+    not counted)"""
+    vx = st[:T, :, 3].astype(float)
+    r = rem[:T + 1].astype(float).copy()
+    for t in range(1, r.shape[0]):                       # a wall / off-grid sample holds the last value
+        bad = ~np.isfinite(r[t]); r[t, bad] = r[t - 1, bad]
+    dr = r[1:] - r[:-1]
+    dr = np.mod(dr + 0.5 * L, L) - 0.5 * L
+    dr[~np.isfinite(dr)] = 0.0
+    dr[rs[:T].astype(bool)] = 0.0
+    ww = (vx > WW_V) & (dr > 0)
+    cur = np.zeros(vx.shape[1]); best = np.zeros(vx.shape[1])
+    for t in range(T):
+        cur = np.where(ww[t], cur + dr[t], 0.0); best = np.maximum(best, cur)
+    return best, (vx < -0.1).any(0)
+
 
 def score(fn):
     z = np.load(fn, allow_pickle=False)
@@ -91,6 +117,7 @@ def score(fn):
     hard = d[:, :, 3:6]; anyc = d[:, :, 0:3]
     n1 = int(round(1.0 / dt)); n_st = int(round(STALL_S / dt))
     P, _ = progress(z["rem"], L)
+    ww_m, rev = wrong_way(z["st"], z["rem"], z["rs"], L, T)
     # stuck: the STALL_S window starting at each decision moves the car less than STUCK_M along the track
     adv = np.full((T, B), np.inf)
     adv[:T - n_st] = P[n_st:T] - P[:T - n_st]
@@ -155,13 +182,14 @@ def score(fn):
         out.append(f"  깨끗한 세션(세게 닿음 0번·2 s 동안 1 m도 못 간 적 없음) {pct(clean[m])} | 한 번도 안 닿은 세션 {pct(anyc.sum((0, 2))[m] == 0)} | "
                    f"2 s 동안 1 m도 못 간 세션 {pct(stalls[m] > 0)} (그렇게 5 s 넘게 {pct(longest[m] * dt > 5.0)})")
         out.append(f"  세션당 세게 닿음: 벽 {mean(h_all[m, 0])} · 상자 {mean(h_all[m, 1])} · 차 {mean(h_all[m, 2])} | 달린 거리 {med(P[-1, m], ' m', '{:.0f}')}")
+        out.append(f"  뒤돌아 {WW_M:g} m 넘게 달린 세션 {pct(ww_m[m] > WW_M)} (가장 긴 것 {ww_m[m].max():.1f} m) | 후진한 세션(참고) {pct(rev[m])}")
         out.append(f"  한 바퀴(세션 중앙값) {med(lap_med[m], ' s')} · 세션에서 가장 빠른 바퀴 {med(lap_min[m], ' s')} · 세션 안 바퀴 흔들림 "
                    f"{med(lap_sd[m], ' s')} · 온전한 바퀴 수 {med(lap_n[m], '', '{:.0f}')} · 세게 닿지 않고 이어 달린 바퀴 {med(stk[m], '', '{:.0f}')}")
         em = m[ev_b] if len(ev_b) else np.zeros(0, bool)
         es, eb = ev_stop[em], ev_back[em]; eb = eb[es]
         out.append(f"  출발(처음 5 s)에 세게 닿은 세션 {pct(hsum[:n5].any(0)[m])} | 세게 닿은 뒤({len(es)}건): 5 s 안에 선 것 {pct(es)}"
                    + (f" · 선 뒤 다시 달리기(2 m/s)까지 {np.median(eb):.1f} s(중앙) · 5 s 안에 다시 못 달린 것 {pct(eb > 5.0)}" if len(eb) else ""))
-        row[key + "_clean"] = clean[m]; row[key + "_lap"] = lap_med[m]
+        row[key + "_clean"] = clean[m]; row[key + "_lap"] = lap_med[m]; row[key + "_wrongway"] = ww_m[m] > WW_M
         if label.endswith("상자"):
             hb, ha = hard[:k_rm].sum(0), hard[k_rm:].sum(0)
             sb = runs(slow[:k_rm], 1)[0]; sa = runs(slow[k_rm:], 1)[0]

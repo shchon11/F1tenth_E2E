@@ -56,7 +56,7 @@ from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models, PRED_N, PR
     pred_zigzag, PC_N, PC_SCALE
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
-from .plan_reward import PlanReward, SEEN_S, T_REF
+from .plan_reward import PlanReward, SEEN_S, T_REF, ww_totals
 from . import plan_car_cost as PCC
 from . import plan_grad_cost as PG
 from . import plan_commit as PC
@@ -863,6 +863,7 @@ def _arg_problem(args) -> str:
         (args.mem_aux_lr > 0 and not args.mem_aux > 0, "--mem-aux-lr needs --mem-aux"),
         (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
         (args.commit_plan > 0 and _commit_problem(args) != "", _commit_problem(args)),
+        (args.wrong_way_cost < 0, "--wrong-way-cost: K >= 0"),
     )
     return next((why for bad, why in rules if bad), "")
 
@@ -1432,6 +1433,14 @@ def main(argv=None):
     ap.add_argument("--commit-off-m", type=float, default=0.05,
                     help="--commit-plan: [m] the car farther than this from the promise's 0.1 s point (a push; the speed estimate's "
                          "own error is ~4 mm median, 4 cm p99) -> no charge at that decision")
+    ap.add_argument("--wrong-way-cost", type=float, default=0.0,
+                    help="K [laps per metre] (11-25, the user: '역주행 ... 말도안되는 벌점', '후진은 상관없는데 뒤돌아서 가는경우가 있어서'): "
+                         "facing backwards and driving -- the heading more than 90 deg from the walls-only distance field's "
+                         "downhill direction (`GoalField.downhill`, the shaping's field; no centreline, no racing line) and the "
+                         "body-frame forward speed above 0.2 m/s -- costs K x the metres the distance to go grows (a line crossing "
+                         "unwrapped, restarts not counted) and, past 120 deg, K x 0.5 m every decision (`plan_reward.wrong_way_cost`). "
+                         "Reversing with the nose along the track is recovery: free. Waived 1 s after a car contact this car is not "
+                         "responsible for (pushed). Training only (the checkpoint's args keep it). 0 = off")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1622,6 +1631,10 @@ def main(argv=None):
     pr.plan_hit_share = float(args.plan_hit_share)
     pr.contact_scale = float(args.contact_scale)
     pr.car_fault_only = bool(args.car_fault)                       # --car-fault (11-24): only the contacts this car is responsible for
+    if args.wrong_way_cost < 0:
+        raise SystemExit("--wrong-way-cost: K >= 0")
+    pr.ww_k = float(args.wrong_way_cost)                           # (11-25) facing backwards and driving (`wrong_way_cost`)
+    ww_on = pr.ww_k > 0
     pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)
     pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
     if args.plan_hit_wall_s is not None and args.plan_hit_wall_s < min(args.plan_hit_s, PS.N_STEP * PS.DT):
@@ -2200,7 +2213,7 @@ def main(argv=None):
     tap_ph = args.plan_hit_share > 0
     tap_names = (["바퀴 완주", "전진 shaping", "벽 접촉", "상자 접촉"] + (["차 접촉(내 잘못)" if args.car_fault else "차 접촉"] if env.M > 1 else [])
                  + (["멈춤"] if args.stall_s > 0 else []) + (["박는 plan(벽·상자)"] if tap_ph else [])
-                 + (["plan 약속 바꿈"] if cm_on else []))
+                 + (["plan 약속 바꿈"] if cm_on else []) + (["역주행"] if ww_on else []))
     for tp_ in taps:
         tp_.set_parts(tap_names, late="차 겹침 plan" if car_on else None)
     tap_kinds_t = torch.tensor(tap_kinds, dtype=torch.long, device=dev)
@@ -2212,6 +2225,8 @@ def main(argv=None):
             xs_.append(out_["plan_hit_price"][q_:q_ + 1])
         if cm_on:                                                   # (11-25) --commit-plan's cost
             xs_.append(out_["commit"][q_:q_ + 1])
+        if ww_on:                                                   # (11-25) --wrong-way-cost
+            xs_.append(out_["wrong_way"][q_:q_ + 1])
         return torch.cat([x_.float() for x_ in xs_])
 
     def tap_opp_plan(q_):
@@ -2318,6 +2333,7 @@ def main(argv=None):
         hb_wall = torch.zeros(Bl, device=dev); hb_box = torch.zeros(Bl, device=dev)   # --hold-new-block: plans ended early
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
+        ww_acc = torch.zeros(3, Bl, device=dev)                        # --wrong-way-cost: cost [laps], decisions charged, metres
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
         c0 = pr.n_contacts.clone()
         st0 = pr.stall_time.clone()
@@ -2881,6 +2897,8 @@ def main(argv=None):
                 n_fault += float(out["car_charged"][ordm].sum())
             for k in ("lap", "shaping", "contact"):
                 stats[k] += out[k]
+            if ww_on:
+                ww_acc += torch.stack([-out["wrong_way"], out["ww_hit"], out["ww_m"]], 0)
             stats["plan_hit_cost"] += out["plan_hit_price"]
             stats["plan_hit"] += out["plan_hit"]
             sp = env.sim.state[lid, dyn.IVX].abs()
@@ -3863,6 +3881,10 @@ def main(argv=None):
                            pred_clear_far_share=car_st["pc_far"])
         if pg_on:
             row.update(pg_log)
+        if ww_on:
+            # (11-25) --wrong-way-cost over every process's ordinary races (one all_reduce, every process, every update)
+            _w = ww_acc[:, ordm].sum(1)
+            row.update(ww_totals(float(_w[0]), float(_w[1]), float(_w[2]), float(T * n_ord), mins, dist, dev))
         if cm_on:
             # (11-25) --commit-plan: "std" stays the per-output std (each step's marginal under the coefficient noise, what the
             # site and tools read), "std_coef" the coefficients' own [turn deg 0..9, speed deg 0..9]
@@ -3984,6 +4006,8 @@ def main(argv=None):
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
               + (pg_line(row) if pg_on else "")
               + (cm_line(row) if cm_on else "")
+              + (f"역주행 벌점 {row['wrong_way_cost_per_min']:.3f} 바퀴/분 (걸린 결정 {row['wrong_way_share'] * 100:.2f} %, 뒤돌아 간 거리 "
+                 f"{row['wrong_way_m_per_min']:.2f} m/분) | " if ww_on else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, " + (f"실제로 간 길과 0.5 s / 1.0 s 차이 {row['tail_next_05'] * 100:.0f} / {(row['tail_driven_10'] or 0) * 100:.0f} cm"
                  if args.tail_target == "driven" else f"다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm")
                  + (f", 몸통 gradient policy 대비 {row['tail_trunk_ratio']:.2f}배" if row.get("tail_trunk_ratio") is not None else "") + " | "
