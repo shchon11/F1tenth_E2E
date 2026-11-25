@@ -19,7 +19,6 @@ import types
 import torch
 
 from f1sim.learn import pts_policy as T
-from f1sim.learn.plan_policy import STATE_DIM2
 
 dev = torch.device("cuda")
 torch.manual_seed(0)
