@@ -28,6 +28,11 @@ exploration floors, correlated noise, KL leashes): the world, the plan format, t
   before a past hard contact and drive 5 s from it (`scene_replay`); the other races are as they were and are where the
   scenes come from. The regular statistics count the other races only.
 
+* `--arch pts` (11-25, net_redesign_v2 A/C, approved by the user): the point-token policy (`pts_policy`): 5 scans as points
+  dead-reckoned into the frame now, plan queries anchored at the previous plan, a GRU on the ego query, and a free-space
+  head (own optimizer, hindsight clearance targets, read detached). The update rebuilds every decision's tokens from the
+  stored scans and poses (`pts_policy.PtsStore`); nothing downstream of the 20 plan numbers changes.
+
 usage: python -m f1sim.learn.plan_rl --name NAME [--updates 2000] [--envs 1024] [--seed 1]"""
 from __future__ import annotations
 
