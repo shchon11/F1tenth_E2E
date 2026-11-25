@@ -336,7 +336,7 @@ class SelfOpponents:
                  "rel_psi", "prev_ok")
 
     def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5, vcap=None,
-                 pace=None, pts: bool = False, odom_noise: float = 0.0):
+                 pace=None, pts: bool = False, odom_noise: float = 0.0, memory: int = 0):
         self.env, self.lim, self.share = env, lim, float(share)
         self.rows = torch.nonzero(~env.learner).flatten()
         dev = env.device
@@ -345,6 +345,10 @@ class SelfOpponents:
         self.pts = bool(pts)
         self.obs = (PTSP.PtsObs(env, lim, None, rows=self.rows, odom_noise=odom_noise) if self.pts
                     else PlanObs2(env, lim, None, rows=self.rows))
+        # (11-25) the copies' memory state from the start, at the learner's size: a scene taken before the first copy joined
+        # stored a (n, 1) stand-in and the store's next add of a (n, memory) one failed (`snapshot`, --scene-copies)
+        if int(memory) > 0:
+            self.obs.mem_h = torch.zeros(Bo, int(memory), device=dev)
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by a copy this race
         self.which = torch.zeros(Bo, dtype=torch.long, device=dev)    # by which of the pool
         # `vcap` (lo, hi) [m/s]: each copy-driven race draws a top speed for its copy (11-12: copies of our own pace gave
@@ -1580,7 +1584,8 @@ def main(argv=None):
             if len(pace_) != 3 or not (0.0 < pace_[0] <= pace_[1] <= 1.0 and 0.0 <= pace_[2] <= 1.0):
                 raise SystemExit("--self-opp-pace LO,HI,P: 0 < LO <= HI <= 1, 0 <= P <= 1")
         drv.opp = SelfOpponents(env, lim, args.self_opp, seed=args.seed, max_pool=args.self_opp_pool, p_newest=args.self_opp_newest,
-                                vcap=args.self_opp_vcap, pace=pace_, pts=pts_on, odom_noise=args.pts_odom_noise if pts_on else 0.0)
+                                vcap=args.self_opp_vcap, pace=pace_, pts=pts_on, odom_noise=args.pts_odom_noise if pts_on else 0.0,
+                                memory=int(args.memory or 0) + int(args.box_memory or 0))
         opp_index = torch.full((env.B,), -1, dtype=torch.long, device=dev)      # env row -> its place in drv.opp's rows
         opp_index[drv.opp.rows] = torch.arange(drv.opp.rows.numel(), device=dev)
     if args.self_opp_pace and drv.opp is None:
