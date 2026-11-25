@@ -22,12 +22,13 @@ class _Boxes:
     def __init__(self, box_x, box_y=0.0, size=0.2):
         self.box_x, self.box_y, self.h = box_x, box_y, size / 2
 
-    def clearance(self, pts, eid):
+    def clearance(self, pts, eid, slot_mask=None):   # (11-21) the real one takes slot_mask (--plan-hit-seen)
         return torch.maximum((pts[:, 0] - self.box_x).abs(), (pts[:, 1] - self.box_y).abs()) - self.h
 
 
 def _pr(wall_x=1e9, box_x=None, wall_n=None, box_y=0.0, size=0.2):
     pr = object.__new__(PlanReward)
+    pr.plan_known, pr.plan_known_walls = None, False   # (11-21 fields; __init__ sets them)
     sim = types.SimpleNamespace(tid=torch.zeros(1, dtype=torch.long), eid=torch.zeros(1, dtype=torch.long), track=_Track(wall_x))
     pr.env = types.SimpleNamespace(sim=sim, procedural=None if box_x is None else _Boxes(box_x, box_y, size))
     pr.lid = torch.zeros(1, dtype=torch.long)
