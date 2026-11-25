@@ -161,23 +161,23 @@ class PtsFront(nn.Module):
         self.tok = nn.Sequential(nn.Linear(D_PT + 16 + 1, D_TOK), nn.ReLU(), nn.Linear(D_TOK, D_TOK))
 
     def forward(self, X, Y, r, ok):
+        """frame by frame (the per-point layer is the memory: 1.4 MB a decision for all five frames at once), the tokens in the
+        probe's order: the newest frame's runs, then each older frame's"""
         n, K, P = X.shape
-        age = (torch.arange(K, device=X.device, dtype=X.dtype) * PS.DT)[None, :, None].expand(n, K, P)
-        xy = torch.stack([X, Y], -1)
-        h = self.pmlp(torch.cat([fourier(xy), age[..., None], r[..., None]], -1))            # (n, K, P, D_PT)
-        h = h.masked_fill(~ok[..., None], float("-inf"))
-        okf = ok.to(X.dtype)
-
-        def runs(hh, oo, pp, aa, L):
-            nF = hh.shape[1]
-            hh = hh.reshape(n, nF, P // L, L, -1).amax(3)
-            cnt = oo.reshape(n, nF, P // L, L).sum(3)
-            pos = (pp * oo[..., None]).reshape(n, nF, P // L, L, 2).sum(3) / cnt.clamp_min(1.0)[..., None]
-            return hh.reshape(n, -1, hh.shape[-1]), pos.reshape(n, -1, 2), aa[:, :, ::L].reshape(n, -1), (cnt > 0).reshape(n, -1)
-        parts = [runs(h[:, :1], okf[:, :1], xy[:, :1], age[:, :1], RUN_NEW)]
-        if K > 1:
-            parts.append(runs(h[:, 1:], okf[:, 1:], xy[:, 1:], age[:, 1:], RUN_OLD))
-        hh, pos, ag, val = (torch.cat([p_[i] for p_ in parts], 1) for i in range(4))
+        hs, ps, ags, vals = [], [], [], []
+        for j in range(K):
+            L = RUN_NEW if j == 0 else RUN_OLD
+            xy = torch.stack([X[:, j], Y[:, j]], -1)                                         # (n, P, 2)
+            a = torch.full_like(X[:, j], j * PS.DT)
+            h = self.pmlp(torch.cat([fourier(xy), a[..., None], r[:, j, :, None]], -1))     # (n, P, D_PT)
+            h = h.masked_fill(~ok[:, j, :, None], float("-inf"))
+            okf = ok[:, j].to(X.dtype)
+            hs.append(h.reshape(n, P // L, L, -1).amax(2))
+            cnt = okf.reshape(n, P // L, L).sum(2)
+            ps.append((xy * okf[..., None]).reshape(n, P // L, L, 2).sum(2) / cnt.clamp_min(1.0)[..., None])
+            ags.append(a[:, ::L])
+            vals.append(cnt > 0)
+        hh, pos, ag, val = torch.cat(hs, 1), torch.cat(ps, 1), torch.cat(ags, 1), torch.cat(vals, 1)
         hh = torch.where(val[..., None], hh, torch.zeros_like(hh))
         val = val.clone()
         val[:, 0] = val[:, 0] | ~val.any(1)                                                  # never an all-masked row

@@ -1421,7 +1421,7 @@ def main(argv=None):
                          "the representation probes' model, on top of the odometry model's own errors (the console / car: 0)")
     ap.add_argument("--pts-abs", action="store_true",
                     help="--arch pts: the plan head's output is the plan itself, not a residual on the anchor action")
-    ap.add_argument("--pts-chunk", type=int, default=1024,
+    ap.add_argument("--pts-chunk", type=int, default=128,
                     help="--arch pts: decisions per recomputed (checkpointed) piece of the update's forward pass")
     ap.add_argument("--free-lr", type=float, default=3e-4, help="--arch pts: the free-space head's own Adam learning rate")
     ap.add_argument("--free-epochs", type=int, default=1,
@@ -1992,7 +1992,7 @@ def main(argv=None):
 
         def pts_stage1(P_, s_):
             """the update's tokens + block 1, recomputed in pieces in the backward pass (the per-point layer of 5 x 1088 points
-            per decision is the memory: a 4864-decision minibatch would keep ~7 GB of it); no gradient: one piece"""
+            is 1.4 MB a decision and tensor: a 2432-decision minibatch would keep ~10 GB of it); no gradient: one piece"""
             if not torch.is_grad_enabled():
                 return actor.stage1(P_, s_)
             def fn_(*a_):

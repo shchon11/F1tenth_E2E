@@ -381,3 +381,16 @@ def test_minibatch_split_is_exact():
     for n_seq in (1, 5, 19, 32, 33, 304):
         for MB in (8, 32, 128):
             assert len(torch.randperm(n_seq).tensor_split(MB)) == MB
+
+
+def test_car_future_guess_straight_and_turning():
+    """--free-oracle's stand-in for a scripted car: speed and yaw rate held (an exact arc; straight when the turn is ~0)"""
+    from f1sim import dynamics as dyn
+    st = torch.zeros(2, 8)
+    st[:, dyn.IVX] = 2.0
+    st[1, dyn.IR] = 1.0
+    g = T.car_future_guess(st)
+    assert torch.allclose(g[0, :, 0], torch.arange(1, 11).float() * 0.2, atol=1e-5) and torch.allclose(g[0, :, 1], torch.zeros(10))
+    t = torch.arange(1, 11).float() * 0.1                    # radius 2 m, centre (0, 2)
+    assert torch.allclose(g[1, :, 0], 2.0 * torch.sin(t), atol=1e-5) and torch.allclose(g[1, :, 1], 2.0 * (1 - torch.cos(t)), atol=1e-5)
+    assert torch.allclose(g[1, :, 2], t, atol=1e-6)
