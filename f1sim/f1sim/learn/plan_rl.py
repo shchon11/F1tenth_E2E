@@ -864,8 +864,23 @@ def _arg_problem(args) -> str:
         (args.horizon_auto > 1 and not args.accum_actor_auto, "--horizon-auto needs --accum-actor-auto"),
         (args.commit_plan > 0 and _commit_problem(args) != "", _commit_problem(args)),
         (args.wrong_way_cost < 0, "--wrong-way-cost: K >= 0"),
+        (bool(args.wrong_way_ramp) and not args.wrong_way_cost > 0, "--wrong-way-ramp needs --wrong-way-cost"),
+        (bool(args.wrong_way_ramp) and ramp_w(1, args.wrong_way_ramp) is None, "--wrong-way-ramp U0,U1 with U0 <= U1"),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+def ramp_w(upd: int, spec: str) -> Optional[float]:
+    """(11-25) a weight's share at update `upd` for a ramp 'U0,U1': 0 until U0, linear to 1 at U1 ('' = 1; a bad spec = None)"""
+    if not spec:
+        return 1.0
+    try:
+        u0, u1 = (float(x) for x in spec.split(","))
+    except ValueError:
+        return None
+    if u1 < u0:
+        return None
+    return 1.0 if u1 == u0 and upd >= u0 else min(1.0, max(0.0, (upd - u0) / max(1e-9, u1 - u0)))
 
 
 def _commit_problem(args) -> str:
@@ -1441,6 +1456,11 @@ def main(argv=None):
                          "unwrapped, restarts not counted) and, past 120 deg, K x 0.5 m every decision (`plan_reward.wrong_way_cost`). "
                          "Reversing with the nose along the track is recovery: free. Waived 1 s after a car contact this car is not "
                          "responsible for (pushed). Training only (the checkpoint's args keep it). 0 = off")
+    ap.add_argument("--wrong-way-ramp", default="",
+                    help="U0,U1: --wrong-way-cost's K is 0 until update U0 and reaches its value at U1 (the state is measured all "
+                         "along). cp36b (K 0.2 from the first update) stood 64-81 %% of the time at u10-u21 against cp36a's 46-60 %%: a "
+                         "fresh policy turns round often, and standing was the safe answer; early on the distance shaping already "
+                         "prices going backwards. '' = K from the start")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1631,10 +1651,10 @@ def main(argv=None):
     pr.plan_hit_share = float(args.plan_hit_share)
     pr.contact_scale = float(args.contact_scale)
     pr.car_fault_only = bool(args.car_fault)                       # --car-fault (11-24): only the contacts this car is responsible for
-    if args.wrong_way_cost < 0:
-        raise SystemExit("--wrong-way-cost: K >= 0")
-    pr.ww_k = float(args.wrong_way_cost)                           # (11-25) facing backwards and driving (`wrong_way_cost`)
-    ww_on = pr.ww_k > 0
+    if args.wrong_way_cost < 0 or (args.wrong_way_ramp and (not args.wrong_way_cost > 0 or ramp_w(1, args.wrong_way_ramp) is None)):
+        raise SystemExit("--wrong-way-cost: K >= 0; --wrong-way-ramp U0,U1 (U0 <= U1) needs it")
+    ww_on = args.wrong_way_cost > 0                                # (11-25) facing backwards and driving (`wrong_way_cost`)
+    pr.ww_on = ww_on                                               # K per update below (--wrong-way-ramp)
     pr.stall_s, pr.stall_vmin, pr.stall_window_s = float(args.stall_s), float(args.stall_vmin), float(args.stall_window)
     pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
     if args.plan_hit_wall_s is not None and args.plan_hit_wall_s < min(args.plan_hit_s, PS.N_STEP * PS.DT):
@@ -2262,6 +2282,8 @@ def main(argv=None):
         if args.shaping_fade:                                       # --shaping-fade: the distance shaping's weight this update
             _f0, _f1 = (float(x_) for x_ in args.shaping_fade.split(","))
             pr.shaping_w = 1.0 - min(1.0, max(0.0, (upd - _f0) / max(1.0, _f1 - _f0)))
+        if ww_on:                                                   # --wrong-way-cost: K this update (--wrong-way-ramp)
+            pr.ww_k = float(args.wrong_way_cost) * ramp_w(upd, args.wrong_way_ramp)
         if cm_on:                                                   # --commit-plan: W this update (--commit-ramp)
             cm_w = float(args.commit_plan)
             if args.commit_ramp:
@@ -3885,7 +3907,8 @@ def main(argv=None):
             # (11-25) --wrong-way-cost over every process's ordinary races (one all_reduce, every process, every update)
             # (own name: `_w` is the critic box block's width that priv_h reads)
             ww_s_ = ww_acc[:, ordm].sum(1)
-            row.update(ww_totals(float(ww_s_[0]), float(ww_s_[1]), float(ww_s_[2]), float(T * n_ord), mins, dist, dev))
+            row.update(ww_totals(float(ww_s_[0]), float(ww_s_[1]), float(ww_s_[2]), float(T * n_ord), mins, dist, dev),
+                       wrong_way_k=pr.ww_k)
         if cm_on:
             # (11-25) --commit-plan: "std" stays the per-output std (each step's marginal under the coefficient noise, what the
             # site and tools read), "std_coef" the coefficients' own [turn deg 0..9, speed deg 0..9]
@@ -4007,7 +4030,7 @@ def main(argv=None):
               + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
               + (pg_line(row) if pg_on else "")
               + (cm_line(row) if cm_on else "")
-              + (f"역주행 벌점 {row['wrong_way_cost_per_min']:.3f} 바퀴/분 (걸린 결정 {row['wrong_way_share'] * 100:.2f} %, 뒤돌아 간 거리 "
+              + (f"역주행 벌점(K {row['wrong_way_k']:.3g}) {row['wrong_way_cost_per_min']:.3f} 바퀴/분 (걸린 결정 {row['wrong_way_share'] * 100:.2f} %, 뒤돌아 간 거리 "
                  f"{row['wrong_way_m_per_min']:.2f} m/분) | " if ww_on else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, " + (f"실제로 간 길과 0.5 s / 1.0 s 차이 {row['tail_next_05'] * 100:.0f} / {(row['tail_driven_10'] or 0) * 100:.0f} cm"
                  if args.tail_target == "driven" else f"다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm")
