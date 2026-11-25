@@ -103,6 +103,9 @@ def describe(ck: dict, kind: str, path: str) -> str:
         if ck.get("format") == "plan_steps3":
             return (f"planner(v3, 제어 지연을 앎): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan·서보 각, "
                     f"속도는 스스로 짐작 -> 0.1 s마다 조향·속도 명령 10개(지연·서보·속도 루프·조향표를 거친 차의 반응이 plan), 10 Hz")
+        if ck.get("format") == "plan_steps2" and (ck.get("pts") or {}).get("arch") == "pts":
+            return (f"planner(점 토큰): {run}/{name} · update {ck.get('update', '?')} · LiDAR 5장을 주행거리로 지금 틀에 옮긴 점 + IMU + "
+                    f"직전 plan, 빈 공간 머리 -> 점 10개 x 0.1 s(차 한계 안) -> {follow}, 10 Hz")
         if ck.get("format") == "plan_steps2":
             return (f"planner(재설계 v2): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, "
                     f"속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> {follow}, 10 Hz")
