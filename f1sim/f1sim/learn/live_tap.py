@@ -25,6 +25,9 @@ training reads or writes changes because of it.
 * ``opp_plan``: 10 x [x, y] in the world, the plan of the policy copy driving the other car this decision (its path; a
   slowed copy covers it at its pace factor); null when no copy drives it.
 * ``car_dims`` / ``opp_dims``: [length, width] [m] of the two cars.
+* ``pred_clear`` (11-25, plan_rl --pred-clear): the 10 clearances [m] the trunk read at this decision -- at 0.1 .. 1.0 s, the
+  smallest free distance between our car where its previous plan puts it and the predicted other car (3 discs each, the
+  plan-car margin; 3 = nothing predicted there or no previous plan; clipped to [-1, 3]); null without --pred-clear.
 The old ``parts_ep`` / ``parts_win`` (lap, shaping, contact, plan hit, total) stay.
 """
 import json
@@ -112,13 +115,14 @@ class LiveTap:
                value: torch.Tensor, reward: torch.Tensor, lap: torch.Tensor, contact: torch.Tensor, shaping: torch.Tensor,
                vhat: torch.Tensor, noise: torch.Tensor, std: torch.Tensor, mem=None, replay: bool = False,
                copy_opp: bool = False, mem_read=None, mem_pose=None, known=None, parts=None, pred=None, pred_pose=None,
-               opp_plan=None, opp_live=None) -> None:
+               opp_plan=None, opp_live=None, pred_clear=None) -> None:
         """after a decision, learner `row`'s: `pts` (10, 2) the plan it drove (world), `pts_mean` (10, 2) the plan its mean
         action makes, `plan_v` (10,) the driven plan's speeds, the critic's `value`, the reward and its parts, the speed
         estimate `vhat`, the size of the noise drawn (`noise`, in std units) and the policy's mean std, `mem` (memory,) the
         memory after this decision. The car as it stands at the decision's end. (11-24) `parts` (n,) the reward's terms
         named by `set_parts`; `pred` (21,) the prediction head's raw output and `pred_pose` (3,) the pose the decision was
-        made at; `opp_plan` (10, 2) the other car's copy's plan (world) and `opp_live` () whether a copy drives it."""
+        made at; `opp_plan` (10, 2) the other car's copy's plan (world) and `opp_live` () whether a copy drives it. (11-25)
+        `pred_clear` (10,) [m] the clearance inputs this decision read."""
         env, sim, r, o = self.env, self.env.sim, self.r, self.o
         dev = sim.state.device
         st = sim.state[r, :4].float()
@@ -137,7 +141,7 @@ class LiveTap:
         e0 = torch.zeros(0, device=dev)
         extra = [sc(parts) if parts is not None else e0, sc(pred) if pred is not None else e0,
                  sc(pred_pose)[:3] if pred_pose is not None else e0, sc(opp_plan) if opp_plan is not None else e0,
-                 sc(opp_live) if opp_live is not None else e0]
+                 sc(opp_live) if opp_live is not None else e0, sc(pred_clear) if pred_clear is not None else e0]
         parts_l = [st, ost, present, sc(pts), sc(pts_mean), sc(plan_v), hard, sim.tid[r].float().reshape(1),
                    sc(value), sc(reward), sc(lap), sc(contact), sc(shaping), sc(vhat), sc(noise), sc(std), box, m, rng] + extra
         sizes = [int(p_.numel()) for p_ in parts_l]
@@ -146,7 +150,7 @@ class LiveTap:
         for n_ in sizes:
             out.append(flat[i:i + n_]); i += n_
         car, opp, pres, plan, plan_m, pv, hit, tid, val, rew, lap_, con, shp, vh, noi, sd, bx, mm, rr = out[:19]
-        npart, pq, ppose, oplan, olive = out[19:]
+        npart, pq, ppose, oplan, olive, pclr = out[19:]
         a = self.angles + car[2]
         sx, sy = car[0] + self.mount_x * np.cos(car[2]), car[1] + self.mount_x * np.sin(car[2])
         ok = np.isfinite(rr) & (rr > 0.05) & (rr < 29.0)
@@ -223,7 +227,8 @@ class LiveTap:
                "laps": list(self.laps), "ep_s": round(self.dec_ep * 0.1, 1), "mem_boxes": mem_boxes,
                "known": None if known is None else int(known),
                "parts": named, "parts_lag_s": lag, "parts_resid": round(self.resid_ep, 6),
-               "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims}
+               "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims,
+               "pred_clear": _r(pclr, 3) if pclr.size else None}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))

@@ -11,6 +11,8 @@
 #       그 뒤 인자는 plan_rl에 그대로 덧붙임(같은 인자는 뒤에 온 것이 이김)
 # 예: bash tools/launch_run.sh k26a korea_2026_competition                       # 처음부터
 #     bash tools/launch_run.sh k26b korea_2026_competition 1300 ~/f1sim_runs/avg26s/plan_u900.pt 900   # Korea 2025 최고에서 이어
+# LAUNCH_CODE (11-25): 학습이 돌 f1sim 코드 폴더 (기본 /home/shchon11/F1tenth_E2E/f1sim) -- 아직 main에 안 합친 갈래(worktree)를 띄울 때.
+#   랩 시험도 그 갈래로 돌려야 하면 LAB_CODE(lab_race_exam_loop.sh)를 함께 줌
 set -e
 N=$1; W=$2; U1=${3:-1000}; INIT=${4:-}; OFF=${5:-0}
 shift $(( $# < 5 ? $# : 5 ))
@@ -37,16 +39,16 @@ if [ -n "${CHECK:-}" ]; then
   # (11-24) the console's training queue (train_queue.py): would plan_rl take exactly these arguments? Parse + the checks
   # that need no environment, the parsed arguments as JSON on stdout; nothing started, no GPU (CUDA_VISIBLE_DEVICES empty)
   DW=""; [ "${LAUNCH_GPU:-both}" = both ] && DW="--dist-world 2"
-  cd /home/shchon11/F1tenth_E2E/f1sim
-  CUDA_VISIBLE_DEVICES= PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim exec /home/shchon11/F1tenth_E2E/.venv/bin/python3 \
+  cd ${LAUNCH_CODE:-/home/shchon11/F1tenth_E2E/f1sim}
+  CUDA_VISIBLE_DEVICES= PYTHONPATH=${LAUNCH_CODE:-/home/shchon11/F1tenth_E2E/f1sim} exec /home/shchon11/F1tenth_E2E/.venv/bin/python3 \
     -m f1sim.learn.plan_rl --name $N $ARGS $DW --check-args
 fi
-echo "$(date +%T) $N | 세계 $WJ ($MAPN, 접촉 무게 $CS) | ${INIT:-처음부터} | 끝 u$U1 | 덧붙임: $*" | tee -a $D/switch_$N.log
+echo "$(date +%T) $N | 세계 $WJ ($MAPN, 접촉 무게 $CS) | ${INIT:-처음부터} | 끝 u$U1 | 덧붙임: $*${LAUNCH_CODE:+ | 코드 $LAUNCH_CODE}" | tee -a $D/switch_$N.log
 cd $RT
 source /home/shchon11/F1tenth_E2E/.venv/bin/activate
-export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONPATH=${LAUNCH_CODE:-/home/shchon11/F1tenth_E2E/f1sim}:/home/shchon11/F1tenth_E2E/f1sim_ros WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export F1SIM_PLAN_LAT_MARGIN=0.95 F1SIM_LIDAR_MOUNT_X=0.12555
-F=/home/shchon11/F1tenth_E2E/f1sim
+F=${LAUNCH_CODE:-/home/shchon11/F1tenth_E2E/f1sim}
 # (11-18) LAUNCH_ENVS0 / LAUNCH_ENVS1 = 4070 / 5060 차 수 (기본 608 / 416): rollout 256에 장면 재생까지 올리면 5060(화면 출력도 맡음)이
 # 메모리 한계(7.6/8.2 GB)에 붙어 주행이 4070의 두 배 걸렸음(qual26l) -> 672 / 352
 # LAUNCH_GPU=both (기본: 4070 608대 + 5060 416대) | 0 (4070 혼자) | 1 (5060 혼자); 혼자일 때 차 수 LAUNCH_ENVS (기본 512)
