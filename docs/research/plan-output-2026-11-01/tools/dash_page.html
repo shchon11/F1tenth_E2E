@@ -107,6 +107,7 @@ button.pill { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 
 .charts h3 .sub { font-weight: 400; }
 .cbox { position: relative; height: 190px; }
 .trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.trio.quad { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .trio .cbox { height: 150px; }
 .trio h4 { font-size: 12px; margin: 0 0 2px; color: var(--ink2); font-weight: 600; }
 /* checkpoints */
@@ -147,7 +148,7 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
 .hide { display: none !important; }
 @media (max-width: 720px) {
   .hbar { padding: 8px 12px; gap: 8px; } .stamp { display: none; } main { padding: 10px 12px 48px; }
-  .ck { grid-template-columns: minmax(0, 1fr); } .trio { grid-template-columns: minmax(0, 1fr); } .mini { grid-template-columns: repeat(3, 1fr); }
+  .ck { grid-template-columns: minmax(0, 1fr); } .trio, .trio.quad { grid-template-columns: minmax(0, 1fr); } .mini { grid-template-columns: repeat(3, 1fr); }
   .kpis { grid-template-columns: repeat(2, 1fr); } .kpi b { font-size: 17px; }
   th, td { padding: 5px 7px; font-size: 12px; }
   table.race th, table.race td { padding-left: 5px; padding-right: 5px; }
@@ -210,6 +211,11 @@ table.race td .cmp { display: block; color: var(--muted); font-size: 11px; font-
       <div class="trio"><div><h4>직접 / PPO gradient</h4><div class="cbox"><canvas id="c_pg1"></canvas></div></div>
         <div><h4>차 항이 켜진 결정 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_pg2"></canvas></div></div>
         <div><h4>앞 4 m 차 결정의 PPO gradient 몫 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_pg3"></canvas></div></div></div></div>
+    <div class="card hide" data-opt="cm_dev05_p50" style="grid-column: 1 / -1"><h3>plan 약속</h3>
+      <div class="trio quad"><div><h4>어긋남 <span class="sub">cm</span></h4><div class="cbox"><canvas id="c_cm1"></canvas></div></div>
+        <div><h4>정직 <span class="sub">cm</span></h4><div class="cbox"><canvas id="c_cm2"></canvas></div></div>
+        <div><h4>비용 / 바퀴 보상 <span class="sub">%</span></h4><div class="cbox"><canvas id="c_cm3"></canvas></div></div>
+        <div><h4>탐색 잡음 <span class="sub">cm</span></h4><div class="cbox"><canvas id="c_cm4"></canvas></div></div></div></div>
     <div class="card hide" data-opt="plan_now_clear_share"><h3>앞차 지금 자리 지나되 실제와 안 겹친 plan <span class="sub">%</span></h3><div class="cbox"><canvas id="c_pnow"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_05"><h3>상대 예측 오차 0.5 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe05"></canvas></div></div>
     <div class="card hide" data-opt="pred_err_10"><h3>상대 예측 오차 1.0 s 뒤 <span class="sub">m</span></h3><div class="cbox"><canvas id="c_pe10"></canvas></div></div>
@@ -475,6 +481,18 @@ async function refresh() {
     for (const [id, sets] of [["c_pg1", [...two((r) => r.pg_ratio), ...sec("한 걸음", (r) => r.pg_ratio_step_est)]],
                               ["c_pg2", [...two(pc("pg_near_car")), ...sec("실제 겹침", pc("pg_hard_car"))]],
                               ["c_pg3", [...two(pc("pg_rel_grad_share")), ...sec("결정 몫", pc("pg_rel_dec_share"))]]]) {
+      if (has) chart(id, sets); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+    }
+  }
+  {   // (11-25, --commit-plan) the promise: its gap (0.5 s solid, 1.0 s dashed), honesty, the cost's share of the lap reward, the noise
+    const has = own.some((r) => r.cm_dev05_p50 != null) || rrOwn.some((r) => r.cm_dev05_p50 != null);
+    document.querySelector('[data-opt="cm_dev05_p50"]').classList.toggle("hide", !has);
+    const cmv = (k) => (r) => r[k] == null ? null : 100 * r[k];
+    const sec = (lab, f) => [Object.assign(ds(lab, series(rows, f, OFF.run), rgba(css("--run"), 0.6), false), {borderWidth: 1.4, borderDash: [5, 4]})];
+    for (const [id, sets] of [["c_cm1", [...two(cmv("cm_dev05_p50")), ...sec("1.0 s", cmv("cm_dev10_p50"))]],
+                              ["c_cm2", [...two(cmv("cm_honest05_p50")), ...sec("1.0 s", cmv("cm_honest10_p50"))]],
+                              ["c_cm3", two(cmv("cm_cost_share"))],
+                              ["c_cm4", [...two(cmv("cm_noise05")), ...sec("1.0 s", cmv("cm_noise10"))]]]) {
       if (has) chart(id, sets); else if (charts[id]) { charts[id].destroy(); delete charts[id]; }
     }
   }

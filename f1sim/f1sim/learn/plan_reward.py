@@ -210,6 +210,10 @@ class PlanReward:
         # by a tenth of its own point's progress. (That was not why roll29c stood still: roll29d with the last point did too,
         # gradient noise scale 52-69k against 38-49k.) Still exact shaping
         self.phi_k = None
+        #: (11-25, plan_rl --commit-plan) Phi read at the CAR (its distance left after the decision), not at the plan's points:
+        #: the shaping pays progress the car made, never progress a plan only promised -- a promise is priced by the commitment
+        #: cost. Still exact shaping (Phi of the state)
+        self.phi_car = False
         # (11-13) the stall price of 11-06 ("--stall-mode progress"): each second the car's progress over the last
         # `stall_window_s` falls short of `stall_vmin` [m/s] costs `stall_s` seconds x the shortfall's share; 0 = off.
         # Progress = the drop of the walls-only distance left, so standing, rocking and going the wrong way all pay, and a
@@ -236,6 +240,8 @@ class PlanReward:
         car's side: the potential jumps once per point per lap, and the sum over a lap still telescopes."""
         tid = self.env.sim.tid[self.lid]
         L = self.goal.lap[tid]
+        if self.phi_car:                                       # --commit-plan: the car's own progress
+            return -d_car / L
         d = self.goal.remaining(pts, tid[:, None].expand(-1, pts.shape[1]))
         prev = d_car
         cols = []
