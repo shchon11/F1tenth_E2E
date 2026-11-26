@@ -7,7 +7,10 @@ need no simulator --
     the floor scored -- and the update's recomputation matches the rollout's (PPO ratio 1 before any step);
   * the intent and its hold round-trip through a stored moment (a copy's `SelfOpponents.snapshot` / `restore`), and a copy
     carries its own;
-  * the structured start: a fresh net's 1 s plan points lie the intended distances apart (a steady steering offset, an arc)."""
+  * the structured start: a fresh net's 1 s plan points lie the intended distances apart (a steady steering offset, an arc);
+  * --intent-trunk: the trunk reads z through first-layer columns that start at zero -- at the start the plan under every z is
+    exactly the vectors-only actor's; moved, z changes the control law state by state while pi_high, the speed estimate and
+    the memory stay z-free."""
 import math
 import types
 
@@ -399,11 +402,123 @@ def test_the_update_log(lim):
     bias = IN.init_bias(lim, K, 0.3)
     z = torch.tensor([0, 1, 2, 3, 3, 3]); due = torch.tensor([True, False, True, False, True, False])
     lg = torch.zeros(6, K); lg[:, 3] = 1.0
-    st.decision(0, z, due, lg, torch.ones(6, dtype=torch.bool), torch.zeros(6, PS.ACT_DIM), bias, torch.full((6,), 5.0),
-                torch.zeros(6), lim)
+    mean_of = lambda idx, k: torch.zeros(idx.numel(), PS.ACT_DIM) + (0.0 if k is None else bias[k])
+    st.decision(0, z, due, lg, torch.ones(6, dtype=torch.bool), mean_of, torch.full((6,), 5.0), torch.zeros(6), lim)
     r = st.row(bias)
     assert r["intent_redraws"] == 3 and abs(r["intent_off_argmax"] - 2 / 3) < 1e-6
     assert r["intent_share"] == [round(1 / 6, 4), round(1 / 6, 4), round(1 / 6, 4), 0.5]
     assert abs(r["intent_lat_spread"] - float(IN.pair_spread(torch.tensor([[-0.3], [-0.1], [0.1], [0.3]])))) < 0.01
     assert all(abs(a - b) < 0.01 for a, b in zip(r["intent_lat_ref"], [-0.3, -0.1, 0.1, 0.3]))
     assert "의도" in IN.log_line(r)
+
+
+# ------------------------------------------------------------------ the trunk reads z (--intent-trunk)
+def _trunk_pair(lim):
+    torch.manual_seed(8)
+    a = Actor2(BEAMS, memory=16, mem_front=True, intent=SPEC)
+    torch.manual_seed(8)
+    b = Actor2(BEAMS, memory=16, mem_front=True, intent=SPEC, intent_trunk=True)
+    for x in (a, b):
+        x.intent_init(lim, 0.3)
+    with torch.no_grad():
+        a.pi.weight.normal_(0.0, 0.3); b.pi.weight.copy_(a.pi.weight)     # a plan head with opinions
+        a.intent_head.weight.normal_(0.0, 0.5); b.intent_head.weight.copy_(a.intent_head.weight)
+    return a.eval(), b.eval()
+
+
+def test_trunk_z_starts_as_the_vectors_only_actor(lim):
+    a, b = _trunk_pair(lim)
+    assert b.intent_trunk and float(b.intent_in.detach().abs().max()) == 0.0
+    sa, sb = a.state_dict(), b.state_dict()
+    assert set(sb) - set(sa) == {"intent_in"} and all(torch.equal(sa[k], sb[k]) for k in sa)
+    sc, st = _inputs(7, 3)
+    h = torch.randn(7, 16) * 0.3
+    ma, la, va = a(sc, st, h); mb, lb, vb = b(sc, st, h)
+    assert torch.equal(ma, mb) and torch.equal(va, vb) and torch.equal(a.intent_logits_out, b.intent_logits_out)
+    assert torch.equal(a.h_out, b.h_out)
+    for k in range(K):
+        z = torch.full((7,), k)
+        assert torch.equal(a.intent_mean(ma, z), b.intent_mean(mb, z))      # bit for bit: a1 + 0
+
+
+def test_the_trunk_reads_z_once_its_columns_move(lim):
+    a, b = _trunk_pair(lim)
+    with torch.no_grad():
+        b.intent_in.normal_(0.0, 0.5)
+    sc, st = _inputs(7, 4)
+    h = torch.randn(7, 16) * 0.3
+    ma, _, va = a(sc, st, h); mb, _, vb = b(sc, st, h)
+    # z-free: the plan without z, pi_high, the speed estimate and the memory do not change with z's columns
+    assert torch.allclose(ma, mb, atol=1e-6) and torch.allclose(va, vb, atol=1e-6)
+    assert torch.allclose(a.intent_logits_out, b.intent_logits_out, atol=1e-6) and torch.allclose(a.h_out, b.h_out)
+    # under z: beyond the vector, and differently from state to state (the control law is z-conditioned)
+    d = torch.stack([b.intent_mean(mb, torch.full((7,), k)) - a.intent_mean(ma, torch.full((7,), k)) for k in range(K)])
+    d = d.detach()
+    assert float(d.abs().max()) > 1e-3
+    assert float((d[:, :1] - d[:, 1:]).abs().max()) > 1e-4                  # not one offset for every state
+    # the plan under z reads the trunk run it was drawn from (a1), not whatever ran last
+    a1 = b.trunk_a1.clone()
+    z = torch.tensor([0, 1, 2, 3, 0, 1, 2])
+    m1 = b.intent_mean(mb, z)
+    b(*_inputs(7, 9), h)                                                     # another trunk run
+    assert torch.allclose(b.intent_mean(None, z, a1=a1), m1)
+
+
+def test_the_policy_gradient_reaches_z_s_columns_and_not_through_pi_high(lim):
+    _, b = _trunk_pair(lim)
+    b.train()
+    sc, st = _inputs(6, 5)
+    mean, log_std, _ = b(sc, st, torch.zeros(6, 16))
+    z = torch.tensor([0, 1, 2, 3, 3, 0])
+    rl = torch.tensor([0, PS.N_STEP])
+    m = b.intent_mean(mean, z)
+    u = (m + 0.1).detach()
+    lp = tanh_logp(u[:, rl], m[:, rl], log_std[:, rl])
+    g_in, g_head = torch.autograd.grad(lp.sum(), [b.intent_in, b.intent_head.weight], allow_unused=True)
+    assert g_in is not None and float(g_in.abs().sum()) > 0
+    assert g_head is None or float(g_head.abs().sum()) == 0.0               # pi_low's log-prob does not move pi_high
+
+
+def test_load_and_copy_an_intent_trunk_actor(lim, monkeypatch):
+    _, b = _trunk_pair(lim)
+    with torch.no_grad():
+        b.intent_in.normal_()
+    ck = {"beams": BEAMS, "actor": b.state_dict(), "args": {"intent": SPEC, "memory": 16, "mem_front": True}}
+    c = load_actor2(ck, "cpu", check_mount=False)
+    assert c.intent_trunk and torch.equal(c.intent_in, b.intent_in)
+    old = {k: v for k, v in b.state_dict().items() if k != "intent_in"}
+    assert not load_actor2({"beams": BEAMS, "actor": old, "args": ck["args"]}, "cpu", check_mount=False).intent_trunk
+    # a copy is made after an update's epochs: the logits and the trunk's pre-activation are graph tensors then
+    b.train()
+    sc, st = _inputs(3, 1)
+    b.heads(b.mem_trunk(torch.cat([b.enc(sc), b.norm(st)], 1), torch.zeros(3, 16)))     # as the epochs run it
+    assert b.trunk_a1.grad_fn is not None and b.intent_logits_out.grad_fn is not None
+    monkeypatch.setattr(PR, "PlanObs2", _Obs)
+    so = PR.SelfOpponents(_env(), lim, 1.0, seed=3)
+    so.add(b, 100)
+    assert b.trunk_a1 is not None and so.model(100).intent_trunk
+
+
+def test_free_runs_the_z_free_plan(monkeypatch, lim):
+    a, b = _trunk_pair(lim)
+    with torch.no_grad():
+        b.intent_in.normal_(0.0, 0.5)
+    obs = _StubObs(5)
+    monkeypatch.setenv(IN.ENV_FIX, "free")
+    nom, _, _ = b(obs.scans, obs.state())
+    _, mean, _, _, _ = plan_v2(b, obs, lim)
+    assert torch.allclose(mean, nom, atol=1e-6) and bool((obs.intent_left == 0).all())
+    monkeypatch.setenv(IN.ENV_FIX, "2")
+    _, mean2, _, _, _ = plan_v2(b, obs, lim)
+    assert bool((obs.intent_z == 2).all()) and float((mean2 - mean).detach().abs().max()) > 1e-4
+
+
+def test_intent_trunk_refusals():
+    with pytest.raises(ValueError):
+        Actor2(BEAMS, memory=16, mem_front=False, intent=SPEC, intent_trunk=True)
+    with pytest.raises(SystemExit) as e:
+        PR.main(["--name", "x", "--intent", SPEC, "--memory", "16", "--check-args"])
+    assert "--mem-front" in str(e.value.code)
+    with pytest.raises(SystemExit) as e:
+        PR.main(["--name", "x", "--intent", SPEC, "--memory", "16", "--no-intent-trunk", "--check-args"])
+    assert e.value.code == 0
