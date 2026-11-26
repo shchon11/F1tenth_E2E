@@ -82,6 +82,16 @@ def is_plan_run(name):
         return False
 
 
+def run_alive(name, ps, mtime):
+    """(11-27) a run trains now when a local plan_rl has `--name NAME` anywhere in its command line (the RQ launchers put
+    --name last, so 'plan_rl --name NAME' never matched), or -- a run on the lab server ACE, its progress fetched every 10 min
+    by tools/ace_run.sh fetch -- when its progress.jsonl changed in the last 15 minutes"""
+    for l in ps.splitlines():
+        if "plan_rl" in l and "bash -c" not in l and f"--name {name} " in l + " ":
+            return True
+    return time.time() - mtime < 900
+
+
 def runs():
     out = []
     ps = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True).stdout
@@ -96,7 +106,7 @@ def runs():
         if not memo(("isplan", name), 3600, lambda: is_plan_run(name)):
             continue
         par, cut = parent(name)
-        out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name), "alive": f"plan_rl --name {name} " in ps,
+        out.append({"name": name, "mtime": os.path.getmtime(p), "map": run_map(name), "alive": run_alive(name, ps, os.path.getmtime(p)),
                     "parent": par, "cut": cut, "note": notes.get(name, ""), "ref": refs.get(name, "")})
     out.sort(key=lambda r: (not r["alive"], -r["mtime"]))       # the runs training now first
     return out
@@ -166,7 +176,9 @@ def status(name):
     except Exception:
         total = None
     ps = subprocess.run(["ps", "-eo", "pid,etimes,cmd"], capture_output=True, text=True).stdout.splitlines()
-    alive = [l for l in ps if f"plan_rl --name {name} " in l and "bash -c" not in l]
+    alive = [l for l in ps if "plan_rl" in l and f"--name {name} " in l + " " and "bash -c" not in l]
+    if not alive and time.time() - os.path.getmtime(f"{RUNS}/{name}/progress.jsonl") < 900:
+        alive = ["(ACE)"]                              # (11-27) trained on the lab server, progress fetched by ace_run.sh
     jobs = [re.sub(r".*/tools/", "", l)[:60] for l in ps if name in l and re.search(r"plan_validate|exam_record|train_video|lap_memory", l)
             and "timeout" not in l and "slot5060" not in l]
     st = {"run": name, "update": rows[-1]["update"] if rows else 0, "total": total, "alive": len(alive), "jobs": jobs,
