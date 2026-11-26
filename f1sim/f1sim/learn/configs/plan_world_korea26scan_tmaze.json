@@ -126,29 +126,35 @@
  "tmaze": {
   "L": [
    [
-    -0.643,
-    6.836,
-    2.7143,
+    0.4725,
+    0.2253,
+    3.0325,
     38
    ],
    [
-    -0.9798,
-    6.9893,
-    2.7143,
+    0.1047,
+    0.2656,
+    3.0325,
+    38
+   ],
+   [
+    -0.2631,
+    0.3059,
+    3.0325,
+    38
+   ],
+   [
+    -0.6309,
+    0.3462,
+    3.0325,
     38
    ]
   ],
   "R": [
    [
-    0.1396,
-    6.4796,
-    2.7143,
-    38
-   ],
-   [
-    -0.1971,
-    6.633,
-    2.7143,
+    0.9397,
+    0.1741,
+    3.0325,
     38
    ]
   ],
@@ -160,43 +166,41 @@
   "source": {
    "record": "exam3_scan31b2_u600_ideal_line3_n256.npz",
    "policy": "scan31b2/plan_u600.pt",
-   "rule": "tmaze_spot.py (opposite sides)",
-   "track_s_m": 15.4,
+   "rule": "tmaze_spot.py react (third design)",
+   "track_s_m": 8.8,
    "line_point": [
-    0.0805,
-    6.5066
+    -0.6159,
+    0.3446
    ],
    "left_normal": [
-    -0.9101,
-    0.4144
+    -0.9941,
+    0.1089
    ],
-   "line_box_first_sight_s": 0.561,
-   "speed_mps": 6.86,
-   "width_m": 1.9,
-   "line_to_left_wall_m": 1.5,
-   "line_to_right_wall_m": 0.4,
-   "L_gaps_m": [
+   "speed_mps": 7.48,
+   "width_m": 2.47,
+   "line_to_left_wall_m": 0.57,
+   "line_to_right_wall_m": 1.9,
+   "block_side": "L",
+   "block_boxes": 4,
+   "block_gaps_m": [
     0.15,
-    1.015
+    0.625
    ],
-   "R_gaps_m": [
-    1.01,
+   "shift_needed_m": 1.43,
+   "block_first_sight_s": 0.775,
+   "shift_reachable_m": 2.375,
+   "ratio": 0.602,
+   "a_lat": 7.9,
+   "other_side": "R",
+   "other_boxes": 1,
+   "other_gaps_m": [
+    1.685,
     0.15
    ],
-   "L_blocks_line": false,
-   "R_blocks_line": true,
-   "L_first_sight_s": 1.009,
-   "R_first_sight_s": 0.735,
-   "boxes_per_placement": 2,
-   "common_passage_m": 0.13,
-   "limits": {
-    "sight_max_s": 0.7,
-    "v_min": 4.5,
-    "w_min": 1.3,
-    "gap_narrow": 0.15,
-    "gap_wide": 0.6
-   }
+   "common_passage_m": 0.11,
+   "other_first_sight_s": 0.454,
+   "line_box_first_sight_s": 0.673
   }
  },
- "_note_tmaze": "11-26 racing T-maze (RQ3/4/6, docs/.../analysis/rq_plan_2026-11-26.md): one map, no variants; 2 real box(es) (0.36 x 0.30 m each, long side across) at a blind fast spot, L = against the left wall (0.15 m gap, the car cannot pass: forced right) or R = the mirror (forced left) or none, P = (0.4, 0.4, 0.2) per episode, never removed; the middle both leave free is narrower than the car (exclusive sides); tools/tmaze_spot.py from scan31b2 u600's exam3 record (line box first seen <= 0.7 s, speed >= 4.5 m/s, width >= 1.3 m); 32 s episodes (~4 laps), no opponents; train with --scene-replay 0"
+ "_note_tmaze": "11-26 racing T-maze, third design (RQ3/4/6; docs/.../analysis/rq_plan_2026-11-26.md): one map, no variants; at a blind spot leaving a slow hairpin (track 8.8 m, line point (-0.616, 0.345), 7.5 m/s there, width 2.47 m) the side the reference line hugs (L) is a row of 4 real boxes (0.36 x 0.30 m, long side across, 0.15 m from the left wall, 0.62 m passage on the right): the car must move 1.43 m right; the zero-delay bound after the first sight of any part (0.78 s on the line) is 2.38 m -- no spot on this map reaches the 1.5x target by that rule; scan31b2 u600 (no anticipation) hits L hard on 48 % of first approaches (28 % of those that saw nothing until 10 m before), 0 % later (survivors). R = 1 box against the right wall: the line passes; the two exclusive (common passage 0.11 m). None 0.2; P = (0.4, 0.4, 0.2) per episode, never removed; tools/tmaze_spot.py from scan31b2 u600's exam3 record; 32 s episodes, no opponents; train with --scene-replay 0"
 }

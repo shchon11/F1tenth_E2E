@@ -22,8 +22,35 @@ TAUS = np.round(np.arange(0.0, 2.0001, 0.1), 2)
 # [m] before the box's along-track place: the control for the time alignment -- L and R are first seen at different times
 # (another place on the track for the same tau, in a braking zone a speed difference that is not memory); both boxes sit at
 # the same along-track place, so the same D is the same place for both
-DISTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0)
-H_DISTS = (6.0, 10.0)        # [m] before the box: I(h; b) read at the same place (the control for the time-aligned one)
+DISTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0)
+# [m] before the box: I(h; b) read at the same place (the control for the time-aligned one). A read is clean only before ANY
+# part of the placement could be seen on this approach (`glimpse`): its first pass reads ~0 bit
+H_DISTS = (6.0, 10.0, 14.0, 18.0)
+GLIMPSE_M = 20.0             # [m] how far back along the approach the first glimpse of any part of the boxes is looked for
+
+
+def seen_any(R, tk, sp, syaw, pts):
+    """any of `pts` (k, 2) -- points on the boxes' outlines -- in direct view from a scanner at sp heading syaw (the exam's sight
+    rule: field of view, range, no wall cell up to 0.05 m short of the point)"""
+    d = pts - sp[None]; dist = np.linalg.norm(d, axis=1)
+    a = (np.arctan2(d[:, 1], d[:, 0]) - syaw + np.pi) % (2 * np.pi) - np.pi
+    m = (dist <= RMAX) & (np.abs(a) <= FOV)
+    if not m.any():
+        return False
+    d, dist = d[m], dist[m]
+    f = np.linspace(0.0, 1.0, 100)[None, :] * (np.maximum(dist - 0.05, 0.0) / np.maximum(dist, 1e-6))[:, None]
+    seg = sp[None, None, :] + f[..., None] * d[:, None, :]
+    return bool((R.wall_dist(tk, seg.reshape(-1, 2)).reshape(seg.shape[:2]) > 0.0).all(1).any())
+
+
+def outline_pts(polys, step=0.1):
+    out = []
+    for q in polys:
+        ring = np.concatenate([q, q[:1]])
+        for a, b in zip(ring[:-1], ring[1:]):
+            m = max(1, int(np.ceil(np.linalg.norm(b - a) / step)))
+            out += [a + (b - a) * i / m for i in range(m)]
+    return np.array(out)
 FOV, RMAX = np.radians(135.0), 10.0
 BIN = 0.1                    # [m] the reference line's along-track bins
 NAME_B = ("L", "R", "없음")
@@ -237,9 +264,28 @@ def one(fn):
                 dv[q] = V[j, i] + f_ * (V[j + 1, i] - V[j, i])
                 dj[q] = j
             h = mem[k_s - 10, i].astype(np.float32) if (mem is not None and k_s - 10 >= 0 and k_s - 10 >= R.k0[min(t, T - 1), i]) else None
+            # the first glimpse of any part of the boxes on this approach (from the last pass, at most GLIMPSE_M back): how far
+            # before the box's along-track place [m]; 0 = never in view before the pass
+            glimpse = np.nan
+            if b[i] < 2:
+                pts = outline_pts(R.boxes(t, i))
+                t_prev = max([r_["t"] for r_ in rows if r_["sess"] == i] + [int(R.k0[min(t, T - 1), i])])
+                ks = [k_ for k_ in range(t_prev + 1, t + 1) if prog[k_, i] >= tgt - GLIMPSE_M]
+                glimpse = 0.0
+                for k_ in ks:
+                    if seen_any(R, tk, xy[k_, i] + mount * np.array([np.cos(yaw[k_, i]), np.sin(yaw[k_, i])]), yaw[k_, i], pts):
+                        glimpse = float(tgt - prog[k_, i]); break
+            # (first pass) the first decision of the episode at which any part of the boxes was in view -- the scanner covers 270
+            # deg, so a car that started past the box saw it behind it: its 'first pass' is not a first look
+            k_seen = 10 ** 9
+            if b[i] < 2 and npass == 1:
+                pts = outline_pts(R.boxes(t, i))
+                for k_ in range(int(R.k0[min(t, T - 1), i]), t + 1):
+                    if seen_any(R, tk, xy[k_, i] + mount * np.array([np.cos(yaw[k_, i]), np.sin(yaw[k_, i])]), yaw[k_, i], pts):
+                        k_seen = k_; break
             hD = {D_: (mem[int(dj[DISTS.index(D_)]), i].astype(np.float32) if (mem is not None and dj[DISTS.index(D_)] >= 0) else None)
                   for D_ in H_DISTS}
-            rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any, hD=hD,
+            rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any, hD=hD, glimpse=glimpse, k_seen=k_seen, dj=dj,
                              off=off_c, v=v_c, offp=offp, doff=doff, dv=dv, h=h))
     # attempts at the box: every pass, and every hard box hit not followed by a pass within 1 s (the car stopped at the box); the
     # attempt's number = passes before it + 1
@@ -285,6 +331,12 @@ def main():
             se = [np.median([r["see"] for r in rows if r["b"] == k and f(r)]) if any(r["b"] == k and f(r) for r in rows) else np.nan
                   for f in (P1, P2)]
             print(f"{NAME_B[k]:<6}{cell[0]:>18}{cell[1]:>18}{se[0]:>12.2f} / {se[1]:.2f} s")
+        # the first attempt where the car had seen nothing of the boxes until 10 m before them (a first look: reaction only)
+        cl = {r["sess"]: bool(r["dj"][DISTS.index(10.0)] < r["k_seen"]) for r in rows if r["n"] == 1 and r["b"] < 2}
+        for k in range(2):
+            for lab, want in (("10 m 앞까지 안 보고 온 첫 번", True), ("그 전에 본 첫 번 (상자를 지나 출발 등)", False)):
+                x = [v_ for (i_, n_), v_ in g["att"].items() if g["b"][i_] == k and n_ == 1 and cl.get(i_, False) == want]
+                print(f"  {NAME_B[k]} {lab}: 세게 닿음 {100 * np.mean(x):5.1f} % ({len(x)})" if x else f"  {NAME_B[k]} {lab}: -")
         print("\n처음 보이기 tau s 전: 옆 위치(빈 트랙 길에서, 왼쪽 +) 평균 [m] b별, A_exec = |L-R|, d = A/sigma; 속도 A_v, d_v; plan A_plan, d_plan")
         for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
             print(f"  {lab}")
@@ -326,9 +378,20 @@ def main():
             m2 = y < 2
             i2, n2 = info_bits(H[m2], y[m2], ss[m2]) if m2.sum() >= 12 else (np.nan, 0)
             print(f"  {lab}: L/R/없음 {i3:+.3f} bit (최대 {np.log2(3):.2f}, 시험 {n3}) | L/R {i2:+.3f} bit (최대 1, 시험 {n2})")
-        print("I(h; b) [bit], 같은 자리 기억 (상자의 트랙 따라 자리 D m 앞 -- 시간 맞춤은 b마다 다른 자리를 읽어 '어디인지'가 섞임)")
+        print(f"상자 어느 부분이든 처음 보인 자리 (통과 앞 m, 지난 통과 뒤 {GLIMPSE_M:g} m 안; 그보다 앞에서 읽어야 1번째 통과가 ~0 bit):")
+        for k in range(2):
+            for lab, f in (("1번째", P1), ("2번째 이후", P2)):
+                g_ = np.array([r["glimpse"] for r in rows if r["b"] == k and f(r)], float)
+                if g_.size:
+                    print(f"  {NAME_B[k]} {lab}: 중앙 {np.median(g_):.1f} m, 90 % {np.percentile(g_, 90):.1f} m, 최대 {g_.max():.1f} m ({g_.size}번)")
+        print("I(h; b) [bit], 같은 자리 기억 (상자의 트랙 따라 자리 D m 앞 -- 시간 맞춤은 b마다 다른 자리를 읽어 '어디인지'가 섞임; 1번째 통과는 "
+              "에피소드 시작부터 그 자리까지 상자 어느 부분도 안 보인 것만 -- 뒤로도 보는 270도 스캐너라 상자를 지나서 출발한 차는 이미 봄)")
+        for k in range(2):
+            n1 = [r for r in rows if r["b"] == k and r["n"] == 1]
+            print(f"  {NAME_B[k]} 1번째 통과 {len(n1)}번 가운데 10 m 앞까지 안 보임 {sum(r['dj'][DISTS.index(10.0)] < r['k_seen'] for r in n1)}번")
+        P1c = lambda r: r["n"] == 1 and (r["b"] == 2 or r["dj"][DISTS.index(D_)] < r["k_seen"])
         for D_ in H_DISTS:
-            for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
+            for lab, f in (("1번째 통과, 그때까지 안 보임", P1c), ("2번째 이후", P2)):
                 rr = [r for r in rows if f(r) and r["hD"][D_] is not None]
                 if len(rr) < 12:
                     print(f"  {D_:g} m 앞 {lab}: 통과 {len(rr)}번 -- 너무 적음"); continue
