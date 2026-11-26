@@ -4,6 +4,8 @@
     이 policy의 빈 트랙 길에서)와 속도, b별 -> A_exec(tau) = |E[옆|L] - E[옆|R]|, A_v(tau), 효과 크기 d = A / sigma_pooled,
     1번째 통과와 2번째 이후 따로
   - A_plan(tau): 그 결정의 plan이 상자의 트랙 따라 자리까지 닿을 때, 그 자리에서 plan의 옆 위치(같은 빈 트랙 길 기준)
+  - 대조: 같은 자리(상자의 트랙 따라 자리 D m 앞)에서 옆 위치·속도 -- L과 R은 처음 보이는 때가 달라(같은 tau = 다른 자리) 시간 맞춤만으로는
+    기억이 아닌 차이(제동 구간의 속도 차)가 d에 섞임
   - I(h; b) [bit]: 처음 보이기 1 s 전 기억 h(_mem.npz의 mem, 그 결정 뒤 상태)에 로지스틱 read-out, 세션 절반으로 배우고 나머지 절반으로 잼
     (H(b) - 교차 엔트로피, 변분 하한). 1번째 / 2번째 이후, 세 갈래(L/R/없음)와 두 갈래(L/R)
 처음 보임 = 상자 중심이 스캔에 직접 보이기 시작한 때 (exam_boxes.py와 같은 규칙: 시야각 135도, 10 m, 벽에 안 가림). 상자 없는 세션은 L·R
@@ -16,6 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rec_lib import Rec, along_track
 
 TAUS = np.round(np.arange(0.0, 2.0001, 0.1), 2)
+# [m] before the box's along-track place: the control for the time alignment -- L and R are first seen at different times
+# (another place on the track for the same tau, in a braking zone a speed difference that is not memory); both boxes sit at
+# the same along-track place, so the same D is the same place for both
+DISTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0)
 FOV, RMAX = np.radians(135.0), 10.0
 BIN = 0.1                    # [m] the reference line's along-track bins
 NAME_B = ("L", "R", "없음")
@@ -74,11 +80,36 @@ def d_pooled(a, b):
     return A, A / sp if sp > 0 else np.nan
 
 
+def _logreg(X, y, C, iters=200):
+    """multinomial logistic regression with an L2 weight 1 / (C n) on the weights (sklearn's convention), L-BFGS (torch, CPU)
+    -> a function giving class probabilities (classes 0..K-1 of np.unique(y))"""
+    import torch
+    cls = np.unique(y); K = len(cls)
+    yi = torch.as_tensor(np.searchsorted(cls, y)); Xt = torch.as_tensor(X, dtype=torch.float64)
+    W = torch.zeros(X.shape[1], K, dtype=torch.float64, requires_grad=True)
+    b0 = torch.zeros(K, dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.LBFGS([W, b0], lr=1.0, max_iter=iters, line_search_fn="strong_wolfe")
+    n = X.shape[0]
+
+    def closure():
+        opt.zero_grad()
+        loss = torch.nn.functional.cross_entropy(Xt @ W + b0, yi) + 0.5 * (W ** 2).sum() / (C * n)
+        loss.backward()
+        return loss
+    opt.step(closure)
+    Wd, bd = W.detach(), b0.detach()
+    return cls, (lambda Z: torch.softmax(torch.as_tensor(Z, dtype=torch.float64) @ Wd + bd, 1).numpy())
+
+
+def _ce_bits(fit, Z, y):
+    cls, f = fit
+    p = f(Z)
+    return -np.mean(np.log2(np.clip(p[np.arange(len(y)), np.searchsorted(cls, y)], 1e-9, 1.0)))
+
+
 def info_bits(H, y, sess, seed=0):
     """I(h; y) lower bound [bit]: a logistic read-out trained on half the sessions (stratified by class), H(y) - held-out
     cross-entropy on the other half; the L2 weight chosen by 2-fold CV inside the training half"""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
     rng = np.random.default_rng(seed)
     us = np.unique(sess)
     cls_of = {s_: y[sess == s_][0] for s_ in us}
@@ -89,8 +120,8 @@ def info_bits(H, y, sess, seed=0):
     m_tr = np.array([s_ in tr for s_ in sess]); m_te = ~m_tr
     if len(np.unique(y[m_tr])) < len(np.unique(y)) or m_te.sum() < 4:
         return np.nan, 0
-    sc = StandardScaler().fit(H[m_tr])
-    Xtr, Xte = sc.transform(H[m_tr]), sc.transform(H[m_te])
+    mu, sd = H[m_tr].mean(0), H[m_tr].std(0) + 1e-6
+    Xtr, Xte = (H[m_tr] - mu) / sd, (H[m_te] - mu) / sd
     best, bc = np.inf, 1.0
     s_tr = sess[m_tr]; u_tr = np.unique(s_tr); rng.shuffle(u_tr)
     fold = np.isin(s_tr, u_tr[: len(u_tr) // 2])
@@ -99,16 +130,10 @@ def info_bits(H, y, sess, seed=0):
         for f in (fold, ~fold):
             if len(np.unique(y[m_tr][~f])) < len(np.unique(y)) or f.sum() == 0:
                 ce = np.inf; break
-            lr = LogisticRegression(C=C, max_iter=2000).fit(Xtr[~f], y[m_tr][~f])
-            p = lr.predict_proba(Xtr[f])
-            col = {c: i for i, c in enumerate(lr.classes_)}
-            ce += -np.mean(np.log2(np.clip(p[np.arange(f.sum()), [col[c] for c in y[m_tr][f]]], 1e-9, 1.0)))
+            ce += _ce_bits(_logreg(Xtr[~f], y[m_tr][~f], C), Xtr[f], y[m_tr][f])
         if ce < best:
             best, bc = ce, C
-    lr = LogisticRegression(C=bc, max_iter=2000).fit(Xtr, y[m_tr])
-    p = lr.predict_proba(Xte)
-    col = {c: i for i, c in enumerate(lr.classes_)}
-    ce = -np.mean(np.log2(np.clip(p[np.arange(m_te.sum()), [col[c] for c in y[m_te]]], 1e-9, 1.0)))
+    ce = _ce_bits(_logreg(Xtr, y[m_tr], bc), Xte, y[m_te])
     pri = np.array([np.mean(y[m_te] == c) for c in np.unique(y[m_te])])
     Hy = -(pri * np.log2(pri)).sum()
     return Hy - ce, int(m_te.sum())
@@ -194,9 +219,22 @@ def one(fn):
                 if len(j):
                     j = j[0]; f_ = -rel[j] / max(rel[j + 1] - rel[j], 1e-9)
                     offp[q] = op[j] + f_ * (op[j + 1] - op[j])
+            # the same place: the car where its along-track progress is D m short of the box's (the last crossing before the pass)
+            tgt = s_b + nmax[t + 1] * L
+            k_lo = max(int(R.k0[min(t, T - 1), i]), t - 80)
+            doff = np.full(len(DISTS), np.nan); dv = np.full(len(DISTS), np.nan)
+            for q, D_ in enumerate(DISTS):
+                v_ = tgt - D_
+                js = [j for j in range(t, k_lo - 1, -1) if prog[j, i] <= v_ < prog[j + 1, i]]
+                if not js:
+                    continue
+                j = js[0]; f_ = (v_ - prog[j, i]) / max(prog[j + 1, i] - prog[j, i], 1e-9)
+                pq = xy[j, i] + f_ * (xy[j + 1, i] - xy[j, i])
+                doff[q] = project(P, pq[None], np.array([v_ % L]), L)[1][0]
+                dv[q] = V[j, i] + f_ * (V[j + 1, i] - V[j, i])
             h = mem[k_s - 10, i].astype(np.float32) if (mem is not None and k_s - 10 >= 0 and k_s - 10 >= R.k0[min(t, T - 1), i]) else None
             rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any,
-                             off=off_c, v=v_c, offp=offp, h=h))
+                             off=off_c, v=v_c, offp=offp, doff=doff, dv=dv, h=h))
     return R, rows, dict(L=L, sb=sb, P=P)
 
 
@@ -242,6 +280,18 @@ def main():
                 mn = lambda a: np.nanmean(a) if np.isfinite(a).any() else np.nan
                 print(f"  {tau:5.1f}{mn(oL):+8.3f}{mn(oR):+8.3f}{mn(oN):+8.3f}{A:8.3f}{d:7.2f}{mn(vL):7.2f}{mn(vR):7.2f}{Av:7.2f}{dv:7.2f}"
                       f"{Ap:8.3f}{dp:8.2f}{npl:8d}")
+        print("\n대조: 같은 자리 -- 상자의 트랙 따라 자리 D m 앞 (L·R 같은 자리라 시간 맞춤의 차이가 없음)")
+        for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
+            print(f"  {lab}")
+            print(f"  {'D m':>5}{'옆 L':>8}{'옆 R':>8}{'옆 없음':>8}{'A_exec':>8}{'d':>7}{'v L':>7}{'v R':>7}{'A_v':>7}{'d_v':>7}")
+            for q, D_ in enumerate(DISTS):
+                g_ = lambda k, key: np.array([r[key][q] for r in rows if r["b"] == k and f(r)], float)
+                oL, oR, oN = g_(0, "doff"), g_(1, "doff"), g_(2, "doff")
+                A, d = d_pooled(oL, oR)
+                vL, vR = g_(0, "dv"), g_(1, "dv")
+                Av, dv = d_pooled(vL, vR)
+                mn = lambda a: np.nanmean(a) if np.isfinite(a).any() else np.nan
+                print(f"  {D_:5.1f}{mn(oL):+8.3f}{mn(oR):+8.3f}{mn(oN):+8.3f}{A:8.3f}{d:7.2f}{mn(vL):7.2f}{mn(vR):7.2f}{Av:7.2f}{dv:7.2f}")
         print("\nI(h; b) [bit], 처음 보이기 1 s 전 기억 (세션 절반 학습 / 절반 시험, 시험 통과 수)")
         if not any(r["h"] is not None for r in rows):
             print("  기억 기록(_mem.npz) 없음")

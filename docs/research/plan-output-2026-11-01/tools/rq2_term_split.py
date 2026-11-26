@@ -39,7 +39,8 @@ for k, v in A.items():
     else:
         argv += [opt, str(v)]
 name = f"rq2_{os.path.basename(run.rstrip('/'))}_u{upd}"
-runs = os.path.join(os.path.dirname(out), ".rq2_runs")
+import tempfile
+runs = tempfile.mkdtemp(prefix="rq2_runs_")                         # the run folder holds only its args and an empty log
 argv += ["--name", name, "--runs", runs, "--init", ck, "--init-critic", "--update-offset", str(upd), "--envs", str(envs),
          "--horizon", str(hor), "--horizon-auto", "1", "--minibatches", str(mb), "--term-split", out,
          "--term-split-warm", str(warm), "--term-split-steps", str(steps)]
@@ -47,5 +48,5 @@ print(f"[rq2] {ck}: 차 {envs}대 x {hor}결정, minibatch {mb}개, warm-up {war
 print("[rq2] python -m f1sim.learn.plan_rl " + " ".join(argv), flush=True)
 r = subprocess.run([sys.executable, "-m", "f1sim.learn.plan_rl"] + argv, cwd=SRC)
 import shutil
-shutil.rmtree(os.path.join(runs, name), ignore_errors=True)        # the run folder holds only its args and an empty log
+shutil.rmtree(runs, ignore_errors=True)
 sys.exit(r.returncode)
