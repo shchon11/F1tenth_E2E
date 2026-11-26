@@ -232,6 +232,8 @@ def _reward(fault_only, ahead_gap):
     pr.phi = torch.zeros(2); pr.cost = torch.zeros(2); pr.seen_t = torch.zeros(2); pr.n_contacts = torch.zeros(2, 3)
     pr.stall_s = 0.0; pr.contact_scale = 0.82; pr.car_fault_only = fault_only; pr.car_charged = torch.zeros(2)
     pr.cost_kind = torch.zeros(2, 4)                    # (11-25) contacts by kind (wall, box, car, stall), --plan-car-cost's live tap
+    pr.ww_on, pr.ww_k = False, 0.0                     # (11-25) --wrong-way-cost off
+    pr.ww_since = torch.full((2,), 1e9)                # (11-26) seconds since a car contact (--wrong-way-cost's car-push waiver)
     return pr
 
 
