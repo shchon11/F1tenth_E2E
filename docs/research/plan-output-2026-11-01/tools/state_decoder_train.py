@@ -24,8 +24,9 @@ policy는 얼린 채(기록된 값만 읽음), 디코더만 배움 -- 디버깅 
 출력: <out>_dec.npz (디코더 셋; 콘솔은 torch로, 사이트는 numpy로 돌림), <out>_decin.npz (시험 세션의 feat·mem, 사이트 재생용),
 <out>_decode.txt (지표).
 --ckpt-copy 경로: 같은 디코더 파일을 checkpoint 옆(plan_uN_dec.npz, 콘솔이 찾는 자리)에도 씀.
-대조(기록에 F1SIM_EXAM_SAVE_SCAN의 <기록>_scan.npz가 있거나 --scan 경로): 같은 디코더를 policy가 읽는 가장 새 스캔 그대로에 학습해 같은 표에
-한 줄 더 -- 스캔 안에 있는 것을 이 크기의 디코더가 얼마나 꺼내는지 (policy 안쪽 값이 그보다 못하면 인코더가 버린 것). 저장은 안 함.
+대조(기록에 F1SIM_EXAM_SAVE_SCAN의 <기록>_scan.npz가 있거나 --scan 경로): policy가 읽는 가장 새 스캔 하나에 policy와 같은 모양의 스캔
+인코더(ScanCtl)를 새로 붙여 같은 정답으로 학습해 같은 표에 한 줄 더 -- 그 크기의 인코더가 지금 스캔에서 꺼낼 수 있는 것 (feat가 그보다
+못하면 policy 인코더가 버린 것). 저장은 안 함.
 인자: 기록npz [--out 앞머리] [--epochs 60] [--device auto|cpu|cuda] [--ckpt-copy 경로] [--scan 경로]"""
 import argparse
 import json
@@ -51,6 +52,24 @@ LF, LR = 0.15875, 0.17145
 WB = LF + LR
 FOV, RMAX = math.radians(135.0), 10.0
 SCAN = "(대조) 원시 스캔"
+
+
+class ScanCtl(nn.Module):
+    """the control's own scan encoder: the policy's ScanEncoder shape (plan_policy.py, one scan as the channel), trained from
+    scratch with the towers for the decoding targets -- what an encoder of the policy's size can get out of the newest scan
+    (11-26: a plain MLP on the 1081 raw beams generalised so badly -- pose 2.2 m -- that it said nothing about the scan)"""
+
+    def __init__(self, beams, hidden):
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv1d(1, 32, 7, stride=3, padding=3), nn.ReLU(), nn.Conv1d(32, 64, 5, stride=3, padding=2), nn.ReLU(),
+                                  nn.Conv1d(64, 64, 5, stride=3, padding=2), nn.ReLU(), nn.Conv1d(64, 64, 3, stride=2, padding=1), nn.ReLU())
+        with torch.no_grad():
+            n = self.conv(torch.zeros(1, 1, beams)).numel()
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(n, 256), nn.ReLU())
+        self.dec = SD.DecoderNet(256, hidden)
+
+    def forward(self, x):
+        return self.dec(self.fc(self.conv(x[:, None, :])))
 
 
 def parse():
@@ -315,7 +334,7 @@ def main():
         mu = Xn[tr_i].astype(np.float32).mean(0); sd = Xn[tr_i].astype(np.float32).std(0) + 1e-4
         Xg = torch.as_tensor(Xn, device=dev)                                         # float16 on the device
         mu_g, sd_g = torch.as_tensor(mu, device=dev), torch.as_tensor(sd, device=dev)
-        net = SD.DecoderNet(Xn.shape[1], a.hidden).to(dev)
+        net = (ScanCtl(Xn.shape[1], a.hidden) if which == SCAN else SD.DecoderNet(Xn.shape[1], a.hidden)).to(dev)
         opt = torch.optim.Adam(net.parameters(), 1e-3, weight_decay=1e-4)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
         tr_g = torch.as_tensor(tr_i, device=dev); va_g = torch.as_tensor(va_i, device=dev)
@@ -563,8 +582,8 @@ def main():
     for r in box_near:
         W(r)
     if SCAN in SETS:
-        W(f"{SCAN} = 같은 디코더를 policy가 읽는 가장 새 스캔 그대로에 학습한 대조 (policy 안쪽 값이 아님; 저장 안 함): 스캔 안에 있는 것을 이 "
-          "크기의 디코더가 얼마나 꺼내는지.")
+        W(f"{SCAN} = policy가 읽는 가장 새 스캔 하나에 policy와 같은 모양의 스캔 인코더를 새로 붙여 디코더와 함께 이 정답들로 학습한 대조 "
+          "(policy 안쪽 값이 아님; 저장 안 함): 그 크기의 인코더가 지금 스캔에서 꺼낼 수 있는 것. feat가 이보다 못하면 policy 인코더가 버린 것.")
     W("상자 찾음 = 그 상자가 걸친 칸 중 하나라도 디코더 확률 > 0.5. (b)는 기억이 지나온 상자를 들고 있는지, (c)·(d)는 0이어야 함 "
       "(아니면 배치를 외웠거나 샘). 정밀도 = 0.5 넘는 덩어리 중 참 상자(한 칸 둘레)에 걸친 것. 보임 = 상자 중심이 시야각·10 m 안, 벽에 안 가림.")
     W("")
