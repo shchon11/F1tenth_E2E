@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>디코더 재생</title>
+<style>
+  /* (11-26, the user: "그 정보들이 네트워크에 있는지 디버깅용 디코더 ... 시각화도 가능하게. 사이트나 콘솔에서도") the exam replay of a
+     checkpoint's state decoders (tools/state_decoder_train.py, dec_replay.py): what the policy's features / memory hold, drawn
+     over the truth. Colour by entity as /live: our car blue, the other car magenta, boxes amber; what the decoder says in the
+     decoder's own aqua (walls, our pose) or dashed in the entity's colour (boxes as heat, the other car as an outline). The
+     user wants minimal text on the site: no legends, no help lines. */
+  :root {
+    color-scheme: light;
+    --page: #f3f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --line: #e1e0d9;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --lane: #fbfaf8; --wall: #e4e3dc; --band: #f3efe9;
+    --ego: #2a78d6; --opp: #cf4a86; --box: #c98500; --dec: #1baf7a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0f12; --surface: #15181d; --surface-2: #1b1f25; --line: #2a2f37;
+      --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+      --lane: #20242b; --wall: #121418; --band: #23262c;
+      --ego: #3987e5; --opp: #d55181; --box: #c98500; --dec: #22c58a;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0f12; --surface: #15181d; --surface-2: #1b1f25; --line: #2a2f37;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --lane: #20242b; --wall: #121418; --band: #23262c;
+    --ego: #3987e5; --opp: #d55181; --box: #c98500; --dec: #22c58a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+  body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
+  header { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+  header .title { font-size: 15px; font-weight: 600; margin-right: 4px; }
+  select, button { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; font: inherit; }
+  button { cursor: pointer; color: var(--ink-2); }
+  button.on { color: var(--ink); border-color: var(--dec); }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; }
+  .seg button.on { position: relative; z-index: 1; }
+  main { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px 14px 12px; }
+  .mapwrap { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+  #map { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  .hud { position: absolute; left: 14px; top: 12px; pointer-events: none; font-variant-numeric: tabular-nums; line-height: 1.25; }
+  .hud .row { display: flex; align-items: baseline; gap: 10px; }
+  .hud .big { font-size: 28px; font-weight: 600; min-width: 3.2em; text-align: right; }
+  .hud .d { color: var(--dec); }
+  .hud .t { color: var(--ink-2); font-size: 20px; min-width: 3.2em; text-align: right; }
+  .hud .u { color: var(--muted); font-size: 12px; }
+  .bar { flex: none; display: flex; align-items: center; gap: 10px; }
+  #slider { flex: 1; accent-color: var(--dec); }
+  #tlab { min-width: 4.5em; text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+  @media (max-width: 700px) { header { padding: 8px 12px; } main { padding: 8px 10px; } .hud .big { font-size: 22px; } .hud .t { font-size: 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">디코더</span>
+  <select id="run" aria-label="학습"></select>
+  <select id="ck" aria-label="checkpoint"></select>
+  <select id="ses" aria-label="세션"></select>
+  <span class="seg" id="sets"></span>
+</header>
+<main>
+  <section class="mapwrap">
+    <canvas id="map"></canvas>
+    <div class="hud" id="hud" hidden>
+      <div class="row"><span class="big d" id="h_v">-</span><span class="t" id="h_vt">-</span><span class="u">m/s</span></div>
+      <div class="row"><span class="big d" id="h_r">-</span><span class="t" id="h_rt">-</span><span class="u">°/s</span></div>
+    </div>
+    <div class="empty" id="empty">-</div>
+  </section>
+  <div class="bar">
+    <button id="play" aria-label="재생">▶</button>
+    <button id="speed" aria-label="빠르기">1x</button>
+    <input type="range" id="slider" min="0" max="0" step="1" value="0" aria-label="시간">
+    <span id="tlab">-</span>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const C = {};
+const TOKENS = ["page", "surface", "line", "ink", "ink-2", "muted", "lane", "wall", "band", "ego", "opp", "box", "dec"];
+function readTokens() { const cs = getComputedStyle(document.documentElement); for (const k of TOKENS) C[k] = cs.getPropertyValue("--" + k).trim(); }
+readTokens();
+const hex = (h) => { const n = parseInt(h.replace("#", ""), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const Q = new URLSearchParams(location.search);
+const ST = { list: [], meta: null, ses: null, set: Q.get("set") || "feat+mem", t: +(Q.get("t") || 0), play: false, speed: 1,
+             wall: null, box: null, track: null, span: 22, ox: 0, oy: 0 };
+const SPEEDS = [1, 2, 4, 0.5];
+
+function fit(c) {
+  const w = Math.max(1, c.clientWidth), h = Math.max(1, c.clientHeight), r = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * r) || c.height !== Math.round(h * r)) { c.width = Math.round(w * r); c.height = Math.round(h * r); }
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0);
+  return { g, W: w, H: h };
+}
+function setUrl() {
+  const q = new URLSearchParams({ rec: $("ck").value || "", s: $("ses").value || "", set: ST.set, t: String(Math.round(ST.t)) });
+  history.replaceState(null, "", "?" + q.toString());
+}
+async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if (!r.ok) throw new Error((await r.json()).error || r.status); return r.json(); }
+
+// ---------------------------------------------------------------- pickers
+async function loadList() {
+  ST.list = await getJSON("/api/dec_list");
+  const runs = [...new Set(ST.list.map((r) => r.run))];
+  $("run").innerHTML = runs.map((r) => `<option>${r}</option>`).join("");
+  const want = ST.list.find((r) => r.rec === Q.get("rec"));
+  $("run").value = want ? want.run : runs[0] || "";
+  fillCk(want ? want.rec : null);
+  if (!ST.list.length) { $("empty").textContent = "-"; return; }
+  await loadMeta(Q.get("s"));
+}
+function fillCk(rec) {
+  const rows = ST.list.filter((r) => r.run === $("run").value);
+  $("ck").innerHTML = rows.map((r) => `<option value="${r.rec}">u${r.u} · ${r.exam}</option>`).join("");
+  if (rec && rows.some((r) => r.rec === rec)) $("ck").value = rec;
+}
+$("run").onchange = () => { fillCk(null); loadMeta(null); };
+$("ck").onchange = () => loadMeta($("ses").value);
+$("ses").onchange = () => loadSession();
+function fillSets() {
+  const sets = (ST.meta && ST.meta.sets) || ["feat", "mem", "feat+mem"];
+  if (!sets.includes(ST.set)) ST.set = sets[sets.length - 1];
+  $("sets").innerHTML = sets.map((s) => `<button data-s="${s}" class="${s === ST.set ? "on" : ""}">${s}</button>`).join("");
+  for (const b of $("sets").children) b.onclick = () => { ST.set = b.dataset.s; fillSets(); loadSession(); };
+}
+
+async function loadMeta(keepSes) {
+  const rec = $("ck").value; if (!rec) return;
+  $("empty").hidden = false; $("empty").textContent = "…";
+  ST.meta = await getJSON(`/api/dec_meta?rec=${encodeURIComponent(rec)}`);
+  const m = ST.meta;
+  $("ses").innerHTML = m.sessions.map((r) => `<option value="${r.s}">${r.s}${r.box ? " · 상자" : ""}${r.opp ? " · 상대" + (r.pace ? " " + r.pace.toFixed(2) + "x" : "") : ""}</option>`).join("");
+  if (keepSes != null && m.sessions.some((r) => String(r.s) === String(keepSes))) $("ses").value = String(keepSes);
+  // the track: lane / band / wall in quiet greys (the true walls stay faint under the decoder's heat)
+  const t = m.track, im = new Image();
+  await new Promise((ok, bad) => { im.onload = ok; im.onerror = bad; im.src = t.png; });
+  const cv = document.createElement("canvas"); cv.width = t.W; cv.height = t.H;
+  const g = cv.getContext("2d"); g.drawImage(im, 0, 0);
+  const d = g.getImageData(0, 0, t.W, t.H); t.mask = new Uint8Array(t.W * t.H);
+  for (let i = 0, j = 0; i < d.data.length; i += 4, j++) { const v = d.data[i]; t.mask[j] = v > 200 ? 0 : v > 110 ? 1 : 2; }
+  t.img = cv; tint(t); ST.track = t;
+  fillSets();
+  await loadSession();
+}
+function tint(t) {
+  const g = t.img.getContext("2d"), d = g.createImageData(t.W, t.H), cols = [hex(C.lane), hex(C.band), hex(C.wall)];
+  for (let i = 0, j = 0; j < t.mask.length; i += 4, j++) { const c = cols[t.mask[j]]; d.data[i] = c[0]; d.data[i + 1] = c[1]; d.data[i + 2] = c[2]; d.data[i + 3] = 255; }
+  g.putImageData(d, 0, 0);
+}
+const b64u8 = (s) => { const b = atob(s), a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+
+async function loadSession() {
+  const rec = $("ck").value, s = $("ses").value; if (!rec || s === "") return;
+  $("empty").hidden = false; $("empty").textContent = "…";
+  const r = await getJSON(`/api/dec_session?rec=${encodeURIComponent(rec)}&s=${encodeURIComponent(s)}&set=${encodeURIComponent(ST.set)}`);
+  ST.ses = r; ST.wall = b64u8(r.wall); ST.box = b64u8(r.box);
+  const [x0, x1, y0, y1, res, nx, ny] = r.grid; ST.grid = { x0, x1, y0, y1, res, nx, ny };
+  ST.off = { wall: mkOff(nx, ny), box: mkOff(nx, ny) };
+  $("slider").max = String(r.T - 1);
+  ST.t = Math.min(Math.max(0, ST.t), r.T - 1); $("slider").value = String(Math.round(ST.t));
+  $("empty").hidden = true; $("hud").hidden = false;
+  draw();
+}
+function mkOff(nx, ny) { const c = document.createElement("canvas"); c.width = nx; c.height = ny; return c; }
+
+// ---------------------------------------------------------------- the decoder's grid as an image: column = cell along x (ahead),
+// row = cell along y from the left edge (row 0 = +y): drawn in the car's frame, rotated with the car
+// `edge`: a light wash over the decoded wall mass and its rim (a cell over 0.5 next to one under) strong, so the true walls
+// underneath stay readable
+function paintGrid(off, data, t, col, gain, edge) {
+  const { nx, ny } = ST.grid, g = off.getContext("2d"), im = g.createImageData(nx, ny), c = hex(col), base = t * nx * ny;
+  const at = (ix, iy) => (ix < 0 || iy < 0 || ix >= nx || iy >= ny ? 255 : data[base + ix * ny + iy]);
+  for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) {
+    const p = data[base + ix * ny + iy], k = ((ny - 1 - iy) * nx + ix) * 4;
+    let a = p * gain;
+    if (edge && p > 127 && (at(ix - 1, iy) <= 127 || at(ix + 1, iy) <= 127 || at(ix, iy - 1) <= 127 || at(ix, iy + 1) <= 127)) a = 235;
+    im.data[k] = c[0]; im.data[k + 1] = c[1]; im.data[k + 2] = c[2]; im.data[k + 3] = Math.min(255, a);
+  }
+  g.putImageData(im, 0, 0);
+}
+
+// ---------------------------------------------------------------- the map
+function draw() {
+  const r = ST.ses, T = ST.track; if (!r || !T) return;
+  const t = Math.round(ST.t), car = r.car[t];
+  const { g, W, H } = fit($("map"));
+  g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
+  const cx = car[0] + ST.ox, cy = car[1] + ST.oy, s = W / ST.span;
+  const P = (x, y) => [(x - cx) * s + W / 2, H / 2 - (y - cy) * s];
+  const [ix, iy] = P(T.x0, T.y0 + T.H * T.res);
+  g.imageSmoothingEnabled = s < 40; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s);
+  // the decoder's walls and boxes, in the true car's frame
+  const G = ST.grid;
+  paintGrid(ST.off.wall, ST.wall, t, C.dec, 0.3, true);
+  paintGrid(ST.off.box, ST.box, t, C.box, 1.4, false);
+  const [px, py] = P(car[0], car[1]);
+  g.save(); g.translate(px, py); g.rotate(-car[2]); g.imageSmoothingEnabled = true;
+  g.drawImage(ST.off.wall, G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
+  g.drawImage(ST.off.box, G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
+  g.strokeStyle = C.line; g.lineWidth = 1; g.setLineDash([4, 4]);
+  g.strokeRect(G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
+  g.restore();
+  // true boxes: outlines
+  g.lineWidth = 2; g.strokeStyle = C.box; g.setLineDash([]);
+  for (const b of r.boxes) {
+    if (t < b[4] || t >= b[5]) continue;
+    const fp = ST.meta.fp[String(b[0])]; if (!fp) continue;
+    const c0 = Math.cos(b[3]), s0 = Math.sin(b[3]);
+    g.beginPath(); fp.forEach((q, i) => { const [x, y] = P(b[1] + q[0] * c0 - q[1] * s0, b[2] + q[0] * s0 + q[1] * c0); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.closePath(); g.stroke();
+  }
+  const dims = T.car || [0.58, 0.31];
+  const body = (x, y, yaw, fill, stroke, dash, alpha) => {
+    const k = Math.max(1, 14 / (dims[0] * s)), hl = dims[0] / 2 * k, hw = dims[1] / 2 * k, c0 = Math.cos(yaw), s0 = Math.sin(yaw);
+    const pts = [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]].map(([a, b]) => P(x + a * c0 - b * s0, y + a * s0 + b * c0));
+    g.save(); g.globalAlpha = alpha == null ? 1 : alpha; g.beginPath(); pts.forEach(([u, v], i) => (i ? g.lineTo(u, v) : g.moveTo(u, v))); g.closePath();
+    if (fill) { g.fillStyle = fill; g.fill(); }
+    if (stroke) { g.setLineDash(dash || []); g.lineWidth = 2; g.strokeStyle = stroke; g.stroke(); }
+    g.restore();
+  };
+  const toW = (u, v) => [car[0] + u * Math.cos(car[2]) - v * Math.sin(car[2]), car[1] + u * Math.sin(car[2]) + v * Math.cos(car[2])];
+  const ring = (x, y, rad, col, fill) => { const [u, v] = P(x, y); g.beginPath(); g.arc(u, v, rad, 0, 2 * Math.PI); if (fill) { g.fillStyle = col; g.fill(); } else { g.setLineDash([]); g.lineWidth = 2; g.strokeStyle = col; g.stroke(); } };
+  // the other car: true body (and where it truly is 0.5 / 1.0 s on), the decoder's outline and its two future points
+  const op = r.opp ? r.opp[t] : null;
+  if (op && op[0]) {
+    body(op[1], op[2], op[3], C.opp, null, null, 0.9);
+    for (const k of [5, 10]) { const f = r.opp[t + k]; if (f && f[0]) ring(f[1], f[2], 3, C.opp, true); }
+  }
+  const dop = r.dec_opp ? r.dec_opp[t] : null;
+  if (dop && dop[0] != null && dop[0] > 0.5) {
+    const [wx, wy] = toW(dop[1], dop[2]);
+    body(wx, wy, car[2] + dop[3], null, C.opp, [5, 4], Math.min(1, 0.4 + dop[0]));
+    for (const k of [0, 1]) { const [fx, fy] = toW(dop[5 + 2 * k], dop[6 + 2 * k]); ring(fx, fy, 5, C.opp, false); }
+  }
+  // our car, and where the decoder puts it
+  const dp = r.dec_pose[t];
+  if (dp && dp[0] != null) body(dp[0], dp[1], dp[2], null, C.dec, [5, 4], 1);
+  body(car[0], car[1], car[2], C.ego, null, null, 1);
+  // numbers: the decoder's (aqua) next to the truth
+  const de = r.dec_ego[t] || [];
+  const f = (v, n) => (v == null || !isFinite(v) ? "-" : (+v).toFixed(n));
+  $("h_v").textContent = f(de[0], 2); $("h_vt").textContent = f(car[3], 2);
+  $("h_r").textContent = de[2] == null ? "-" : f(de[2] * 180 / Math.PI, 0); $("h_rt").textContent = car[4] == null ? "-" : f(car[4] * 180 / Math.PI, 0);
+  $("tlab").textContent = (t * r.dt).toFixed(1) + " s";
+}
+
+// ---------------------------------------------------------------- playback and the camera
+$("slider").oninput = () => { ST.t = +$("slider").value; draw(); setUrl(); };
+$("play").onclick = () => { ST.play = !ST.play; $("play").textContent = ST.play ? "❚❚" : "▶"; if (ST.play) { ST.last = performance.now(); requestAnimationFrame(tick); } else setUrl(); };
+$("speed").onclick = () => { ST.speed = SPEEDS[(SPEEDS.indexOf(ST.speed) + 1) % SPEEDS.length]; $("speed").textContent = ST.speed + "x"; };
+function tick(now) {
+  if (!ST.play || !ST.ses) return;
+  const dt = (now - ST.last) / 1000; ST.last = now;
+  const prev = Math.round(ST.t);
+  ST.t += dt * ST.speed / ST.ses.dt;
+  if (ST.t >= ST.ses.T - 1) { ST.t = ST.ses.T - 1; ST.play = false; $("play").textContent = "▶"; setUrl(); }
+  if (Math.round(ST.t) !== prev) { $("slider").value = String(Math.round(ST.t)); draw(); }
+  if (ST.play) requestAnimationFrame(tick);
+}
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT" || !ST.ses) return;
+  if (e.key === " ") { e.preventDefault(); $("play").click(); }
+  else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    e.preventDefault(); ST.t = Math.min(ST.ses.T - 1, Math.max(0, Math.round(ST.t) + (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 10 : 1)));
+    $("slider").value = String(ST.t); draw(); setUrl();
+  }
+});
+(() => {
+  const c = $("map");
+  c.addEventListener("wheel", (e) => { e.preventDefault(); ST.span = Math.max(3, Math.min(120, ST.span * Math.exp(Math.max(-0.5, Math.min(0.5, e.deltaY * 0.0015))))); draw(); }, { passive: false });
+  let d = null;
+  c.addEventListener("pointerdown", (e) => { d = { x: e.clientX, y: e.clientY, ox: ST.ox, oy: ST.oy }; c.setPointerCapture(e.pointerId); });
+  c.addEventListener("pointermove", (e) => { if (!d) return; const s = c.clientWidth / ST.span; ST.ox = d.ox - (e.clientX - d.x) / s; ST.oy = d.oy + (e.clientY - d.y) / s; draw(); });
+  const up = () => { d = null; }; c.addEventListener("pointerup", up); c.addEventListener("pointercancel", up);
+  c.addEventListener("dblclick", () => { ST.ox = ST.oy = 0; draw(); });
+})();
+window.addEventListener("resize", draw);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readTokens(); if (ST.track) tint(ST.track); draw(); });
+loadList().catch((e) => { $("empty").textContent = String(e.message || e); });
+</script>
+</body>
+</html>

@@ -1568,6 +1568,8 @@ class SimWorker:
             "procedural_src": proc_src,
             "layout_hold": hold, "prop_catalogue": prop_cat,
         }
+        if skind == "plan":
+            self._attach_decoder(session, state_ck, ckpt_path, gen)
         if skind:
             session["act_fn"].session = session        # a student reads the session's observation dict
             session["intro"] = session["act_fn"].intro = state_policy.StateIntro(session["act_fn"])
@@ -2164,6 +2166,10 @@ class SimWorker:
             if _k >= 0:
                 opp_pred = _runner.pred_w[_k]
                 pieces.append(opp_pred.reshape(-1).to(pack.dtype))
+        # (11-26) the state decoder's answer for the focus car (`_decoder_overlay`), in the same single copy
+        dec_t = None if ext_focus else self._decoder_overlay(session, focus)
+        if dec_t is not None:
+            pieces += [t_.reshape(-1).to(pack.dtype) for t_ in dec_t]
         proc = env.procedural
         if proc is not None:
             # The layout the focus car is driving through -- its race's set: the cars of a race share
@@ -2229,6 +2235,19 @@ class SimWorker:
                 drv_fr = dict(drv_fr or {})
                 drv_fr["lines"] = list(drv_fr.get("lines") or []) + [pred_line]
                 drv_fr["points"] = list(drv_fr.get("points") or []) + [pred_pts]
+        if dec_t is not None:
+            vals = []
+            for t_ in dec_t:
+                nq = int(t_.numel()); vals.append(_copy(flat[i:i + nq])); i += nq
+            try:
+                dfr = self._decoder_frame(session, vals, (p[focus, 0], p[focus, 1], p[focus, 2]), float(p[focus, 3]))
+                drv_fr = dict(drv_fr or {})
+                drv_fr["lines"] = list(drv_fr.get("lines") or []) + dfr["lines"]
+                drv_fr["points"] = list(drv_fr.get("points") or []) + dfr["points"]
+                drv_fr["grid"], drv_fr["legend"], drv_fr["title"] = dfr["grid"], dfr["legend"], dfr["title"]
+            except Exception as exc:                # a drawing aid never stops the simulation it draws
+                self._overlay["decoder"] = False
+                self.say(P.MSG_LOG, gen=self.gen, text=f"디코더 표시를 끕니다 (오류: {type(exc).__name__}: {exc})")
         props_dyn = None
         if proc is not None:
             blk = flat[i:i + 4 * int(proc.C)].reshape(-1, 4); i += 4 * int(proc.C)
@@ -2300,6 +2319,97 @@ class SimWorker:
                 fr["hidden"], fr["stem"] = hidden, stem
         self.seq += 1
         return fr
+
+    def _attach_decoder(self, session, ck, ckpt_path, gen) -> None:
+        """(11-26, the user: "그 정보들이 네트워크에 있는지 디버깅용 디코더 ... 사이트나 콘솔에서도") a plan checkpoint's state decoder,
+        when one was trained for it (tools/lab_decoder_watch.sh puts `plan_uN_dec.npz` beside `plan_uN.pt`): the file beside
+        the checkpoint (or beside what a `watch_<run>/state_latest.pt` link points at), else the run's `plan_u<update>_dec.npz`.
+        Read-only: it decodes the policy's features and memory at each decision; 표시 > '디코더' draws it."""
+        runner = session.get("act_fn")
+        if not hasattr(runner, "attach_decoder"):
+            return
+        from ..learn import common
+        from ..learn.state_decoder import decoder_path_of
+        cands = [decoder_path_of(os.path.realpath(ckpt_path)), decoder_path_of(ckpt_path)]
+        upd = (ck or {}).get("update") if isinstance(ck, dict) else None
+        if upd is not None:
+            for d in (os.path.dirname(os.path.realpath(ckpt_path)), os.path.dirname(ckpt_path)):
+                r = os.path.basename(d)
+                r = r[len("watch_"):] if r.startswith("watch_") else r
+                cands.append(os.path.join(common.RUNS_DIR, r, f"plan_u{int(upd)}_dec.npz"))
+        for c in dict.fromkeys(cands):
+            if not os.path.isfile(c):
+                continue
+            try:
+                name = runner.attach_decoder(c, os.environ.get("F1SIM_DECODER_SET", "feat+mem"))
+            except Exception as exc:
+                self.say(P.MSG_LOG, gen=gen, text=f"상태 디코더를 못 씀 ({os.path.basename(c)}: {exc})")
+                return
+            session["decoder"] = c
+            self.say(P.MSG_LOG, gen=gen, text=f"상태 디코더 있음: {name} 시험 기록으로 학습 ({runner.dec_set}) · 표시 > 디코더로 켭니다")
+            return
+
+    def _decoder_overlay(self, session, focus: int):
+        """the decoder's answer for the focus car, as tensors to ride in the frame's single copy (None: nothing to draw)"""
+        import torch
+        runner = session.get("act_fn")
+        if not self._overlay.get("decoder") or getattr(runner, "dec_out", None) is None:
+            return None
+        k = runner.pred_row(focus)
+        if k < 0:
+            return None
+        o = runner.dec_out
+        return [torch.sigmoid(o["wall"][k].float()), torch.sigmoid(o["box"][k].float()), o["pose"][k].float(),
+                o["ego"][k].float(), o["opp"][k].float(), runner.dec_pose[k].float()]
+
+    def _decoder_frame(self, session, vals, true_pose, true_v) -> dict:
+        """the decoder's layers in the console's driver overlay (`fr["drv"]`): walls (teal) and boxes (amber) as the 2D
+        panel's grid image and, in 3D, the wall edges and box cells as markers; where it puts our car (teal outline) and the
+        other car (magenta outline, its 0.5 / 1.0 s points), all in the frame of the car at the decision"""
+        from ..learn import state_decoder as SD
+        dec = session["act_fn"].dec
+        nx, ny = SD.NX, SD.NY
+        wall, box = vals[0].reshape(nx, ny), vals[1].reshape(nx, ny)
+        pr, eg, q, dp = vals[2], vals[3], vals[4], vals[5]
+        TEAL, AMBER, MAG = (0.13, 0.80, 0.58), (0.95, 0.62, 0.05), (1.0, 0.2, 0.85)
+        wm = wall > 0.5
+        edge = wm & ~(np.pad(wm, 1, constant_values=True)[:-2, 1:-1] & np.pad(wm, 1, constant_values=True)[2:, 1:-1]
+                      & np.pad(wm, 1, constant_values=True)[1:-1, :-2] & np.pad(wm, 1, constant_values=True)[1:-1, 2:])
+        # a light wash over the decoded wall mass, its rim strong (as the site's /dec), boxes over it
+        img = np.zeros((nx, ny, 4), np.uint8)
+        img[..., :3] = np.array(TEAL) * 255
+        img[..., 3] = np.where(edge, 235, np.clip(wall * 80, 0, 255))
+        bm = box > 0.15
+        img[bm, :3] = np.array(AMBER) * 255
+        img[bm, 3] = np.clip(box[bm] * 255, 0, 255)
+        cx, cy, cyaw = float(dp[0]), float(dp[1]), float(dp[2])
+        c0, s0 = math.cos(cyaw), math.sin(cyaw)
+        cells = SD.cell_centres().reshape(nx, ny, 2)
+        to_w = lambda u, v: np.stack([cx + u * c0 - v * s0, cy + u * s0 + v * c0], -1).astype(np.float32)
+        pts = [{"xy": to_w(cells[edge][:, 0], cells[edge][:, 1]), "rgba": TEAL + (0.85,), "px": 4.0, "panel": False},
+               {"xy": to_w(cells[box > 0.5][:, 0], cells[box > 0.5][:, 1]), "rgba": AMBER + (1.0,), "px": 8.0, "panel": False}]
+        x0, x1, y0, y1 = dec.pose_ext
+        px_, py_ = x0 + float(pr[0]) * (x1 - x0), y0 + float(pr[1]) * (y1 - y0)
+        pyaw = math.atan2(float(pr[3]), float(pr[2]))
+
+        def rect(x, y, yaw, L=0.58, W=0.31):
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            q_ = [(L / 2, W / 2), (L / 2, -W / 2), (-L / 2, -W / 2), (-L / 2, W / 2), (L / 2, W / 2)]
+            return np.array([[x + a * c - b * s_, y + a * s_ + b * c] for a, b in q_], np.float32)
+        lines = [{"xy": rect(px_, py_, pyaw), "rgba": TEAL + (1.0,), "w": 2.5}]
+        p_opp = 1.0 / (1.0 + math.exp(-float(q[0])))
+        S = SD.OPP_SCALE
+        if p_opp > 0.5:
+            ox, oy = to_w(np.array([float(q[1]) * S]), np.array([float(q[2]) * S]))[0]
+            lines.append({"xy": rect(float(ox), float(oy), cyaw + math.atan2(float(q[4]), float(q[3]))), "rgba": MAG + (0.95,), "w": 2.5})
+            fut = to_w(np.array([float(q[6]), float(q[8])]) * S, np.array([float(q[7]), float(q[9])]) * S)
+            pts.append({"xy": fut, "rgba": MAG + (1.0,), "px": 7.0})
+        r_deg = math.degrees(float(eg[2]) * float(dec.ego_scale[2]))
+        v_dec = float(eg[0]) * float(dec.ego_scale[0])
+        legend = (f"디코더 {session['act_fn'].dec_set}: 청록 벽·pose, 주황 상자, 분홍 상대 차"
+                  + (f" {p_opp:.2f}" if p_opp > 0.5 else "") + f" · 속도 {v_dec:.2f} (참 {true_v:.2f}) m/s · 회전 {r_deg:.0f}°/s")
+        return {"title": "상태 디코더", "legend": legend, "lines": lines, "points": [q_ for q_ in pts if len(q_["xy"])],
+                "grid": {"rgba": img, "res": SD.GRID_RES, "x0": SD.GRID_X0}}
 
     def _viz_failure(self, session, exc) -> None:
         """A driver overlay that fails is switched off for the session and said once: a drawing aid

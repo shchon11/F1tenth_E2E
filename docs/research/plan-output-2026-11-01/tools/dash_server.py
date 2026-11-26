@@ -536,6 +536,22 @@ class H(BaseHTTPRequestHandler):
                 if not re.fullmatch(r"[A-Za-z0-9_]+", name or ""):
                     return self._send(404, json.dumps({"error": "no such run"}))
                 return self._json(memo(("spots", name), 20, lambda: spots(name)))
+            # (11-26, the user: "디버깅용 디코더 ... 시각화도 가능하게. 사이트나 콘솔에서도") the exam replay of a checkpoint's state
+            # decoders (dec_replay.py, numpy only): the records with a decoder, one record's track and test sessions, one session
+            if u.path == "/dec":
+                return self._send(200, open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dec_page.html"), "rb").read(),
+                                  "text/html; charset=utf-8")
+            if u.path == "/api/dec_list":
+                import dec_replay
+                return self._json(memo("dec_list", 30, dec_replay.records))
+            if u.path in ("/api/dec_meta", "/api/dec_session"):
+                import dec_replay
+                rec = q.get("rec", "")
+                if not dec_replay.ok_rec(rec):
+                    return self._send(404, json.dumps({"error": "no such decoder"}))
+                if u.path == "/api/dec_meta":
+                    return self._json(memo(("dec_meta", rec), 600, lambda: dec_replay.meta(rec)))
+                return self._send(200, dec_replay.session_json(rec, int(q.get("s", "0")), q.get("set", "feat+mem")))
             if u.path.startswith("/api/") and u.path not in ("/api/figs", "/api/notes", "/api/overview") and not ok_run(name):
                 return self._send(404, json.dumps({"error": "no such run"}))
             if u.path == "/api/progress":
