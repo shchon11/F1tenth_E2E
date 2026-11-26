@@ -155,6 +155,20 @@ def build_env(a, device, extra=None):
         tid = torch.arange(T, device=device)[:, None].expand_as(tr.cl_s)
         env.procedural.set_line(_line_planner(env).rl_offset(tr.cl_s, tid))
         env.reset()
+    tm = getattr(a, "tmaze", None)
+    if tm:
+        # (11-26, the racing T-maze for RQ3/4/6, `configs/plan_world_korea26scan_tmaze.json`) real boxes at one of two fixed
+        # placements (L against the left wall: forced right, R the mirror; tools/tmaze_spot.py) or none, drawn per episode with
+        # P = tm["p"] and never removed -- the world's own fixed layouts in place of a bank (`set_layouts`)
+        if env.procedural is None:
+            raise ValueError("tmaze world: needs boxes (stage props, prop_fraction > 0)")
+        p_l, p_r, p_0 = (float(x) for x in tm["p"])
+        if abs(p_l - p_r) > 1e-9 or abs(p_l + p_r + p_0 - 1.0) > 1e-6:
+            raise ValueError(f"tmaze p: (L, R, none) with L = R, summing to 1; got {tm['p']}")
+        # a placement is one piece [x, y, yaw, id] or a list of them (a row of boxes)
+        lay = lambda v: [list(q) for q in v] if isinstance(v[0], (list, tuple)) else [list(v)]
+        env.procedural.set_layouts([lay(tm["L"]), lay(tm["R"])], fraction=p_l + p_r)
+        env.reset()
     return env
 
 

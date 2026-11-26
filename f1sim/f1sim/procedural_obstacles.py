@@ -593,6 +593,37 @@ class ProceduralObstacles:
         self.place = "bank"
         print(f"[procedural] bank {path}: {int(self.b_n.min())}-{int(self.b_n.max())} layouts per track, {T} tracks", flush=True)
 
+    def set_layouts(self, layouts, fraction: float) -> None:
+        """(11-26, the racing T-maze: a world's `tmaze` block) a fixed list of layouts in place of a bank file -- `layouts` a
+        list of layouts, each a list of pieces [x, y, yaw, catalogue id] in the world -- drawn as a bank is (`_redraw_bank`):
+        `fraction` of the draws carry props, those take one of the layouts uniformly, all of its pieces. One track only (the
+        coordinates are that map's)"""
+        T = int(self.tr.length.numel())
+        if T != 1:
+            raise ValueError(f"set_layouts: fixed layouts are one map's coordinates; this set has {T} tracks")
+        K = len(layouts)
+        n_max = max(len(l_) for l_ in layouts)
+        if K < 1 or n_max < 1 or n_max > self.C:
+            raise ValueError(f"set_layouts: {K} layouts of up to {n_max} pieces for {self.C} slots")
+        dev = self.device
+        self.b_sid = torch.full((1, K, self.C), -1, dtype=torch.long, device=dev)
+        self.b_pose = torch.zeros(1, K, self.C, 3, device=dev)
+        for k, lay in enumerate(layouts):
+            for c, (x, y, yaw, sid) in enumerate(lay):
+                if not 0 <= int(sid) < len(self.shapes):
+                    raise ValueError(f"set_layouts: catalogue id {sid} out of range")
+                self.b_sid[0, k, c] = int(sid)
+                self.b_pose[0, k, c] = torch.tensor([float(x), float(y), float(yaw)], device=dev)
+        self.b_n = torch.full((1,), K, dtype=torch.long, device=dev)
+        xy = self.b_pose[..., :2].reshape(-1, 2)
+        p_ = self.tr.project(xy, torch.zeros(xy.shape[0], dtype=torch.long, device=dev))
+        self.b_j = (p_[2].long() % self.N).reshape(1, K, self.C)
+        self.b_v = p_[1].reshape(1, K, self.C).float()
+        self.place = "bank"
+        self.fraction = float(fraction)
+        self.count, self.keep = "fixed", 0
+        self.b_online = self.b_late = None
+
     def set_driven_line(self, line: torch.Tensor, ok: torch.Tensor, near: float = 0.40, bin_m: float = 0.25) -> float:
         """(11-18) the policy's own line per track, `line` (T, n, 2) points along the lap and `ok` (T, n) the ones measured:
         every bank piece whose centre is within `near` of a measured point is marked on the line (`b_online`). Returns the

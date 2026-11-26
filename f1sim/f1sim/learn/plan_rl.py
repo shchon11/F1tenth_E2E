@@ -60,6 +60,7 @@ from .plan_reward import PlanReward, SEEN_S, T_REF, ww_totals
 from . import plan_car_cost as PCC
 from . import plan_grad_cost as PG
 from . import plan_commit as PC
+from . import plan_intent as IN
 from .pred_oracle import copy_oracle
 from .level_replay import LevelReplay
 from .scene_replay import SceneReplay
@@ -338,7 +339,7 @@ class SelfOpponents:
     #: compounds down decision after decision (a scaled command would: every plan starts from the car's own speed) nor
     #: drives the fast corners at full speed (a top-speed cap would). Lap-time ratios measured: tools/self_pace_laps.py
     PACE_KEYS = ("on", "tag", "pace", "cap", "scans", "rel", "rel_v", "cmd_d", "cmd_v", "plan_xy", "plan_v", "mem", "imu",
-                 "rel_psi", "prev_ok")
+                 "rel_psi", "prev_ok", "intent_z", "intent_left")
 
     def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5, vcap=None,
                  pace=None):
@@ -375,7 +376,18 @@ class SelfOpponents:
     def add(self, actor, tag) -> None:
         """a frozen copy of `actor` joins the pool; a full pool gives up a random one of its older copies"""
         import copy
-        a = copy.deepcopy(actor).eval()
+        # (11-26) an intent actor keeps the update's last pi_high logits and trunk pre-activation (tensors in the graph, which
+        # deepcopy refuses): not part of the copy
+        _kept = {k_: getattr(actor, k_, None) for k_ in ("intent_logits_out", "trunk_a1")}
+        for k_, v_ in _kept.items():
+            if v_ is not None:
+                setattr(actor, k_, None)
+        try:
+            a = copy.deepcopy(actor).eval()
+        finally:
+            for k_, v_ in _kept.items():
+                if v_ is not None:
+                    setattr(actor, k_, v_)
         for q in a.parameters():
             q.requires_grad_(False)
         if len(self.pool) < self.max_pool:
@@ -388,6 +400,8 @@ class SelfOpponents:
         self.prune()
         if getattr(self.obs, "mem_h", None) is None and getattr(a, "memory", 0):
             self.obs.mem_h = torch.zeros(self.on.numel(), a.memory, device=self.on.device)
+        if getattr(a, "intent_k", 0) and getattr(self.obs, "intent_z", None) is None:
+            self.obs.intent_on(a.intent_k, a.intent_hold)          # (11-26) each copy-driven car carries its own intent
         if len(self.pool) == 1:
             every = torch.arange(self.on.numel(), device=self.on.device)
             self.obs.reset_rows(every)
@@ -483,6 +497,12 @@ class SelfOpponents:
                     m, _, vh = actor(obs.scans[idx], s[idx], h, prev=(prev[0][idx], prev[1][idx]))
                 else:
                     m, _, vh = actor(obs.scans[idx], s[idx], h)
+                if getattr(actor, "intent_k", 0):
+                    # (11-26) a copy's intent: the likeliest at its redraws (it drives its mean plan), held as trained
+                    z_, l_, _ = IN.step(actor.intent_logits_out, obs.intent_z[idx], obs.intent_left[idx], actor.intent_hold,
+                                        actor.intent_eps, "argmax")
+                    obs.intent_z[idx] = z_; obs.intent_left[idx] = l_
+                    m = actor.intent_mean(m, z_)
                 if h is not None:
                     obs.mem_h[idx] = actor.h_out
                 mean[idx] = m.float(); v_hat[idx] = vh.float()
@@ -532,11 +552,14 @@ class SelfOpponents:
         mem = (o.mem_h[oi].clone() if getattr(o, "mem_h", None) is not None
                else torch.zeros(n, max(1, int(getattr(self.pool[0], "memory", 1)) if self.pool else 1), device=dev))
         r = self.env.last_result
+        iz = getattr(o, "intent_z", None)                          # (11-26) its intent and hold (zeros without one)
         return {"on": self.on[oi].clone(), "tag": self.row_tag[oi].clone(), "pace": self.pace[oi].clone(),
                 "cap": self.cap[oi].clone(), "scans": o.scans[oi].clone(), "rel": o.rel[oi].clone(),
                 "rel_v": o.rel_v[oi].clone(), "cmd_d": o.cmd_d[oi].clone(), "cmd_v": o.cmd_v[oi].clone(),
                 "plan_xy": o.plan_xy[oi].clone(), "plan_v": o.plan_v[oi].clone(), "mem": mem,
-                "imu": r.imu[self.rows[oi]].float().mean(1), "rel_psi": o.rel_psi[oi].clone(), "prev_ok": o.prev_ok[oi].clone()}
+                "imu": r.imu[self.rows[oi]].float().mean(1), "rel_psi": o.rel_psi[oi].clone(), "prev_ok": o.prev_ok[oi].clone(),
+                "intent_z": iz[oi].clone() if iz is not None else torch.zeros(n, dtype=torch.long, device=dev),
+                "intent_left": o.intent_left[oi].clone() if iz is not None else torch.zeros(n, dtype=torch.long, device=dev)}
 
     def restore(self, oi: torch.Tensor, d: dict) -> None:
         """put a `snapshot` back on opponent rows `oi` (their race has just been loaded from a scene): the same copy at the
@@ -557,6 +580,8 @@ class SelfOpponents:
         o.rel_psi[oi] = d["rel_psi"]; o.prev_ok[oi] = d["prev_ok"]
         if getattr(o, "mem_h", None) is not None and o.mem_h.shape[1] == d["mem"].shape[1]:
             o.mem_h[oi] = d["mem"]
+        if getattr(o, "intent_z", None) is not None and "intent_z" in d:
+            o.intent_z[oi] = d["intent_z"]; o.intent_left[oi] = d["intent_left"]
         r = self.env.last_result
         r.imu[self.rows[oi]] = d["imu"][:, None, :].to(r.imu.dtype)
         self.xy[oi] = self.env.sim.state[self.rows[oi], :2]          # where it is now is where the scene put it
@@ -866,8 +891,59 @@ def _arg_problem(args) -> str:
         (args.wrong_way_cost < 0, "--wrong-way-cost: K >= 0"),
         (bool(args.wrong_way_ramp) and not args.wrong_way_cost > 0, "--wrong-way-ramp needs --wrong-way-cost"),
         (bool(args.wrong_way_ramp) and ramp_w(1, args.wrong_way_ramp) is None, "--wrong-way-ramp U0,U1 with U0 <= U1"),
+        (_rq_problem(args) != "", _rq_problem(args)),
+        (bool(args.intent) and _intent_problem(args) != "", _intent_problem(args)),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+def _rq_problem(args) -> str:
+    """(11-26) --contact-cond / --term-split / the T-maze world's refusals ('' = none)"""
+    if args.contact_cond:
+        try:
+            lo, hi = (float(x) for x in args.contact_cond.split(","))
+        except ValueError:
+            return "--contact-cond LO,HI: two numbers"
+        if not 0.0 < lo <= hi:
+            return "--contact-cond LO,HI: 0 < LO <= HI"
+        if args.format != "v2" or args.pace_caps or args.line_shifts or args.self_opp > 0 or args.commit_plan > 0:
+            return "--contact-cond: --format v2, without --pace-caps / --line-shifts / --self-opp / --commit-plan"
+        if args.init:
+            ck = torch.load(args.init, map_location="cpu", weights_only=False)
+            if str((ck.get("args") or {}).get("contact_cond") or "") != args.contact_cond:
+                return "--contact-cond: from scratch (its log(c) input changes the state's size), or from a checkpoint with the same"
+    if args.term_split:
+        if not args.init:
+            return "--term-split measures a checkpoint: give --init (and --init-critic)"
+        if (args.dist_world > 1 or args.branches == 2 or args.pace_caps or args.line_shifts or args.plan_roll or args.roll_grow
+                or args.commit_plan > 0 or args.hold_p > 0 or args.dump_rollout or args.format != "v2"
+                or getattr(args, "intent", "")):
+            return ("--term-split: one process, --format v2, without --branches 2 / --pace-caps / --line-shifts / --plan-roll / "
+                    "--roll-grow / --commit-plan / --hold-p / --dump-rollout / --intent (its log-probability is not scored here)")
+    if os.path.isfile(args.world) and json.load(open(args.world)).get("tmaze") and args.scene_replay > 0:
+        return "the T-maze world runs without scene replay: --scene-replay 0"
+    return ""
+
+
+def _intent_problem(args) -> str:
+    """(11-26) --intent's refusals ('' = none): one plan with its first 0.1 s the action (or all 20), v2; nothing else that
+    owns the plan's outputs or holds a choice of its own"""
+    try:
+        IN.parse(args.intent)
+    except ValueError as e:
+        return str(e)
+    if args.format != "v2":
+        return "--intent needs --format v2"
+    if args.commit_plan > 0:
+        return "--intent: not with --commit-plan (the whole plan as the action has its own noise and promise)"
+    if (args.hold_p > 0 or args.plan_roll or args.roll_grow or args.branches == 2 or args.pace_caps or args.line_shifts
+            or args.dump_rollout):
+        return "--intent: not with --hold-p / --plan-roll / --roll-grow / --branches 2 / --pace-caps / --line-shifts / --dump-rollout"
+    if args.intent_ent < 0 or args.intent_lat < 0:
+        return "--intent-ent, --intent-lat: >= 0"
+    if getattr(args, "intent_trunk", False) and args.memory and not args.mem_front:
+        return "--intent-trunk: a memory actor needs --mem-front (or --no-intent-trunk)"
+    return ""
 
 
 def ramp_w(upd: int, spec: str) -> Optional[float]:
@@ -1461,6 +1537,22 @@ def main(argv=None):
                          "along). cp36b (K 0.2 from the first update) stood 64-81 %% of the time at u10-u21 against cp36a's 46-60 %%: a "
                          "fresh policy turns round often, and standing was the safe answer; early on the distance shaping already "
                          "prices going backwards. '' = K from the start")
+    ap.add_argument("--hard-contact-ends", action="store_true",
+                    help="(11-26, RQ4 'racing T-maze') a hard contact (impact >= contact_severity.HARD_MPS, the exam tables' "
+                         "'세게 닿음'; a car's only when the reward charges it) ends the return: done with terminal value 0 for "
+                         "GAE (the shaping's next potential left out, so it stays exact per segment). The car drives on from "
+                         "there as the start of a new return segment; the env is not restarted and the memory is NOT reset")
+    ap.add_argument("--contact-cond", default="",
+                    help="LO,HI (11-26, RQ3/4): every episode draws c ~ LogUniform[LO, HI]; every contact cost (contacts, the "
+                         "plan-hit price, the plan-car cost) is multiplied by c and log(c) is the state's last input (actor "
+                         "trunk and memory, critic), from scratch. Exam / console: F1SIM_CONTACT_COND=c, default sqrt(LO HI)")
+    ap.add_argument("--term-split", default="",
+                    help="OUT.txt (11-26, RQ2; measurement only, with --init): one rollout of the normal size after "
+                         "--term-split-warm warm-up rollouts, NO update -- the reward split into its lap and contact terms, a "
+                         "value function fitted per term, the policy gradient of each over the update's minibatches "
+                         "(`term_split.measure`): norms, cosine, agreement, noise scale, the share near box passes")
+    ap.add_argument("--term-split-warm", type=int, default=1, help="--term-split: rollouts driven (not measured) first")
+    ap.add_argument("--term-split-steps", type=int, default=400, help="--term-split: Adam steps per value function")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1503,6 +1595,28 @@ def main(argv=None):
     ap.add_argument("--line-follow", type=float, default=1.0,
                     help="--line-shifts: weight of the loss that puts a level's plan end that far across the plan the same state "
                          "and memory draw at level 0 (across that plan's heading at its 1 s end; the level-0 plan is not moved by it)")
+    ap.add_argument("--intent", default="",
+                    help="K,H,EPS (11-26, RQ6 (c) / RQ3; `plan_intent`): a held intent in the action -- pi_high(z | h), z in 0..K-1, "
+                         "drawn at a start, after a restart and every H decisions from (1 - EPS) softmax + EPS / K and held in "
+                         "between; z adds its own vector to the plan head's 20 outputs (it starts as a steady steering offset whose arc "
+                         "ends linspace(-LAT, LAT, K) m to the side at 1 s, --intent-lat), the critic reads z and the hold left. Its "
+                         "log-probability joins the action's at a redraw. Output noise is taken back within ~0.1 s; a held intent "
+                         "moves what the plan aims at for H decisions. '' = off (e.g. 4,15,0.1)")
+    ap.add_argument("--intent-trunk", action=argparse.BooleanOptionalAction, default=True,
+                    help="--intent: the trunk also reads z (one-hot; its first layer's columns for it start at zero, so the plan is "
+                         "the vectors' alone until PPO moves them) -- the control law itself z-conditioned (11-26, the "
+                         "coordinator: a vector the policy does not know about was 85-93 %% undone by its own closed loop). "
+                         "pi_high and the speed estimate stay z-free, the memory reads no z. --no-intent-trunk: the vectors only")
+    ap.add_argument("--intent-effect-every", type=int, default=25,
+                    help="--intent: every N updates (and the last) rank 0 drives a small env of its own (32 cars, 10 s, ideal "
+                         "execution, built once) from one start three times -- the z-free plan, the outer intents 0 and K-1 fixed "
+                         "-- and logs how far each outer run's line lies from the z-free path [m] (`plan_intent.realized_effect`; "
+                         "11-26, the coordinator). 0 = off")
+    ap.add_argument("--intent-ent", type=float, default=0.01,
+                    help="--intent: the entropy bonus on pi_high at the redraws (per decision, as the policy loss is)")
+    ap.add_argument("--intent-lat", type=float, default=0.3,
+                    help="--intent: [m] the outermost intent's start -- its 1 s plan point this far to the side at 5 m/s, a fresh "
+                         "net's plan (the others evenly between, -LAT .. +LAT)")
     ap.add_argument("--branches", type=int, default=1, choices=(1, 2),
                     help="2 = two plans and a choice between them (`Actor2.branches`); --format v2 with --tail-consistency")
     ap.add_argument("--branch-floor", type=float, default=0.1,
@@ -1562,6 +1676,11 @@ def main(argv=None):
         raise SystemExit(0)
     if args.contact_scale is None:                 # the map's own contact weight (11-15: one world json per map carries it)
         args.contact_scale = float(json.load(open(args.world)).get("contact_scale", 1.0))
+    _why_rq = _rq_problem(args)                    # (11-26) --contact-cond / --term-split / the T-maze world
+    if _why_rq:
+        raise SystemExit(_why_rq)
+    if args.term_split:                            # the warm-up rollouts, then the measured one; no update is ever made
+        args.updates = args.update_offset + max(0, args.term_split_warm) + 1
     dist = None
     if args.dist_world > 1:
         import datetime
@@ -1662,6 +1781,22 @@ def main(argv=None):
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
+    cc_on = bool(args.contact_cond)                    # (11-26) --contact-cond: c per episode, log(c) the state's last input
+    if cc_on:
+        cc_lo, cc_hi = (math.log(float(x_)) for x_ in args.contact_cond.split(","))
+        cc_gen = torch.Generator(device=dev); cc_gen.manual_seed(args.seed + 4241)
+        cc_draw = lambda n_: torch.exp(cc_lo + (cc_hi - cc_lo) * torch.rand(n_, device=dev, generator=cc_gen))
+        pr.cond = cc_draw(Bl)
+        obs.cond = pr.cond.log()
+        print(f"[plan_rl] 접촉 비용 조건(--contact-cond): 판마다 c ~ LogUniform[{args.contact_cond}], 모든 접촉 비용 x c, log(c)를 "
+              f"상태 마지막 입력으로 (처음부터)", flush=True)
+    hce_on = bool(args.hard_contact_ends)              # (11-26) --hard-contact-ends: a hard contact ends the return
+    if hce_on:
+        print("[plan_rl] 세게 닿으면 return 끝(--hard-contact-ends): GAE는 끝값 0, 차는 그 자리에서 계속, 기억 유지, env 다시 시작 안 함",
+              flush=True)
+    term_on = bool(args.term_split)                    # (11-26) --term-split: RQ2's measurement, no update
+    if term_on and env.procedural is None:
+        raise SystemExit("--term-split: the box passes need a world with boxes")
     two = args.branches == 2
     if two:
         if not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0 or args.init:
@@ -1669,6 +1804,12 @@ def main(argv=None):
         if not 0.0 <= args.branch_floor < 0.5:
             raise SystemExit("--branch-floor: in [0, 0.5)")
         obs.prev_branch = torch.zeros(Bl, device=dev)          # the state's last input: the plan chosen last (+1 / -1 / 0)
+    intent_on = bool(args.intent)                              # (11-26) --intent: a held intent (`plan_intent`)
+    if intent_on:
+        if _intent_problem(args):
+            raise SystemExit(_intent_problem(args))
+        iK, iH, iEPS = IN.parse(args.intent)
+        obs.intent_on(iK, iH)                                  # the critic's last inputs (before its size is read below)
     act3, turn3 = plan3_models(env, lim, dev) if v3 else (None, None)
     drv = Driver(env, lim, pr, obs)
     if args.self_opp > 0:
@@ -1959,13 +2100,27 @@ def main(argv=None):
     aux_opp = aux_on and args.aux_opp > 0
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
+                    **({"state_dim": int(obs.state().shape[1])} if cc_on else {}),     # (11-26) --contact-cond: log(c) last
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
                     aux_in=args.mem_aux_in, pace_caps=args.pace_caps, pace_hold=args.pace_hold,
                     pace_floor=args.pace_floor, line_shifts=args.line_shifts, pred_opp=args.pred_opp,
                     pred_smooth=pred_smooth, pred_kin=pred_kin, pred_clear=pc_on,
-                    pc_geom=(car_dims[0], car_dims[1], args.plan_car_margin) if pc_on else None) if v2
+                    pc_geom=(car_dims[0], car_dims[1], args.plan_car_margin) if pc_on else None,
+                    intent=args.intent, intent_trunk=bool(args.intent) and args.intent_trunk) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
+    if intent_on:
+        # the intents' start in metres (a checkpoint with intents, --init, keeps its own: `init_actor` loads them over this)
+        actor.intent_init(lim, args.intent_lat)
+        _l1 = IN.lat_1s(torch.zeros(1, PS.ACT_DIM, device=dev), actor.intent_bias.detach(), torch.full((1,), IN.V_REF, device=dev),
+                        torch.zeros(1, device=dev), lim)[:, 0]
+        print(f"[plan_rl] 의도 z {iK}개 (--intent {args.intent}): {iH}결정({iH * PS.DT:g} s)마다 다시 뽑고 그 사이 유지, 학습은 "
+              f"(1-{iEPS:g}) softmax + {iEPS:g}/{iK}에서 뽑음 (그 섞인 분포가 PPO가 매기는 policy), 다시 뽑는 결정의 log-prob = "
+              f"log pi_high(z) + log pi_low(a|z); z는 plan 출력 20개에 더하는 의도별 벡터로 들어감 (처음엔 일정한 조향 차이 = 호, "
+              f"{IN.V_REF:g} m/s 새 망에서 1 s 점 옆 " + " / ".join(f"{float(x_) * 100:+.0f}" for x_ in _l1) + " cm), critic은 z와 "
+              f"남은 유지를 읽음, 엔트로피 보너스 {args.intent_ent:g}"
+              + (", trunk도 z를 읽음(첫 층 z 열 0에서 시작; pi_high·속도 짐작은 z 없이)" if actor.intent_trunk else ", trunk는 z를 안 읽음"),
+              flush=True)
     cm_on = args.commit_plan > 0                                   # (11-25) --commit-plan: the plan as a commitment
     cm_parent = None                                               # --init: the parent actor, for the first decision's check
     if cm_on:
@@ -2081,6 +2236,12 @@ def main(argv=None):
         critic.enc.load_state_dict(enc)
         if args.init_critic:
             c_sd = ck0["critic"]
+            if intent_on and not (ck0.get("args") or {}).get("intent"):
+                # (11-26) the intent's inputs are the critic's last: from a checkpoint without them, zero weights on them
+                _w_sd = IN.widen_critic(c_sd, critic)
+                if _w_sd is not None:
+                    c_sd = _w_sd
+                    print(f"[plan_rl] critic: 의도 입력 {iK + 1}칸을 끝에 붙임 (가중치 0에서 시작)", flush=True)
             if all(k_ in c_sd and c_sd[k_].shape == v_.shape for k_, v_ in critic.state_dict().items()):
                 critic.load_state_dict(c_sd)
                 print("[plan_rl] critic too (its inputs match)", flush=True)
@@ -2227,6 +2388,7 @@ def main(argv=None):
             for k_, r_ in enumerate(pick[:args.live_taps], start=1):
                 taps.append(LiveTap(env, run, row=r_, name=f"live_tap_{k_}.json", label=lab_(r_)))
     tap_pm = torch.zeros(10, 2, device=dev)
+    ie_env = None                                                  # --intent-effect-every: the eval's own small env (rank 0)
     # (11-24) the live view's reward parts, named: every term that enters the reward this run, in `tap_parts`' order (a
     # contact kind that cannot happen here is 0 and left out); the plan-car cost is priced after each rollout (`settle`)
     tap_kinds = [0, 1] + ([2] if env.M > 1 else []) + ([3] if args.stall_s > 0 else [])
@@ -2330,6 +2492,8 @@ def main(argv=None):
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
         BR = []                                                # --branches 2: the plan each decision drove
         PD, PI, CAPL = [], [], []                              # --pace-caps: picked now?, the level in force, its cap [m/s]
+        ZD, ZI = [], []                                        # --intent: drawn now?, the intent in force
+        iz_st = IN.IntentStats(iK, dev) if intent_on else None
         FULL = []                                              # --plan-roll: a whole new plan drawn at this decision
         KZ, kz_n = [], 0.0                                     # --noise-corr-known: the rows in the known zone, their share
         pace_n = torch.zeros(max(getattr(actor, "pace_levels", 0), 1), device=dev)
@@ -2351,6 +2515,8 @@ def main(argv=None):
         DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
         n_removed = 0
         n_restarted = 0
+        HE, CCV = [], []                                       # (11-26) the decisions a hard contact ended / each decision's c
+        TSR = {k_: [] for k_ in ("lap", "con", "ds", "live", "pos")} if term_on else None     # --term-split's record
         near_sum = torch.zeros(Bl, device=dev)
         hb_wall = torch.zeros(Bl, device=dev); hb_box = torch.zeros(Bl, device=dev)   # --hold-new-block: plans ended early
         vest_err = []
@@ -2385,6 +2551,8 @@ def main(argv=None):
                         snap.update(aux_seen=aux_seen.clone(), aux_prev_ds=aux_prev_ds.clone(), aux_prev_pos=aux_prev_pos.clone())
                     if two:
                         snap["pol_branch"] = obs.prev_branch.clone()
+                    if intent_on:                              # (11-26) the intent in force and its hold left
+                        snap.update(pol_intent_z=obs.intent_z.clone(), pol_intent_left=obs.intent_left.clone())
                     if scene_copies:                           # (11-24) the copy at the wheel of the other car, as it stands
                         for k_, v_ in drv.opp.snapshot(opp_index[others[:, 0]]).items():
                             snap["so_" + k_] = v_
@@ -2529,6 +2697,18 @@ def main(argv=None):
                     br_n["arg_switch"] += float(((arg_ != arg_prev).float() * same_ep).sum())
                     br_n["pairs"] += float(same_ep.sum())
                     br_prev, arg_prev = br, arg_
+                if intent_on:
+                    # (11-26) the intent: rows whose hold ran out (a start, a restart, H decisions) draw from the mixture
+                    # and hold it; everything below (noise, the plan, the log-probability) is under it. Its probability joins
+                    # the decision's at a draw (below), a held intent is the state's (the critic reads it)
+                    lg_z = actor.intent_logits_out
+                    obs.intent_z, obs.intent_left, due_z = IN.step(lg_z, obs.intent_z, obs.intent_left, iH, iEPS, "sample")
+                    mean_nom, a1_z = mean, actor.trunk_a1                 # (the trunk's z-free run, for the stats)
+                    mean = actor.intent_mean(mean, obs.intent_z)
+                    ZD.append(due_z); ZI.append(obs.intent_z.clone())
+                    _mo = (lambda i_, k_: mean_nom[i_] if k_ is None else
+                           actor.intent_mean(mean_nom[i_], torch.full_like(i_, k_), a1=None if a1_z is None else a1_z[i_]))
+                    iz_st.decision(t, obs.intent_z, due_z, lg_z, ordm, _mo, v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
                 if args.noise_corr > 0 or stall_on:
                     # exploration noise that stays for several decisions (AR(1), each decision still N(0, 1) by itself; a
                     # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
@@ -2588,6 +2768,8 @@ def main(argv=None):
                     obs.prev_branch = (1.0 - 2.0 * br).to(s.dtype)                   # a restart below clears its rows
                 if pace_on:
                     lp = lp + torch.where(due_p, pp_.gather(1, obs.pace_idx[:, None])[:, 0].log(), torch.zeros_like(lp))
+                if intent_on:                                      # log pi_high(z | h) at a draw, 0 while held
+                    lp = lp + IN.logp(lg_z, obs.intent_z, due_z, iEPS)
                 v = critic(sc, s, pv_)
                 v_true = env.sim.state[lid, dyn.IVX].float().clone()
                 if args.dump_rollout:
@@ -2710,9 +2892,31 @@ def main(argv=None):
                         CQ["op_rem"].append(pr.goal.remaining(o_xy, _tid)); CQ["op_ok"].append(o_ok.clone())
                         CQ["know"].append(o_ok & ((o_xy - st_me[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S))
                         CQ["pace"].append(pace_t)
+                if hce_on:                                         # (11-26) --hard-contact-ends: the hard counts before
+                    hce0 = env.sim.contact_counts[lid, 3:6].clone()
+                if cc_on:
+                    CCV.append(pr.cond.clone())
+                if term_on:                                        # (11-26) --term-split: every box slot along the track now
+                    _ds_t, _lv_t, _ps_t = box_along(env, pr.goal, lid)
+                    TSR["ds"].append(_ds_t.half()); TSR["live"].append(_lv_t); TSR["pos"].append(_ps_t.half())
                 out, p, (xw_, yw_, pw_) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
                                                        charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None,
                                                        opp_planned=pc_orc)
+                if hce_on:
+                    # a hard contact in this decision (a car's only if the reward charges it, as the scenes count them) ends the
+                    # return: the potential after it is left out of the shaping (terminal Phi = 0 -- exact per segment); the
+                    # next decision starts a new segment from Phi there
+                    _hd = (env.sim.contact_counts[lid, 3:6] - hce0).clamp_min(0).float()
+                    _hd[:, 2] = _hd[:, 2] * ((out["car_charged"] > 0) if args.car_fault else (pr.seen_t <= SEEN_S + PS.DT)).float()
+                    _end = (_hd.sum(1) > 0) & ~out["restarted"]
+                    out["reward"] = out["reward"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
+                    out["shaping"] = out["shaping"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
+                    HE.append(_end.float())
+                if cc_on and bool(out["restarted"].any()):         # a new episode: a new c
+                    pr.cond = torch.where(out["restarted"], cc_draw(Bl), pr.cond)
+                    obs.cond = pr.cond.log()
+                if term_on:
+                    TSR["lap"].append(out["lap"] + out["shaping"]); TSR["con"].append(out["contact"] + out["plan_hit_price"])
                 if car_on:
                     # the plan just driven, its 10 points (pose, world velocity) after our car at the decision; distance to go
                     if car_kofs is None:
@@ -2831,6 +3035,8 @@ def main(argv=None):
                             aux_prev_pos[g_l] = Dd["aux_prev_pos"][i_l]
                         if two:
                             obs.prev_branch[g_l] = Dd["pol_branch"][i_l]
+                        if intent_on:                            # the intent it held then, with what was left of the hold
+                            obs.intent_z[g_l] = Dd["pol_intent_z"][i_l]; obs.intent_left[g_l] = Dd["pol_intent_left"][i_l]
                         if hold:                                 # a scene starts with a plan of its own
                             hold_left[g_l] = 0
                         if roll_on:
@@ -2976,6 +3182,8 @@ def main(argv=None):
                 cc_ = {k_: torch.cat(v_, 1) for k_, v_ in cc_.items()}
                 mr_ = {k_: torch.cat(v_, 1) for k_, v_ in mr_.items()}
                 car_cost = pr.contact_scale * args.plan_car_cost * cc_["price"] / T_REF                          # (T, Bl) [laps]
+                if cc_on:                                                    # (11-26) --contact-cond: each decision's c
+                    car_cost = car_cost * torch.stack(CCV)
                 if pg_on:
                     # (11-25) --plan-grad-cost's record, flat like the update's batch (t Bl + b): the other car at every plan
                     # point's time and the one before, which points are compared (prefix, knowable), our car at the decision
@@ -3041,14 +3249,17 @@ def main(argv=None):
         if car_cost is not None:
             R_ = R_ - car_cost
         adv = torch.zeros_like(R_); gae = torch.zeros(Bl, device=dev)
+        E_ = torch.stack(HE) if hce_on else None               # (11-26) --hard-contact-ends: done, terminal value 0
         for t in reversed(range(T)):
             v_next = v_last if t == T - 1 else V_[t + 1]
             v_next = torch.where(D_[t] > 0, V_[t], v_next)
+            if E_ is not None:
+                v_next = torch.where(E_[t] > 0, torch.zeros_like(v_next), v_next)
             delta = R_[t] + args.gamma * v_next - V_[t]
             # inside a held plan the trace runs on undiscounted by lambda: a plan's advantage is all it drove, then
             # lambda from the next plan on
             lam_t = args.lam if t == T - 1 else torch.where(FM_[t + 1] > 0, torch.full_like(gae, args.lam), torch.ones_like(gae))
-            gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
+            gae = delta + args.gamma * lam_t * (1.0 - (D_[t] if E_ is None else torch.maximum(D_[t], E_[t]))) * gae
             adv[t] = gae
         ret = adv + V_
         cm_log = {}
@@ -3185,7 +3396,9 @@ def main(argv=None):
                 if line_on:
                     with torch.no_grad():
                         aux_box["fc0"] = actor.features(bX[sel], lvl0(bS[sel]))
-                return heads_on(actor.features(bX[sel], bS[sel]), sel)
+                f_ = actor.features(bX[sel], bS[sel])
+                aux_box["a1"] = actor.trunk_a1 if intent_on else None    # (11-26) --intent-trunk: the plan under z runs from it
+                return heads_on(f_, sel)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
             h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.mem_cell, *prev_mem, sel[0] % Bl, bHM[sel[0]])
@@ -3206,6 +3419,7 @@ def main(argv=None):
                 pin_ = bPIN[mb_]                                   # (11-25) stored: the rollout's, not the moved head's
             pc_ = bPCL[mb_] if pc_on else None                 # (11-25) stored: the head moves during the update, the input must not
             fc = (actor.mem_trunk(fflat_, hcat_, pin_, pc_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            aux_box["a1"] = actor.trunk_a1 if intent_on else None        # (11-26) --intent-trunk: the plan under z runs from it
             if pred_on and drift_box["on"] and not two:
                 # (11-25) what the update read before 11-25 -- the prediction made again by the head as it is now, on the
                 # memory as it is now -- against the stored one: the inputs' gap and the log-probability's (same weights)
@@ -3214,8 +3428,14 @@ def main(argv=None):
                     pfd.append(float((rec_ - pin_).abs().mean())); pfd_p.append(float((rec_[:, 0] - pin_[:, 0]).abs().mean()))
                     ls_ = torch.maximum(actor.log_std, actor.log_std_floor).expand(mb_.numel(), -1)
                     fu_ = bFULL[mb_] if roll_on else None
-                    dl_ = (lp_scored(bU[mb_], actor.pi(actor.mem_trunk(fflat_, hcat_, rec_, pc_)), ls_, fu_)
-                           - lp_scored(bU[mb_], actor.pi(fc), ls_, fu_)).abs()
+                    fr_ = actor.mem_trunk(fflat_, hcat_, rec_, pc_); a1r_ = actor.trunk_a1
+                    if intent_on:
+                        m_rec_ = actor.intent_mean(actor.pi(fr_), bZI[mb_], a1=a1r_)
+                        m_fc_ = actor.intent_mean(actor.pi(fc), bZI[mb_], a1=aux_box["a1"])
+                    else:
+                        m_rec_, m_fc_ = actor.pi(fr_), actor.pi(fc)
+                    dl_ = (lp_scored(bU[mb_], m_rec_, ls_, fu_) - lp_scored(bU[mb_], m_fc_, ls_, fu_)).abs()
+                    del fr_, a1r_, m_rec_, m_fc_
                     pdl.append(float(dl_.mean())); pdl90.append(float(torch.quantile(dl_.float(), 0.9)))
                     pdlc.append(float((dl_ > math.log(1.0 + args.clip)).float().mean()))
                     del rec_, ls_, dl_
@@ -3298,6 +3518,8 @@ def main(argv=None):
             bBR = torch.cat(BR)
         if pace_on:
             bPD, bPI, bCAP = torch.cat(PD), torch.cat(PI), torch.cat(CAPL)
+        if intent_on:
+            bZD, bZI = torch.cat(ZD), torch.cat(ZI)
         if roll_on:
             bFULL = torch.cat(FULL)
         if known_on:
@@ -3408,6 +3630,32 @@ def main(argv=None):
                           "pg_near_wall_all": acc_["near_wall_all"] / nn_pg, "pg_near_box_all": acc_["near_box_all"] / nn_pg,
                           **{f"pg_{a_}_{k_}": acc_[f"{a_}_{k_}"] / nn_pg for a_ in ("cost", "near", "hard") for k_ in ("car", "wall", "box")}}
             pg_meas = collections.defaultdict(list)                    # this update's measured minibatches
+        if term_on:
+            # (11-26) --term-split: warm-up rollouts only leave the memory prefix (--mem-prev) for the next; the last is measured
+            if upd < args.updates:
+                if args.mem_prev > 0:
+                    K_ = min(args.mem_prev, T)
+                    idx_ = torch.arange((T - K_) * Bl, T * Bl, device=dev)
+                    with torch.no_grad():
+                        pF_ = torch.cat([actor.features(bX[c_], bS[c_]).half() for c_ in idx_.split(8192)]).view(K_, Bl, -1)
+                    prev_mem = (pF_, bHM[idx_].view(K_, Bl, -1).clone(), D_[T - K_:].clone())
+                print(f"[plan_rl] --term-split: warm-up rollout {upd - args.update_offset} ({t_roll:.0f} s)", flush=True)
+                S.clear(); X.clear()
+                bS = bX = bPV = bU = bVT = bLP = bA = bR = bV = bFM = None
+                torch.cuda.empty_cache()
+                continue
+            from . import term_split as TS
+            with torch.no_grad():
+                R_con_ = torch.stack(TSR["con"]) - (car_cost if car_cost is not None else 0.0)
+                last_in_ = (obs.scans, obs.state(), priv_h())
+            S.clear(); X.clear()
+            TS.measure(actor=actor, critic=critic, pol_params=pol_params, batches=batches, actor_on=actor_on, lp_scored=lp_scored,
+                       bX=bX, bS=bS, bPV=bPV, bU=bU, bFM=bFM, bA=bA, V_ckpt=V_, v_last_ckpt=v_last, R_all=R_,
+                       R_lap=torch.stack(TSR["lap"]), R_con=R_con_, D=D_, FM=FM_, box_ds=torch.stack(TSR["ds"]),
+                       box_live=torch.stack(TSR["live"]), box_pos=torch.stack(TSR["pos"]), last_inputs=last_in_,
+                       gamma=args.gamma, lam=args.lam, steps=args.term_split_steps, out_path=args.term_split,
+                       info={"ckpt": f"{args.init} (update {args.update_offset})", "warm": args.term_split_warm})
+            return
         if args.dump_rollout:
             # the direction this rollout alone would push the actor (no step is made): the policy loss of the first pass
             # (ratio 1, advantage normalised over the whole rollout), its gradient through the steering mean, the speed
@@ -3452,9 +3700,13 @@ def main(argv=None):
             gsum_, gs2_, nb_, bs_ = None, 0.0, 0, 0.0
             for sel in batches():
                 mean, log_std, _, mb, _ = actor_on(sel) if v2 else (*actor(bX[sel], bS[sel]), None, sel, None)
+                if intent_on:                                   # (11-26) the plan under the intent driven
+                    mean = actor.intent_mean(mean, bZI[mb], a1=aux_box.get("a1"))
                 # (11-22) what PPO scores -- under --plan-roll it read all 20 outputs, 18 of them without effect on a rolling
                 # decision: the noise scale of roll29c-e was too high and the auto batch grew on it
                 lp_ = lp_scored(bU[mb], mean, log_std, bFULL[mb] if roll_on else None)
+                if intent_on:
+                    lp_ = lp_ + IN.logp(actor.intent_logits_out, bZI[mb], bZD[mb], iEPS)
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0); a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
                 a_ = (a_ - mu_) / (((a_ - mu_).pow(2) * m_).sum() / n_).sqrt().add(1e-8)
                 g_ = torch.autograd.grad(-(lp_ * a_ * m_).sum() / n_, pr_, allow_unused=True)
@@ -3506,6 +3758,9 @@ def main(argv=None):
                 if v2:
                     mean, log_std, v_hat, mb, f_heads = actor_on(sel)
                     el = (v_hat - bVT[mb]).pow(2).mean()
+                    if intent_on:                              # (11-26) the plan under the intent driven; pi_high's logits
+                        mean = actor.intent_mean(mean, bZI[mb], a1=aux_box.get("a1"))
+                        lg_z = actor.intent_logits_out
                 else:
                     mb = sel
                     mean, log_std = actor(bX[mb], bS[mb])
@@ -3519,6 +3774,8 @@ def main(argv=None):
                 if pace_on:
                     lp = lp + torch.where(bPD[mb], actor.pace_p(actor.pace_logits_out).gather(1, bPI[mb][:, None])[:, 0].log(),
                                           torch.zeros_like(lp))
+                if intent_on:                                  # log pi_high(z | h) at the draws (the mixture scored)
+                    lp = lp + IN.logp(lg_z, bZI[mb], bZD[mb], iEPS)
                 if line_on:
                     # --line-follow: a level's plan ends its offset across the level-0 plan's heading at the 1 s end
                     # the level the plan was drawn under is the one in the state it read: a level picked at a decision enters
@@ -3551,6 +3808,11 @@ def main(argv=None):
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
                 terms_ = {"policy": pl, "vest": args.vest_coef * el}
+                if intent_on and args.intent_ent > 0:
+                    # (11-26) pi_high's entropy at the draws, normalised as the policy loss is (per decision)
+                    ent_z = (IN.entropy(lg_z) * bZD[mb].float() * m_).sum() / n_
+                    loss = loss - args.intent_ent * ent_z
+                    terms_["intent_ent"] = -args.intent_ent * ent_z
                 if line_on:
                     loss = loss + loss_line
                     terms_["line"] = loss_line
@@ -3572,6 +3834,14 @@ def main(argv=None):
                                else f_heads[ok_].detach())     # same values; only tail_alpha of the gradient reaches the trunk
                         tail_mean = (actor.all_heads(fh_)[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
                                      if two else actor.pi(fh_))      # the plan that was driven
+                        if intent_on and aux_box.get("a1") is not None:
+                            # (11-26) --intent-trunk: the trunk run under its intent, the gradient into the shared weights as
+                            # above (tail_alpha / none); its vector learns the forecast
+                            fz_ = actor.trunk_z(aux_box["a1"][ok_], bZI[mb_c])
+                            tail_mean = actor.plan_out(fz_ * tail_alpha + fz_.detach() * (1.0 - tail_alpha) if args.tail_trunk
+                                                       else fz_.detach(), bZI[mb_c])
+                        elif intent_on:                           # (11-26) under its intent (its vector learns the forecast)
+                            tail_mean = actor.intent_mean(tail_mean, bZI[mb_c])
                         a_c = torch.where((gm_all if grow_on else rl_mask)[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
                         pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim, bCAP[mb_c] if pace_on else None)
                         xw_c, yw_c, _ = plan_world(pc_, bST0[mb_c])
@@ -3948,6 +4218,34 @@ def main(argv=None):
             row["roll_full_share"] = float(torch.cat(FULL).float().mean()) if FULL else None
         if pace_on:                                                # --pace-caps: the share of decisions under each level
             row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
+        if intent_on:                                              # (11-26) --intent: this process's ordinary races
+            row.update(iz_st.row(actor.intent_bias))
+            if (args.intent_effect_every > 0 and args.dist_rank == 0
+                    and (upd % args.intent_effect_every == 0 or upd == args.updates)):
+                # what the outer intents make the car drive, against the z-free plan, on a small env of this process's own
+                # (built at the first eval: whole first episodes, the training world's tracks / boxes / opponents); the
+                # training's random streams are put back after it
+                t_ie = time.time()
+                rng_ = (torch.get_rng_state(), torch.cuda.get_rng_state(dev) if dev.type == "cuda" else None)
+                if ie_env is None:
+                    _ns = os.environ.get("F1SIM_NO_STAGGER")
+                    os.environ["F1SIM_NO_STAGGER"] = "1"
+                    try:
+                        ie_env, _, _ = build(args.world, IN.EFFECT_ENVS, args.seed + 4242, dev, overrides=ov, fmt=args.format)
+                    finally:
+                        if _ns is None:
+                            os.environ.pop("F1SIM_NO_STAGGER", None)
+                        else:
+                            os.environ["F1SIM_NO_STAGGER"] = _ns
+                    ie_env.external_skip_unused = True
+                    if args.opp_every > 0:
+                        ie_env.opp_every = int(args.opp_every)
+                actor.eval()
+                row.update(IN.realized_effect(ie_env, lim, actor, IN.EFFECT_S, seed=args.seed + 4242))
+                torch.set_rng_state(rng_[0])
+                if rng_[1] is not None:
+                    torch.cuda.set_rng_state(rng_[1], dev)
+                row["t_intent_eff"] = time.time() - t_ie
         if line_on:                                                # --line-shifts: how far off its offset a level's plan ends
             row["line_err"] = float(torch.tensor(lfs).median()) if lfs else None
             row["line_moved"] = float(torch.tensor(lfd).median()) if lfd else None
@@ -3987,6 +4285,14 @@ def main(argv=None):
             row["roll_c"] = grow_c
         if args.plan_hit_wall_seen:                                 # plan hits not charged: a wall out of view, per decision
             row["plan_wall_hidden_share"] = drv.n_wall_hidden / max(1.0, float(T * Bl)); drv.n_wall_hidden = 0.0
+        if hce_on:                                                  # (11-26) --hard-contact-ends: returns ended (ordinary races)
+            _ne = float(E_[:, ordm].sum())
+            row.update(hard_ends=_ne, hard_ends_per_min=_ne / mins)
+            print(f"[plan_rl] update {upd}: 세게 닿아 끊은 return {_ne:.0f}번 ({_ne / mins:.3f}/분)", flush=True)
+        if cc_on:                                                   # (11-26) --contact-cond: the c the decisions were priced with
+            _cv = torch.stack(CCV)[:, ordm]
+            row.update(contact_cond_gmean=float(_cv.log().mean().exp()), contact_cond_lo=float(_cv.min()),
+                       contact_cond_hi=float(_cv.max()))
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % " + (f"(서 있는 벌점 {row['stall_s_per_min']:.1f} s/분) " if args.stall_s > 0 else "")
@@ -4007,6 +4313,7 @@ def main(argv=None):
               + ("라인 단계 " + " · ".join(f"{float(actor.line_dy[k_]):+g} m {v_ * 100:.0f} %" for k_, v_ in enumerate(row["pace_share"]))
                  + (f" (plan이 옮긴 폭 {row['line_moved']:.2f} m, 어긋남 {row['line_err']:.2f} m)" if row.get("line_err") is not None else "")
                  + " | " if line_on else "")
+              + (IN.log_line(row) if intent_on else "")
               + (f"접촉 직전 장면: 보관 {row['scene_store']}개 (새로 벽 {row['scene_new'][0]} 상자 {row['scene_new'][1]} 차 "
                  f"{row['scene_new'][2]}" + (f" 스침 {row['scene_new'][3]}" if near_on else "") + f"), 장면에서 시작한 결정 {row['scene_share'] * 100:.1f} %, 끝난 {sc_end}판 중 다시 세게 닿음 "
                  f"{sc_end_hit / max(sc_end, 1) * 100:.0f} % | " if scene is not None else "")

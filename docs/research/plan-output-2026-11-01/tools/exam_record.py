@@ -61,13 +61,18 @@ F1SIM_EXAM4_PACES="a,b,c,d" (11-25, 표현 시험용 기록이지 exam4 점수�
 F1SIM_EXAM_SAVE_SCAN=1이면 `_scan.npz`에 결정마다 우리 차의 참 속도·옆속도·회전 속도(ego: vx, vy, r)도 남김 (11-25).
 F1SIM_EXAM_SAVE_BOXVIS=1 (11-25, 상자 기억 시험): 결정마다 상자 칸마다 트랙 따라 앞 거리(plan_rl.box_along, 학습의 벽 기준 거리장 -- 타깃
 정의용이지 입력이 아님)·살아 있음·지금 LiDAR에 보이나(plan_rl.boxes_in_view: 거리·시야각·벽에 안 가림)를 `_boxvis.npz`에 남김.
-F1SIM_EXAM_ALL_BOXES=1 (11-25, line3): 모든 세션에 은행 배치를 차례로 깜 (기본은 리셋 추첨이 상자를 준 절반만)."""
+F1SIM_EXAM_ALL_BOXES=1 (11-25, line3): 모든 세션에 은행 배치를 차례로 깜 (기본은 리셋 추첨이 상자를 준 절반만).
+상자 개수 "tmaze" (11-26, 레이싱 T-미로 시험, RQ3/4/6): world json의 "tmaze" 블록(configs/plan_world_korea26scan_tmaze.json; 다른 세계에서
+배운 checkpoint는 F1SIM_EXAM_WORLD로 그 세계를 줌)의 상자 하나를 세션 i마다 b = i % 3 (0 = L, 1 = R, 2 = 없음) 자리에 깔고 치우지 않음
+-> 세션 192개(환경 384) = b마다 64개. 고정 시드. 결정마다 plan·기억(_mem.npz)·plan 입력(_plan.npz)을 늘 남기고, 기록에 tm_b(세션마다 b),
+tm_L / tm_R(자리), tm_p를 더함. 분석은 tmaze_measure.py.
+plan_rl --contact-cond로 배운 checkpoint: 상태 마지막 입력 log(c), c = F1SIM_CONTACT_COND(없으면 LO·HI의 기하평균); 기록의 cond에 세션마다 c."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
 import numpy as np
 import torch
-sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
+sys.path.insert(0, os.environ.get("F1SIM_SRC", "/home/shchon11/F1tenth_E2E/f1sim"))   # F1SIM_SRC: a worktree's code
 
 EXAM = "exam1"
 BANK = "/home/shchon11/f1sim_runs/prop_banks_exam1"
@@ -206,6 +211,13 @@ if LINE3 and json.load(open(WORLD)).get("solo_world"):
     WORLD = os.path.join(os.path.dirname(WORLD), str(json.load(open(WORLD))["solo_world"]))
     assert os.path.isfile(WORLD), WORLD
 RACE4 = count == "race4"
+# (11-26) the racing T-maze exam: the world's own "tmaze" block, b = session % 3, no removal; plans and memory always saved
+TMAZE = count == "tmaze"
+if TMAZE:
+    TM = json.load(open(WORLD)).get("tmaze")
+    assert TM, f"{WORLD}: no tmaze block (F1SIM_EXAM_WORLD=configs/plan_world_korea26scan_tmaze.json)"
+    EXAM = str(json.load(open(WORLD)).get("exam_name") or "exam_tmaze")
+    SAVE_MEM, SAVE_PLAN = True, True
 if RACE4:
     # (11-24) exam4: the race exam on the world's own map; boxes = the world's line exam bank (exam3's), written per race below
     EXAM = str(json.load(open(WORLD)).get("race_exam") or "exam4")
@@ -232,7 +244,7 @@ if getattr(a, "stage", "race") != "race":
 a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
-a.prop_bank, a.prop_count = BANK, ("fixed" if (LINE3 or RACE4) else count)
+a.prop_bank, a.prop_count = ("" if TMAZE else BANK), ("fixed" if (LINE3 or RACE4 or TMAZE) else count)
 if OPP_SLOT:
     a.opp_slot = OPP_SLOT                                   # merged over the training world's slot (`state_rl.build_env`)
 if mode == "map":
@@ -329,8 +341,13 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
 
 
 obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
+# (11-26) a --contact-cond checkpoint: log(c) as its last state input (F1SIM_CONTACT_COND, else the range's geometric mean)
+from f1sim.learn.plan_policy import contact_cond_log
+obs.cond = contact_cond_log(ck.get("args") or {}, Bl, dev)
 if getattr(actor, "pace_levels", 0):                         # (11-21) a pace policy: its state inputs exist before the first read
     obs.pace_on(actor.pace_levels, actor.pace_hold)
+if getattr(actor, "intent_k", 0):                            # (11-26) an intent policy (argmax at each redraw; F1SIM_INTENT_FIX=k:
+    obs.intent_on(actor.intent_k, actor.intent_hold)         # that intent throughout), its critic's inputs from the first read
 # (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
 # keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or when something
 # out of view (a box: nor passed) when a part was added now blocks the committed path (`plan_rl.roll_blocked`)
@@ -387,7 +404,23 @@ if RACE4:
     _nk = (po.p_sid[rl_] >= 0).sum(1)
     print(f"[exam4] 상자 경주 {int(c_box.sum())}개에 은행 배치 0..{int(c_box.sum()) - 1}: 경주마다 상자 {int(_nk[c_box].min())}-{int(_nk[c_box].max())}개, "
           f"상자 없는 경주 {int((~c_box).sum())}개 (상자 {int(_nk[~c_box].max())}개)", flush=True)
-remover = SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if po is not None else None
+if TMAZE:
+    # every session's box: race i gets b = i % 3 (0 L, 1 R, 2 none), written into every car of the race; never removed
+    G_t = env.B // env.M
+    rl_t = torch.arange(G_t, device=dev) * env.M
+    assert torch.equal(rl_t, lid), "tmaze: the learner is expected in the first seat of every race"
+    tm_b = torch.arange(G_t, device=dev) % 3
+    sid_t = po.b_sid[0, tm_b.clamp_max(1)].clone(); pose_t = po.b_pose[0, tm_b.clamp_max(1)].clone()
+    live_t = (sid_t >= 0) & (tm_b < 2)[:, None]
+    rows_ = torch.cat([rl_t[:, None], env.sim.other_idx[rl_t]], 1) if env.M > 1 else rl_t[:, None]
+    src_ = torch.arange(G_t, device=dev)[:, None].expand_as(rows_)
+    dst_, src_ = rows_.reshape(-1), src_.reshape(-1)
+    po.last_live.index_copy_(0, dst_, torch.zeros(G_t, po.P, dtype=torch.bool, device=dev)[src_])
+    po._write(dst_, src_, pose_t[..., :2], pose_t[..., 2], sid_t.clamp_min(0), live_t, P=po.C, Q=1)
+    _nk = (po.p_sid[rl_t] >= 0).sum(1)
+    print(f"[tmaze] 세션 {G_t}개: L {int((tm_b == 0).sum())} / R {int((tm_b == 1).sum())} / 없음 {int((tm_b == 2).sum())}, 상자 수 "
+          f"{[int(_nk[tm_b == k_].max()) for k_ in range(3)]}, L {TM['L']} R {TM['R']}, 치우지 않음", flush=True)
+remover = (SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if (po is not None and not TMAZE) else None)
 KNOWN = bool(VIRT) or bool(TARGET)
 if KNOWN:
     v_seen = torch.zeros(Bl, po.C, dtype=torch.bool, device=dev)    # passed at least once this session
@@ -777,6 +810,8 @@ for kd in range(T):
         obs.pace_idx[:] = int(LINE_LEVEL)
     if getattr(obs, "pace_idx", None) is not None:              # (11-21) a pace policy: the level in force each decision
         R.setdefault("pace", []).append(obs.pace_idx.to(torch.int8).cpu())
+    if getattr(obs, "intent_z", None) is not None:              # (11-26) an intent policy: the intent each decision drove
+        R.setdefault("intent", []).append(obs.intent_z.to(torch.int8).cpu())
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
@@ -879,8 +914,11 @@ for kd in range(T):
 snap()
 D = {k: torch.stack(v).numpy() for k, v in R.items()}
 trk = env.sim.track
-_bank = sorted(f for f in os.listdir(BANK) if f.endswith(".pt"))
-_sha = hashlib.sha256(b"".join(open(os.path.join(BANK, f), "rb").read() for f in _bank)).hexdigest()[:12]
+_bank = sorted(f for f in os.listdir(BANK) if f.endswith(".pt")) if not TMAZE else []
+_sha = hashlib.sha256(b"".join(open(os.path.join(BANK, f), "rb").read() for f in _bank) if not TMAZE
+                      else json.dumps(TM, sort_keys=True).encode()).hexdigest()[:12]
+if TMAZE:
+    BANK = "tmaze " + json.dumps({k_: TM[k_] for k_ in ("L", "R", "p")})
 D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=trk.t_H.cpu().numpy(), t_W=trk.t_W.cpu().numpy(),
          t_res=trk.t_res.cpu().numpy(), t_origin=trk.t_origin.cpu().numpy(),
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT),
@@ -891,9 +929,15 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0), opp_slot=np.array(OPP_SLOT), start_rest=np.array(REST), half_lap=np.array(HALF))
 if RACE4:
     D.update(R_c, ref=np.array(REF), per=np.array(PER))
+if TMAZE:
+    D.update(tm_b=tm_b.cpu().numpy(), tm_L=np.array(TM["L"], np.float32), tm_R=np.array(TM["R"], np.float32), tm_p=np.array(TM["p"]))
+if obs.cond is not None:                                    # (11-26) --contact-cond: each session's c
+    D["cond"] = obs.cond.exp().float().cpu().numpy()
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
+if getattr(actor, "intent_k", 0):                           # (11-26) argmax at each redraw, or F1SIM_INTENT_FIX's
+    D["intent_fix"] = np.array(os.environ.get("F1SIM_INTENT_FIX", "")); D["intent_hold"] = np.array(actor.intent_hold)
 D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("clear_oracle" if PRED_CLEAR_ORACLE else ("probe" if PRED_PROBE else ("save" if PRED_SAVE else "")))); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)

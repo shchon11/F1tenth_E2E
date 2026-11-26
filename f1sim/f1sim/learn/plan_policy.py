@@ -278,8 +278,12 @@ class PlanRunner:
             self.obs = PlanObs2(env, self.lim, None)
             if getattr(self.actor, "pace_levels", 0):            # its state inputs exist before anything reads the state
                 self.obs.pace_on(self.actor.pace_levels, self.actor.pace_hold)
+            if getattr(self.actor, "intent_k", 0):               # (11-26) an intent policy: argmax at each redraw, held
+                self.obs.intent_on(self.actor.intent_k, self.actor.intent_hold)
             if self.actor.branches == 2:
                 self.obs.prev_branch = torch.zeros(int(self.lid.numel()), device=device)
+            # (11-26) a --contact-cond checkpoint: log(c), c = F1SIM_CONTACT_COND or the training range's geometric mean
+            self.obs.cond = contact_cond_log(ck.get("args") or {}, int(self.lid.numel()), device)
         else:
             self.actor = load_actor(ck, device)
             self.obs = PlanObs(env, self.lim, None)
@@ -482,6 +486,8 @@ class PlanRunner:
                 b_old = self.obs.prev_branch.clone() if self.obs.prev_branch is not None else None
                 pc_old = ((self.obs.pace_idx.clone(), self.obs.pace_left.clone())
                           if getattr(self.obs, "pace_idx", None) is not None else None)
+                iz_old = ((self.obs.intent_z.clone(), self.obs.intent_left.clone())
+                          if getattr(self.obs, "intent_z", None) is not None else None)
                 if self.roll:
                     self._roll_check(due)
                 # what the memory reads this decision (Actor2.features), for the decoder only
@@ -508,6 +514,9 @@ class PlanRunner:
                 if pc_old is not None:                            # the pace level: only deciding rows move on
                     self.obs.pace_idx = torch.where(due, self.obs.pace_idx, pc_old[0])
                     self.obs.pace_left = torch.where(due, self.obs.pace_left, pc_old[1])
+                if iz_old is not None:                            # (11-26) the intent: only deciding rows move on
+                    self.obs.intent_z = torch.where(due, self.obs.intent_z, iz_old[0])
+                    self.obs.intent_left = torch.where(due, self.obs.intent_left, iz_old[1])
                 self.v_hat = v_hat
             else:
                 mean, _ = self.actor(self.obs.scans, self.obs.state())
@@ -806,7 +815,12 @@ class Actor2(nn.Module):
     predicted other car(s), after every other input, zero-weighted at the start. `pc_geom` = (car length, width, margin) [m]
     (the plan-car cost's), kept in the checkpoint (`pc_geom` buffer). `forward` / `remember` then need `prev` = (the previous
     plan's poses at t_1..t_10 (n, 10, 3), whether there is one (n,) bool) -- `PlanObs2.prev_poses()`; the values used are left
-    in `pc_out`."""
+    in `pc_out`.
+    `intent` = "K,H,EPS" (11-26, plan_rl --intent; `plan_intent` has the why): a held intent z in 0..K-1 -- `intent_head` gives
+    pi_high's logits from the trunk's features (`intent_logits_out`, set by `heads`), `intent_bias` (K, 20) is each intent's
+    vector on the plan head's pre-tanh outputs (`intent_mean`). `forward` returns the plan WITHOUT the intent: the caller draws
+    or holds z (`plan_intent.step`; `plan_v2` does it with `PlanObs2.intent_z` / `intent_left`) and adds its vector. The
+    memory and the speed estimate do not read z; with `intent_trunk` the trunk does (`intent_mean` runs it under z)."""
 
     GAP0 = 0.5                # the gap between the two plans' first-step turn at the start (the action before its tanh)
     AUX_IN_SLOTS, AUX_IN_KEYS = 3, 4     # `aux_in`: the read-out's boxes (present, dx/5, dy/5, distance/5 along the track)
@@ -815,7 +829,8 @@ class Actor2(nn.Module):
                  aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
                  mem_keep_log: bool = False, branches: int = 1, box_memory: int = 0, aux_in: bool = False,
                  pace_caps: str = "", pace_hold: int = 10, pace_floor: float = 0.05, line_shifts: str = "",
-                 pred_opp: bool = False, pred_smooth: bool = False, pred_kin=None, pred_clear: bool = False, pc_geom=None):
+                 pred_opp: bool = False, pred_smooth: bool = False, pred_kin=None, pred_clear: bool = False, pc_geom=None,
+                 intent: str = "", intent_trunk: bool = False):
         super().__init__()
         self.branches = int(branches)
         # (11-21 redesign, the user "ㄱㄱ": speed only, a level every 1 s, absolute caps, a floor per level) the pace: every
@@ -919,11 +934,71 @@ class Actor2(nn.Module):
                 self.keep_init(float(mem_keep_s), bool(mem_keep_log))
         self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
         self.h_out = None
+        # (11-26, plan_rl --intent K,H,EPS; `plan_intent`) a held intent: pi_high(z | h) from the trunk's features and a
+        # per-intent vector on the plan head's 20 outputs. Made last (an actor without it draws its random start exactly as
+        # before); the head starts at zero (every intent as likely), the vectors at zero until `intent_init` lays them out
+        self.intent_k, self.intent_hold, self.intent_eps = 0, 0, 0.0
+        self.intent_logits_out = None
+        # (11-26, the coordinator's decision on the measurement that a vector the policy does not know about is 85-93 % undone
+        # by its own closed loop) `intent_trunk`: the trunk also reads z (one-hot) -- its first layer's columns for z
+        # (`intent_in`, K x hidden, zero at the start: the plan is the table's alone until PPO moves them), so the control law
+        # itself is z-conditioned and z moves its setpoint. pi_high's logits and the speed estimate stay z-free: they read the
+        # trunk run without z (`heads`); the plan under z runs the trunk's two layers again from the first layer's
+        # pre-activation (`trunk_a1`, kept by every trunk run) plus z's column (`trunk_z`). The memory reads no z
+        self.intent_trunk = False
+        self.trunk_a1 = None
+        if intent:
+            from .plan_intent import parse
+            if self.branches != 1 or self.pace_levels:
+                raise ValueError("intent: one plan, no pace / line levels")
+            self.intent_k, self.intent_hold, self.intent_eps = parse(intent)
+            self.intent_head = nn.Linear(hidden, self.intent_k)
+            nn.init.zeros_(self.intent_head.weight); nn.init.zeros_(self.intent_head.bias)
+            self.intent_bias = nn.Parameter(torch.zeros(self.intent_k, PS.ACT_DIM))
+            if intent_trunk:
+                if self.memory and not self.mem_front:
+                    raise ValueError("intent_trunk: a memory actor with mem_front (the memory added after the trunk is not in "
+                                     "the trunk's input)")
+                self.intent_trunk = True
+                self.intent_in = nn.Parameter(torch.zeros(self.intent_k, hidden))
+
+    def intent_init(self, lim: PS.Limits, lat: float) -> None:
+        """the intents' start (`plan_intent.init_bias`): intent k's 1 s plan point linspace(-lat, lat, K)[k] m to the side"""
+        from .plan_intent import init_bias
+        with torch.no_grad():
+            self.intent_bias.copy_(init_bias(lim, self.intent_k, lat, device=self.intent_bias.device))
+
+    def run_trunk(self, x: torch.Tensor) -> torch.Tensor:
+        """the trunk on its z-free input `x`; with `intent_trunk` its first layer's pre-activation is kept (`trunk_a1`) for the
+        plan under z -- the same numbers as `self.trunk(x)`"""
+        if not self.intent_trunk:
+            return self.trunk(x)
+        a1 = self.trunk[0](x)
+        self.trunk_a1 = a1
+        return self.trunk[3](self.trunk[2](self.trunk[1](a1)))
+
+    def trunk_z(self, a1: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """`intent_trunk`: the trunk's features under intent z (B,) from its first layer's z-free pre-activation a1 (B, hidden)"""
+        return self.trunk[3](self.trunk[2](self.trunk[1](a1 + self.intent_in[z.long()].to(a1.dtype))))
+
+    def plan_out(self, f: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """the plan head on features `f` under intent z: + that intent's vector"""
+        m = self.pi(f)
+        return m + self.intent_bias[z.long()].to(m.dtype)
+
+    def intent_mean(self, mean: Optional[torch.Tensor], z: torch.Tensor, a1: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """the plan head's outputs (B, 20) under intent z (B,): the z-free `mean` + that intent's vector; with `intent_trunk`
+        the plan head on the trunk run under z (from `a1`, default the last trunk run's `trunk_a1`) + the vector -- the z-free
+        `mean` is then not read. The gradient reaches the table (and `intent_in`)"""
+        if self.intent_trunk:
+            a1 = self.trunk_a1 if a1 is None else a1
+            return self.plan_out(self.trunk_z(a1, z), z)
+        return mean + self.intent_bias[z.long()].to(mean.dtype)
 
     def features(self, scans: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         """what the memory reads: the trunk's output, or with `mem_front` the trunk's inputs (`remember` runs the trunk)"""
         x = torch.cat([self.enc(scans), self.norm(state)], 1)
-        return x if self.mem_front else self.trunk(x)
+        return x if self.mem_front else self.run_trunk(x)
 
     def heads(self, f: torch.Tensor):
         if self.branches == 2:
@@ -934,6 +1009,8 @@ class Actor2(nn.Module):
         log_std = torch.maximum(self.log_std, self.log_std_floor)
         if self.pace_levels:
             self.pace_logits_out = self.pace_head(f)
+        if self.intent_k:                                    # pi_high's logits; the mean returned is without the intent
+            self.intent_logits_out = self.intent_head(f)     # (the caller picks z and adds `intent_mean`)
         return self.pi(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
 
     def pace_p(self, logits: torch.Tensor) -> torch.Tensor:
@@ -994,7 +1071,7 @@ class Actor2(nn.Module):
             if pc is None:
                 raise ValueError("a pred_clear actor's trunk reads the plan clearances: pass pc (clear_in(...))")
             x = x + [pc.to(f.dtype)]
-        return self.trunk(torch.cat(x, 1))
+        return self.run_trunk(torch.cat(x, 1))
 
     @torch.no_grad()
     def clear_in(self, q: torch.Tensor, prev, psi: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1110,6 +1187,14 @@ class PlanObs2(PlanObs):
         # input. A new episode picks at once (left 0, level 0 = no cap until then)
         self.pace_idx = self.pace_left = None
         self.pace_k = 0
+        # (11-26, plan_rl --contact-cond) log(c) of the contact weight each row's episode is priced with (B_l,): the state's
+        # last input. None = no such input (every policy without --contact-cond)
+        self.cond = None
+        # (11-26) an intent actor (`Actor2.intent_k`, `plan_intent`): the intent in force (B_l,) long and the decisions it still
+        # holds after the next one; None = none. A start / restart draws at once (left 0). Not a policy input: the critic's
+        # (`intent_priv`)
+        self.intent_z = self.intent_left = None
+        self.intent_k = self.intent_hold = 0
         super().__init__(env, lim, goal, rows)
 
     def pace_on(self, levels: int, hold: int) -> None:
@@ -1117,6 +1202,19 @@ class PlanObs2(PlanObs):
         self.pace_k, self.pace_hold = int(levels), int(hold)
         self.pace_idx = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
         self.pace_left = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
+
+    def intent_on(self, k: int, hold: int) -> None:
+        Bl = self.rel.shape[0]
+        self.intent_k, self.intent_hold = int(k), int(hold)
+        self.intent_z = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
+        self.intent_left = torch.zeros(Bl, dtype=torch.long, device=self.rel.device)
+
+    def intent_priv(self) -> torch.Tensor:
+        """(B_l, K + 1) the critic's intent inputs before this decision's draw: the held z one-hot (zeros when it runs out
+        now -- the next z is this decision's action) and the share of its hold left"""
+        held = (self.intent_left > 0).float()[:, None]
+        return torch.cat([nn.functional.one_hot(self.intent_z, self.intent_k).float() * held,
+                          (self.intent_left.float() / float(self.intent_hold))[:, None]], 1)
 
     def reset_rows(self, rows: torch.Tensor) -> None:
         super().reset_rows(rows)
@@ -1130,6 +1228,8 @@ class PlanObs2(PlanObs):
             self.prev_branch[rows] = 0.0
         if self.pace_idx is not None:
             self.pace_idx[rows] = 0; self.pace_left[rows] = 0
+        if getattr(self, "intent_z", None) is not None:              # a new episode draws its intent at once
+            self.intent_z[rows] = 0; self.intent_left[rows] = 0
 
     def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
         """the plan just drawn (`plan_steps.roll`, in the frame it was drawn from): kept in its own 0.1 s pose's frame"""
@@ -1169,12 +1269,28 @@ class PlanObs2(PlanObs):
         if self.pace_idx is not None:                               # the level in force and the share of its hold left
             s = torch.cat([s, nn.functional.one_hot(self.pace_idx, self.pace_k).to(s.dtype),
                            (self.pace_left.to(s.dtype) / float(self.pace_hold))[:, None]], 1)
+        if self.cond is not None:                                   # (11-26) --contact-cond: log(c), last
+            s = torch.cat([s, self.cond.to(s.dtype)[:, None]], 1)
         return s
 
     def priv(self) -> torch.Tensor:
-        """v1's critic extras and the true speed / steering (training only)"""
+        """v1's critic extras and the true speed / steering (training only); an intent policy's intent last"""
         st = self.env.sim.state[self.lid]
-        return torch.cat([super().priv(), st[:, dyn.IVX:dyn.IVX + 1].float(), st[:, dyn.ISTEER:dyn.ISTEER + 1].float()], 1)
+        pv = torch.cat([super().priv(), st[:, dyn.IVX:dyn.IVX + 1].float(), st[:, dyn.ISTEER:dyn.ISTEER + 1].float()], 1)
+        return pv if getattr(self, "intent_z", None) is None else torch.cat([pv, self.intent_priv()], 1)
+
+
+def contact_cond_log(ck_args: dict, n: int, device) -> Optional[torch.Tensor]:
+    """(11-26, plan_rl --contact-cond LO,HI) the state input log(c) (n,) a checkpoint drives with outside training (exam,
+    console): c = F1SIM_CONTACT_COND when set, else the geometric mean of LO and HI. None for a checkpoint without it"""
+    spec = str((ck_args or {}).get("contact_cond") or "")
+    if not spec:
+        return None
+    lo, hi = (float(x) for x in spec.split(","))
+    c = float(os.environ.get("F1SIM_CONTACT_COND") or math.sqrt(lo * hi))
+    if not c > 0:
+        raise ValueError(f"F1SIM_CONTACT_COND: a contact weight > 0, got {c}")
+    return torch.full((int(n),), math.log(c), device=device)
 
 
 def lidar_mount_of(ck: dict) -> float:
@@ -1204,7 +1320,10 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    pred_smooth="pred.kin_k" in ck["actor"],
                    pred_kin=((ck["actor"]["pred.kin_v"], ck["actor"]["pred.kin_k"]) if "pred.kin_k" in ck["actor"] else None),
                    pred_clear="pc_geom" in ck["actor"],
-                   pc_geom=(ck["actor"]["pc_geom"].tolist() if "pc_geom" in ck["actor"] else None)
+                   pc_geom=(ck["actor"]["pc_geom"].tolist() if "pc_geom" in ck["actor"] else None),
+                   # (11-26) --contact-cond: one more state input (log c, last) -- the size the checkpoint's input statistics have
+                   **({"state_dim": int(ck["actor"]["norm.mean"].numel())} if ck["args"].get("contact_cond") else {}),
+                   intent=str(ck["args"].get("intent", "") or ""), intent_trunk="intent_in" in ck["actor"]
                    ).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
@@ -1212,11 +1331,14 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
 
 
 def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, eps: Optional[torch.Tensor] = None,
-            cap: Optional[torch.Tensor] = None):
+            cap: Optional[torch.Tensor] = None, intent_fix: Optional[int] = None):
     """one decision of a v2 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate and the last
     steering command. A memory actor's state is `obs.mem_h` (made here, cleared by `obs.reset_rows`), stepped once per call:
     call once per decision. A two-plan actor (`Actor2.branches`): the plan with the larger logit; `obs.prev_branch` (made
-    here) is the input that says which was chosen last, `actor.means_out` / `logits_out` hold both plans."""
+    here) is the input that says which was chosen last, `actor.means_out` / `logits_out` hold both plans. An intent actor
+    (`Actor2.intent_k`, 11-26): rows whose hold ran out draw the likeliest intent (`sample`: from training's mixture;
+    F1SIM_INTENT_FIX=<k>: that one at every decision; =free: none, the z-free plan), `obs.intent_z` / `intent_left` (made
+    here) hold it, and the plan returned is drawn under it (`mean` includes its vector)."""
     two = getattr(actor, "branches", 1) == 2
     if two and getattr(obs, "prev_branch", None) is None:
         obs.prev_branch = torch.zeros(obs.scans.shape[0], device=obs.scans.device)
@@ -1228,6 +1350,9 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, 
     pace = getattr(actor, "pace_levels", 0)
     if pace and getattr(obs, "pace_idx", None) is None:
         obs.pace_on(pace, actor.pace_hold)
+    intent = getattr(actor, "intent_k", 0)
+    if intent and getattr(obs, "intent_z", None) is None:
+        obs.intent_on(intent, actor.intent_hold)
     if getattr(actor, "pred_clear", False):                 # (11-25) the clearances read the last plan
         mean, log_std, v_hat = actor(obs.scans, obs.state(), h, prev=obs.prev_poses())
     else:
@@ -1245,6 +1370,16 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False, 
         cap = pc if cap is None else torch.minimum(cap, pc)
     if two:
         obs.prev_branch = 1.0 - 2.0 * actor.branch_out.float()
+    if intent:
+        # (11-26) the intent: rows whose hold ran out draw again -- the likeliest (sampled from training's mixture with
+        # `sample`; F1SIM_INTENT_FIX=<k>: that one at every decision) -- and hold it; the plan is drawn under it
+        from .plan_intent import step as intent_step, fixed as intent_fixed, FREE
+        fix = intent_fixed() if intent_fix is None else int(intent_fix)      # `intent_fix`: the caller's, over the env var
+        if fix != FREE:                                      # F1SIM_INTENT_FIX=free: the z-free plan (`mean` as it is)
+            obs.intent_z, obs.intent_left, _ = intent_step(actor.intent_logits_out, obs.intent_z, obs.intent_left,
+                                                           actor.intent_hold, actor.intent_eps,
+                                                           "sample" if sample else "argmax", fix)
+            mean = actor.intent_mean(mean, obs.intent_z)
     u = mean + log_std.exp() * (torch.randn_like(mean) if eps is None else eps) if sample else mean      # `eps`: the caller's noise (e.g. held)
     p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim, cap)     # `cap`: a speed cap per row
     return u, mean, log_std, v_hat, p
