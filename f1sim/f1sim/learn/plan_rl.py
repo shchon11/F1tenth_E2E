@@ -866,8 +866,36 @@ def _arg_problem(args) -> str:
         (args.wrong_way_cost < 0, "--wrong-way-cost: K >= 0"),
         (bool(args.wrong_way_ramp) and not args.wrong_way_cost > 0, "--wrong-way-ramp needs --wrong-way-cost"),
         (bool(args.wrong_way_ramp) and ramp_w(1, args.wrong_way_ramp) is None, "--wrong-way-ramp U0,U1 with U0 <= U1"),
+        (_rq_problem(args) != "", _rq_problem(args)),
     )
     return next((why for bad, why in rules if bad), "")
+
+
+def _rq_problem(args) -> str:
+    """(11-26) --contact-cond / --term-split / the T-maze world's refusals ('' = none)"""
+    if args.contact_cond:
+        try:
+            lo, hi = (float(x) for x in args.contact_cond.split(","))
+        except ValueError:
+            return "--contact-cond LO,HI: two numbers"
+        if not 0.0 < lo <= hi:
+            return "--contact-cond LO,HI: 0 < LO <= HI"
+        if args.format != "v2" or args.pace_caps or args.line_shifts or args.self_opp > 0 or args.commit_plan > 0:
+            return "--contact-cond: --format v2, without --pace-caps / --line-shifts / --self-opp / --commit-plan"
+        if args.init:
+            ck = torch.load(args.init, map_location="cpu", weights_only=False)
+            if str((ck.get("args") or {}).get("contact_cond") or "") != args.contact_cond:
+                return "--contact-cond: from scratch (its log(c) input changes the state's size), or from a checkpoint with the same"
+    if args.term_split:
+        if not args.init:
+            return "--term-split measures a checkpoint: give --init (and --init-critic)"
+        if (args.dist_world > 1 or args.branches == 2 or args.pace_caps or args.line_shifts or args.plan_roll or args.roll_grow
+                or args.commit_plan > 0 or args.hold_p > 0 or args.dump_rollout or args.format != "v2"):
+            return ("--term-split: one process, --format v2, without --branches 2 / --pace-caps / --line-shifts / --plan-roll / "
+                    "--roll-grow / --commit-plan / --hold-p / --dump-rollout")
+    if os.path.isfile(args.world) and json.load(open(args.world)).get("tmaze") and args.scene_replay > 0:
+        return "the T-maze world runs without scene replay: --scene-replay 0"
+    return ""
 
 
 def ramp_w(upd: int, spec: str) -> Optional[float]:
@@ -1461,6 +1489,22 @@ def main(argv=None):
                          "along). cp36b (K 0.2 from the first update) stood 64-81 %% of the time at u10-u21 against cp36a's 46-60 %%: a "
                          "fresh policy turns round often, and standing was the safe answer; early on the distance shaping already "
                          "prices going backwards. '' = K from the start")
+    ap.add_argument("--hard-contact-ends", action="store_true",
+                    help="(11-26, RQ4 'racing T-maze') a hard contact (impact >= contact_severity.HARD_MPS, the exam tables' "
+                         "'세게 닿음'; a car's only when the reward charges it) ends the return: done with terminal value 0 for "
+                         "GAE (the shaping's next potential left out, so it stays exact per segment). The car drives on from "
+                         "there as the start of a new return segment; the env is not restarted and the memory is NOT reset")
+    ap.add_argument("--contact-cond", default="",
+                    help="LO,HI (11-26, RQ3/4): every episode draws c ~ LogUniform[LO, HI]; every contact cost (contacts, the "
+                         "plan-hit price, the plan-car cost) is multiplied by c and log(c) is the state's last input (actor "
+                         "trunk and memory, critic), from scratch. Exam / console: F1SIM_CONTACT_COND=c, default sqrt(LO HI)")
+    ap.add_argument("--term-split", default="",
+                    help="OUT.txt (11-26, RQ2; measurement only, with --init): one rollout of the normal size after "
+                         "--term-split-warm warm-up rollouts, NO update -- the reward split into its lap and contact terms, a "
+                         "value function fitted per term, the policy gradient of each over the update's minibatches "
+                         "(`term_split.measure`): norms, cosine, agreement, noise scale, the share near box passes")
+    ap.add_argument("--term-split-warm", type=int, default=1, help="--term-split: rollouts driven (not measured) first")
+    ap.add_argument("--term-split-steps", type=int, default=400, help="--term-split: Adam steps per value function")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -1562,6 +1606,11 @@ def main(argv=None):
         raise SystemExit(0)
     if args.contact_scale is None:                 # the map's own contact weight (11-15: one world json per map carries it)
         args.contact_scale = float(json.load(open(args.world)).get("contact_scale", 1.0))
+    _why_rq = _rq_problem(args)                    # (11-26) --contact-cond / --term-split / the T-maze world
+    if _why_rq:
+        raise SystemExit(_why_rq)
+    if args.term_split:                            # the warm-up rollouts, then the measured one; no update is ever made
+        args.updates = args.update_offset + max(0, args.term_split_warm) + 1
     dist = None
     if args.dist_world > 1:
         import datetime
@@ -1662,6 +1711,22 @@ def main(argv=None):
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
+    cc_on = bool(args.contact_cond)                    # (11-26) --contact-cond: c per episode, log(c) the state's last input
+    if cc_on:
+        cc_lo, cc_hi = (math.log(float(x_)) for x_ in args.contact_cond.split(","))
+        cc_gen = torch.Generator(device=dev); cc_gen.manual_seed(args.seed + 4241)
+        cc_draw = lambda n_: torch.exp(cc_lo + (cc_hi - cc_lo) * torch.rand(n_, device=dev, generator=cc_gen))
+        pr.cond = cc_draw(Bl)
+        obs.cond = pr.cond.log()
+        print(f"[plan_rl] 접촉 비용 조건(--contact-cond): 판마다 c ~ LogUniform[{args.contact_cond}], 모든 접촉 비용 x c, log(c)를 "
+              f"상태 마지막 입력으로 (처음부터)", flush=True)
+    hce_on = bool(args.hard_contact_ends)              # (11-26) --hard-contact-ends: a hard contact ends the return
+    if hce_on:
+        print("[plan_rl] 세게 닿으면 return 끝(--hard-contact-ends): GAE는 끝값 0, 차는 그 자리에서 계속, 기억 유지, env 다시 시작 안 함",
+              flush=True)
+    term_on = bool(args.term_split)                    # (11-26) --term-split: RQ2's measurement, no update
+    if term_on and env.procedural is None:
+        raise SystemExit("--term-split: the box passes need a world with boxes")
     two = args.branches == 2
     if two:
         if not v2 or v3 or args.tail_consistency <= 0 or args.hold_p > 0 or args.self_opp > 0 or args.init:
@@ -1959,6 +2024,7 @@ def main(argv=None):
     aux_opp = aux_on and args.aux_opp > 0
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
+                    **({"state_dim": int(obs.state().shape[1])} if cc_on else {}),     # (11-26) --contact-cond: log(c) last
                     mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
                     mem_keep_log=args.mem_keep_log, branches=args.branches, box_memory=args.box_memory,
                     aux_in=args.mem_aux_in, pace_caps=args.pace_caps, pace_hold=args.pace_hold,
@@ -2351,6 +2417,8 @@ def main(argv=None):
         DMP = {k: [] for k in ("mean", "d_samp", "d_mean", "hard", "contact", "lap", "shaping", "pose", "std")}   # --dump-rollout
         n_removed = 0
         n_restarted = 0
+        HE, CCV = [], []                                       # (11-26) the decisions a hard contact ended / each decision's c
+        TSR = {k_: [] for k_ in ("lap", "con", "ds", "live", "pos")} if term_on else None     # --term-split's record
         near_sum = torch.zeros(Bl, device=dev)
         hb_wall = torch.zeros(Bl, device=dev); hb_box = torch.zeros(Bl, device=dev)   # --hold-new-block: plans ended early
         vest_err = []
@@ -2699,9 +2767,31 @@ def main(argv=None):
                         CQ["op_rem"].append(pr.goal.remaining(o_xy, _tid)); CQ["op_ok"].append(o_ok.clone())
                         CQ["know"].append(o_ok & ((o_xy - st_me[:, :2]).norm(dim=1) <= args.pred_range) & (pr.seen_t <= SEEN_S))
                         CQ["pace"].append(pace_t)
+                if hce_on:                                         # (11-26) --hard-contact-ends: the hard counts before
+                    hce0 = env.sim.contact_counts[lid, 3:6].clone()
+                if cc_on:
+                    CCV.append(pr.cond.clone())
+                if term_on:                                        # (11-26) --term-split: every box slot along the track now
+                    _ds_t, _lv_t, _ps_t = box_along(env, pr.goal, lid)
+                    TSR["ds"].append(_ds_t.half()); TSR["live"].append(_lv_t); TSR["pos"].append(_ps_t.half())
                 out, p, (xw_, yw_, pw_) = drv.decision(torch.tanh(u), p, charge=newp if hold else None,
                                                        charge_from=roll_cf if roll_on else None, charge_to=roll_ct if roll_on else None,
                                                        opp_planned=pc_orc)
+                if hce_on:
+                    # a hard contact in this decision (a car's only if the reward charges it, as the scenes count them) ends the
+                    # return: the potential after it is left out of the shaping (terminal Phi = 0 -- exact per segment); the
+                    # next decision starts a new segment from Phi there
+                    _hd = (env.sim.contact_counts[lid, 3:6] - hce0).clamp_min(0).float()
+                    _hd[:, 2] = _hd[:, 2] * ((out["car_charged"] > 0) if args.car_fault else (pr.seen_t <= SEEN_S + PS.DT)).float()
+                    _end = (_hd.sum(1) > 0) & ~out["restarted"]
+                    out["reward"] = out["reward"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
+                    out["shaping"] = out["shaping"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
+                    HE.append(_end.float())
+                if cc_on and bool(out["restarted"].any()):         # a new episode: a new c
+                    pr.cond = torch.where(out["restarted"], cc_draw(Bl), pr.cond)
+                    obs.cond = pr.cond.log()
+                if term_on:
+                    TSR["lap"].append(out["lap"] + out["shaping"]); TSR["con"].append(out["contact"] + out["plan_hit_price"])
                 if car_on:
                     # the plan just driven, its 10 points (pose, world velocity) after our car at the decision; distance to go
                     if car_kofs is None:
@@ -2965,6 +3055,8 @@ def main(argv=None):
                 cc_ = {k_: torch.cat(v_, 1) for k_, v_ in cc_.items()}
                 mr_ = {k_: torch.cat(v_, 1) for k_, v_ in mr_.items()}
                 car_cost = pr.contact_scale * args.plan_car_cost * cc_["price"] / T_REF                          # (T, Bl) [laps]
+                if cc_on:                                                    # (11-26) --contact-cond: each decision's c
+                    car_cost = car_cost * torch.stack(CCV)
                 if pg_on:
                     # (11-25) --plan-grad-cost's record, flat like the update's batch (t Bl + b): the other car at every plan
                     # point's time and the one before, which points are compared (prefix, knowable), our car at the decision
@@ -3030,14 +3122,17 @@ def main(argv=None):
         if car_cost is not None:
             R_ = R_ - car_cost
         adv = torch.zeros_like(R_); gae = torch.zeros(Bl, device=dev)
+        E_ = torch.stack(HE) if hce_on else None               # (11-26) --hard-contact-ends: done, terminal value 0
         for t in reversed(range(T)):
             v_next = v_last if t == T - 1 else V_[t + 1]
             v_next = torch.where(D_[t] > 0, V_[t], v_next)
+            if E_ is not None:
+                v_next = torch.where(E_[t] > 0, torch.zeros_like(v_next), v_next)
             delta = R_[t] + args.gamma * v_next - V_[t]
             # inside a held plan the trace runs on undiscounted by lambda: a plan's advantage is all it drove, then
             # lambda from the next plan on
             lam_t = args.lam if t == T - 1 else torch.where(FM_[t + 1] > 0, torch.full_like(gae, args.lam), torch.ones_like(gae))
-            gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
+            gae = delta + args.gamma * lam_t * (1.0 - (D_[t] if E_ is None else torch.maximum(D_[t], E_[t]))) * gae
             adv[t] = gae
         ret = adv + V_
         cm_log = {}
@@ -3397,6 +3492,32 @@ def main(argv=None):
                           "pg_near_wall_all": acc_["near_wall_all"] / nn_pg, "pg_near_box_all": acc_["near_box_all"] / nn_pg,
                           **{f"pg_{a_}_{k_}": acc_[f"{a_}_{k_}"] / nn_pg for a_ in ("cost", "near", "hard") for k_ in ("car", "wall", "box")}}
             pg_meas = collections.defaultdict(list)                    # this update's measured minibatches
+        if term_on:
+            # (11-26) --term-split: warm-up rollouts only leave the memory prefix (--mem-prev) for the next; the last is measured
+            if upd < args.updates:
+                if args.mem_prev > 0:
+                    K_ = min(args.mem_prev, T)
+                    idx_ = torch.arange((T - K_) * Bl, T * Bl, device=dev)
+                    with torch.no_grad():
+                        pF_ = torch.cat([actor.features(bX[c_], bS[c_]).half() for c_ in idx_.split(8192)]).view(K_, Bl, -1)
+                    prev_mem = (pF_, bHM[idx_].view(K_, Bl, -1).clone(), D_[T - K_:].clone())
+                print(f"[plan_rl] --term-split: warm-up rollout {upd - args.update_offset} ({t_roll:.0f} s)", flush=True)
+                S.clear(); X.clear()
+                bS = bX = bPV = bU = bVT = bLP = bA = bR = bV = bFM = None
+                torch.cuda.empty_cache()
+                continue
+            from . import term_split as TS
+            with torch.no_grad():
+                R_con_ = torch.stack(TSR["con"]) - (car_cost if car_cost is not None else 0.0)
+                last_in_ = (obs.scans, obs.state(), priv_h())
+            S.clear(); X.clear()
+            TS.measure(actor=actor, critic=critic, pol_params=pol_params, batches=batches, actor_on=actor_on, lp_scored=lp_scored,
+                       bX=bX, bS=bS, bPV=bPV, bU=bU, bFM=bFM, bA=bA, V_ckpt=V_, v_last_ckpt=v_last, R_all=R_,
+                       R_lap=torch.stack(TSR["lap"]), R_con=R_con_, D=D_, FM=FM_, box_ds=torch.stack(TSR["ds"]),
+                       box_live=torch.stack(TSR["live"]), box_pos=torch.stack(TSR["pos"]), last_inputs=last_in_,
+                       gamma=args.gamma, lam=args.lam, steps=args.term_split_steps, out_path=args.term_split,
+                       info={"ckpt": f"{args.init} (update {args.update_offset})", "warm": args.term_split_warm})
+            return
         if args.dump_rollout:
             # the direction this rollout alone would push the actor (no step is made): the policy loss of the first pass
             # (ratio 1, advantage normalised over the whole rollout), its gradient through the steering mean, the speed
@@ -3976,6 +4097,14 @@ def main(argv=None):
             row["roll_c"] = grow_c
         if args.plan_hit_wall_seen:                                 # plan hits not charged: a wall out of view, per decision
             row["plan_wall_hidden_share"] = drv.n_wall_hidden / max(1.0, float(T * Bl)); drv.n_wall_hidden = 0.0
+        if hce_on:                                                  # (11-26) --hard-contact-ends: returns ended (ordinary races)
+            _ne = float(E_[:, ordm].sum())
+            row.update(hard_ends=_ne, hard_ends_per_min=_ne / mins)
+            print(f"[plan_rl] update {upd}: 세게 닿아 끊은 return {_ne:.0f}번 ({_ne / mins:.3f}/분)", flush=True)
+        if cc_on:                                                   # (11-26) --contact-cond: the c the decisions were priced with
+            _cv = torch.stack(CCV)[:, ordm]
+            row.update(contact_cond_gmean=float(_cv.log().mean().exp()), contact_cond_lo=float(_cv.min()),
+                       contact_cond_hi=float(_cv.max()))
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % " + (f"(서 있는 벌점 {row['stall_s_per_min']:.1f} s/분) " if args.stall_s > 0 else "")

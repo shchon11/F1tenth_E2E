@@ -280,6 +280,8 @@ class PlanRunner:
                 self.obs.pace_on(self.actor.pace_levels, self.actor.pace_hold)
             if self.actor.branches == 2:
                 self.obs.prev_branch = torch.zeros(int(self.lid.numel()), device=device)
+            # (11-26) a --contact-cond checkpoint: log(c), c = F1SIM_CONTACT_COND or the training range's geometric mean
+            self.obs.cond = contact_cond_log(ck.get("args") or {}, int(self.lid.numel()), device)
         else:
             self.actor = load_actor(ck, device)
             self.obs = PlanObs(env, self.lim, None)
@@ -1109,6 +1111,9 @@ class PlanObs2(PlanObs):
         # input. A new episode picks at once (left 0, level 0 = no cap until then)
         self.pace_idx = self.pace_left = None
         self.pace_k = 0
+        # (11-26, plan_rl --contact-cond) log(c) of the contact weight each row's episode is priced with (B_l,): the state's
+        # last input. None = no such input (every policy without --contact-cond)
+        self.cond = None
         super().__init__(env, lim, goal, rows)
 
     def pace_on(self, levels: int, hold: int) -> None:
@@ -1168,12 +1173,27 @@ class PlanObs2(PlanObs):
         if self.pace_idx is not None:                               # the level in force and the share of its hold left
             s = torch.cat([s, nn.functional.one_hot(self.pace_idx, self.pace_k).to(s.dtype),
                            (self.pace_left.to(s.dtype) / float(self.pace_hold))[:, None]], 1)
+        if self.cond is not None:                                   # (11-26) --contact-cond: log(c), last
+            s = torch.cat([s, self.cond.to(s.dtype)[:, None]], 1)
         return s
 
     def priv(self) -> torch.Tensor:
         """v1's critic extras and the true speed / steering (training only)"""
         st = self.env.sim.state[self.lid]
         return torch.cat([super().priv(), st[:, dyn.IVX:dyn.IVX + 1].float(), st[:, dyn.ISTEER:dyn.ISTEER + 1].float()], 1)
+
+
+def contact_cond_log(ck_args: dict, n: int, device) -> Optional[torch.Tensor]:
+    """(11-26, plan_rl --contact-cond LO,HI) the state input log(c) (n,) a checkpoint drives with outside training (exam,
+    console): c = F1SIM_CONTACT_COND when set, else the geometric mean of LO and HI. None for a checkpoint without it"""
+    spec = str((ck_args or {}).get("contact_cond") or "")
+    if not spec:
+        return None
+    lo, hi = (float(x) for x in spec.split(","))
+    c = float(os.environ.get("F1SIM_CONTACT_COND") or math.sqrt(lo * hi))
+    if not c > 0:
+        raise ValueError(f"F1SIM_CONTACT_COND: a contact weight > 0, got {c}")
+    return torch.full((int(n),), math.log(c), device=device)
 
 
 def lidar_mount_of(ck: dict) -> float:
@@ -1203,7 +1223,9 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
                    pred_smooth="pred.kin_k" in ck["actor"],
                    pred_kin=((ck["actor"]["pred.kin_v"], ck["actor"]["pred.kin_k"]) if "pred.kin_k" in ck["actor"] else None),
                    pred_clear="pc_geom" in ck["actor"],
-                   pc_geom=(ck["actor"]["pc_geom"].tolist() if "pc_geom" in ck["actor"] else None)
+                   pc_geom=(ck["actor"]["pc_geom"].tolist() if "pc_geom" in ck["actor"] else None),
+                   # (11-26) --contact-cond: one more state input (log c, last) -- the size the checkpoint's input statistics have
+                   **({"state_dim": int(ck["actor"]["norm.mean"].numel())} if ck["args"].get("contact_cond") else {})
                    ).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()

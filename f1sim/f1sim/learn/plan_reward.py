@@ -278,6 +278,9 @@ class PlanReward:
         self.plan_known_walls = False
         # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
         self.contact_scale = 1.0
+        #: (11-26, plan_rl --contact-cond) (B_l,) a factor per row on every contact cost (the contacts, the plan-hit price) --
+        #: the episode's c; None = 1 everywhere
+        self.cond = None
         #: (11-21, plan_rl --shaping-fade) the weight of the distance shaping: 1 = as agreed 11-07, 0 = the lap bonus alone
         #: (the user: "왜 그따구로 설계한거지? 랩타임 보상으로 갈아끼우기로 하지않았나" -- the shaping fixed the line on the shortest
         #: path while the car was slow, and PPO never left it)
@@ -377,6 +380,8 @@ class PlanReward:
             if self.ww_on:                                     # pushed by a car: no wrong-way cost for WW_WAIVE_S
                 self.ww_since = torch.where((on[:, 2] > 0) & ~fault, torch.zeros_like(self.ww_since), self.ww_since)
         ck = self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge) / T_REF
+        if self.cond is not None:                              # (11-26) --contact-cond: the episode's c
+            ck = ck * self.cond[:, None]
         self.cost = self.cost + ck.sum(1)
         self.cost_kind[:, :3] += ck
         self.car_charged = self.car_charged + charge[:, 2]
@@ -457,6 +462,8 @@ class PlanReward:
         v_hit = v.gather(1, first[:, None])[:, 0].abs()
         price = torch.where(any_, self.contact_scale * self.plan_hit_share * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF,
                             torch.zeros_like(v_hit))
+        if self.cond is not None:                              # (11-26) --contact-cond: the episode's c
+            price = price * self.cond
         return {"hit": any_, "first": first, "price": price}
 
     def decision(self, pts: torch.Tensor, plan_price: Optional[torch.Tensor] = None,
