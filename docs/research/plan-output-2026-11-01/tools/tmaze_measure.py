@@ -7,6 +7,8 @@
   - 대조: 같은 자리(상자의 트랙 따라 자리 D m 앞)에서 옆 위치·속도 -- L과 R은 처음 보이는 때가 달라(같은 tau = 다른 자리) 시간 맞춤만으로는
     기억이 아닌 차이(제동 구간의 속도 차)가 d에 섞임
   - 세게 닿음은 상자에 다가간 번마다 셈: 통과 + 지나가지 못한 채 세게 닿은 번 (멈춰 선 차)
+  - (11-27, rq5_offpolicy_design.md 5.3) 구간 시간: 상자 자리 20 m 앞 -> 5 m 뒤(같은 에피소드, 지나는 때 보간), 그 구간 벽 세게 닿음, 한 바퀴
+    시간(같은 에피소드의 잇단 통과 사이), b x 1번째 / 2번째 이후. 넛지 시험(tmaze_nudge.py)의 기준 열과 같은 계산
   - I(h; b) [bit]: 처음 보이기 1 s 전 기억 h(_mem.npz의 mem, 그 결정 뒤 상태)에 로지스틱 read-out, 세션 절반으로 배우고 나머지 절반으로 잼
     (H(b) - 교차 엔트로피, 변분 하한). 1번째 / 2번째 이후, 세 갈래(L/R/없음)와 두 갈래(L/R)
 처음 보임 = 상자 중심이 스캔에 직접 보이기 시작한 때 (exam_boxes.py와 같은 규칙: 시야각 135도, 10 m, 벽에 안 가림). 상자 없는 세션은 L·R
@@ -27,6 +29,7 @@ DISTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0)
 # part of the placement could be seen on this approach (`glimpse`): its first pass reads ~0 bit
 H_DISTS = (6.0, 10.0, 14.0, 18.0)
 GLIMPSE_M = 20.0             # [m] how far back along the approach the first glimpse of any part of the boxes is looked for
+SEC_M = (20.0, 5.0)          # [m] (11-27) the section timed around each pass: this far before the box's place -> this far after
 
 
 def seen_any(R, tk, sp, syaw, pts):
@@ -196,6 +199,7 @@ def one(fn):
     W = int(round(3.0 / dt))
     rows = []                                              # one per pass
     mem = None
+    nudge = z["nudge"].astype(bool) if "nudge" in z.files else None      # (11-27) exam_record's F1SIM_EXAM_NUDGE rows
     mf = fn[:-4] + "_mem.npz"
     if os.path.exists(mf):
         mem = np.load(mf)["mem"]                           # (T, B, memory): the state after each decision
@@ -285,8 +289,21 @@ def one(fn):
                         k_seen = k_; break
             hD = {D_: (mem[int(dj[DISTS.index(D_)]), i].astype(np.float32) if (mem is not None and dj[DISTS.index(D_)] >= 0) else None)
                   for D_ in H_DISTS}
+            # (11-27) the section time: the along-track place SEC_M[0] m before the box -> SEC_M[1] m after it (crossing times
+            # interpolated, the same episode), and the wall contacts begun in it (hard / any)
+            tsec, wsec, wsec_any = np.nan, np.nan, np.nan
+            k_ep = int(R.k0[min(t, T - 1), i])
+            j0 = [j for j in range(t, k_ep - 1, -1) if prog[j, i] <= tgt - SEC_M[0] < prog[j + 1, i]]
+            j1 = [j for j in range(t, min(t + 80, T)) if prog[j, i] <= tgt + SEC_M[1] < prog[j + 1, i] and R.k0[j, i] == k_ep]
+            if j0 and j1:
+                f0 = (tgt - SEC_M[0] - prog[j0[0], i]) / max(prog[j0[0] + 1, i] - prog[j0[0], i], 1e-9)
+                f1 = (tgt + SEC_M[1] - prog[j1[0], i]) / max(prog[j1[0] + 1, i] - prog[j1[0], i], 1e-9)
+                tsec = ((j1[0] + f1) - (j0[0] + f0)) * dt
+                wsec = float(R.d[j0[0]:j1[0] + 1, i, 3].sum())
+                wsec_any = float(R.d[j0[0]:j1[0] + 1, i, 0].sum())
+            nud = float(nudge[max(t - 60, k_ep):t + 1, i].any()) if nudge is not None else np.nan
             rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any, hD=hD, glimpse=glimpse, k_seen=k_seen, dj=dj,
-                             off=off_c, v=v_c, offp=offp, doff=doff, dv=dv, h=h))
+                             off=off_c, v=v_c, offp=offp, doff=doff, dv=dv, h=h, tsec=tsec, wsec=wsec, wsec_any=wsec_any, nudged=nud))
     # attempts at the box: every pass, and every hard box hit not followed by a pass within 1 s (the car stopped at the box); the
     # attempt's number = passes before it + 1
     att = {}
@@ -337,6 +354,21 @@ def main():
             for lab, want in (("10 m 앞까지 안 보고 온 첫 번", True), ("그 전에 본 첫 번 (상자를 지나 출발 등)", False)):
                 x = [v_ for (i_, n_), v_ in g["att"].items() if g["b"][i_] == k and n_ == 1 and cl.get(i_, False) == want]
                 print(f"  {NAME_B[k]} {lab}: 세게 닿음 {100 * np.mean(x):5.1f} % ({len(x)})" if x else f"  {NAME_B[k]} {lab}: -")
+        print(f"\n구간 시간 (상자 자리 {SEC_M[0]:g} m 앞 -> {SEC_M[1]:g} m 뒤, 같은 에피소드) [s]: 평균 (표준오차, 수) / 벽 세게 닿음 구간당; 한 바퀴 = 같은 에피소드의 잇단 통과 사이")
+        print(f"{'b':<6}{'1번째':>24}{'2번째 이후':>24}{'벽 hard/구간 (1 / 2+)':>24}{'한 바퀴':>20}")
+        for k in range(3):
+            cell, wl = [], []
+            for f in (P1, P2):
+                x = np.array([r["tsec"] for r in rows if r["b"] == k and f(r)], float); x = x[np.isfinite(x)]
+                w_ = np.array([r["wsec"] for r in rows if r["b"] == k and f(r)], float); w_ = w_[np.isfinite(w_)]
+                cell.append(f"{x.mean():6.3f} ({x.std(ddof=1) / np.sqrt(len(x)):.3f}, {len(x):3d})" if len(x) > 1 else "-")
+                wl.append(f"{w_.mean():.3f}" if len(w_) else "-")
+            lp = []
+            for i_ in sorted({r["sess"] for r in rows if r["b"] == k}):
+                tp = sorted(r["t"] for r in rows if r["sess"] == i_)
+                lp += [(c_ - a_) * R.dt for a_, c_ in zip(tp[:-1], tp[1:]) if R.k0[a_, i_] == R.k0[c_, i_]]
+            lp_s = f"{np.mean(lp):6.3f} ({np.std(lp, ddof=1) / np.sqrt(len(lp)):.3f}, {len(lp)})" if len(lp) > 1 else "-"
+            print(f"{NAME_B[k]:<6}{cell[0]:>24}{cell[1]:>24}{wl[0] + ' / ' + wl[1]:>24}{lp_s:>20}")
         print("\n처음 보이기 tau s 전: 옆 위치(빈 트랙 길에서, 왼쪽 +) 평균 [m] b별, A_exec = |L-R|, d = A/sigma; 속도 A_v, d_v; plan A_plan, d_plan")
         for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
             print(f"  {lab}")

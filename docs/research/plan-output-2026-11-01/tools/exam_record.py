@@ -151,6 +151,17 @@ assert (PRED_ORACLE + PRED_PROBE + PRED_SAVE + PRED_CLEAR_ORACLE) <= 1, \
 # (11-25) the box memory probe: every box slot's along-track distance ahead, live, in view now (boxes_in_view)
 SAVE_BOXVIS = os.environ.get("F1SIM_EXAM_SAVE_BOXVIS", "") == "1"
 ALL_BOXES = os.environ.get("F1SIM_EXAM_ALL_BOXES", "") == "1"   # line3: a bank layout in every session
+# (11-27, RQ5 step 0 "참 기울기" / T-maze v4: the nudge test -- what is anticipation worth?) tmaze only. JSON
+#   {"b": [0, 1, 2] (which sessions' b get the bias), "d": [D_end, D_start] (window: the car's along-track distance to its session's
+#    spot, the walls-only field of the reward / tmaze_measure; none sessions: the middle of L and R), "lat": y [m, left +] (steer onto
+#    the policy's own empty-track line `line` (npy (n, 2), 0.1 m bins, tmaze_measure.ref_line; (n, 4) with the wall distance
+#    along the normal left / right: the shift kept 0.3 m off the walls, eased in / out at <= 0.6 m per m) shifted by y, pure
+#    pursuit on the shifted line, lookahead max(1.5, 0.5 v) m, the steering at most "alat" [m/s^2, default 3] of lateral
+#    acceleration away from the policy's own), "cap": C [m/s] (the plan's speeds capped at C, braking at most a_brake a step)}
+# In the window the policy's own action is changed (its first-step turn re-aimed / its speeds capped) and the plan re-rolled from it,
+# so the car drives -- and the next decision reads -- exactly that plan (as a policy that chose it would). Outside it: untouched.
+# Analysis only (a scripted bias the policy does not know about); the rows in the window go to the record ("nudge").
+NUDGE = json.loads(os.environ.get("F1SIM_EXAM_NUDGE", "") or "{}")
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -420,6 +431,75 @@ if TMAZE:
     _nk = (po.p_sid[rl_t] >= 0).sum(1)
     print(f"[tmaze] 세션 {G_t}개: L {int((tm_b == 0).sum())} / R {int((tm_b == 1).sum())} / 없음 {int((tm_b == 2).sum())}, 상자 수 "
           f"{[int(_nk[tm_b == k_].max()) for k_ in range(3)]}, L {TM['L']} R {TM['R']}, 치우지 않음", flush=True)
+if NUDGE:
+    assert TMAZE, "F1SIM_EXAM_NUDGE: the tmaze exam only"
+    _ctr = lambda v_: np.asarray(v_, float).reshape(-1, 4)[:, :2].mean(0)
+    _sp = np.stack([_ctr(TM["L"]), _ctr(TM["R"]), 0.5 * (_ctr(TM["L"]) + _ctr(TM["R"]))])
+    nd_spot = torch.as_tensor(_sp, dtype=torch.float32, device=dev)[tm_b]                  # (Bl, 2) each session's spot
+    nd_on = torch.as_tensor([int(k_) in [int(q_) for q_ in NUDGE.get("b", [0, 1, 2])] for k_ in tm_b.tolist()], device=dev)
+    nd_d0, nd_d1 = (float(x_) for x_ in NUDGE["d"])
+    nd_lat, nd_cap = float(NUDGE.get("lat", 0.0) or 0.0), float(NUDGE.get("cap", 0.0) or 0.0)
+    ND_ALAT = float(NUDGE.get("alat", 3.0))                 # [m/s^2] the lateral acceleration the bias may add (gentle)
+    assert nd_lat != 0.0 or nd_cap > 0.0, NUDGE
+    if nd_lat != 0.0:
+        _Pa = torch.as_tensor(np.load(NUDGE["line"]), dtype=torch.float32, device=dev)  # (n, 2) the policy's empty-track line
+        _Pl = _Pa[:, :2]
+        _tl = torch.roll(_Pl, -1, 0) - torch.roll(_Pl, 1, 0); _tl = _tl / _tl.norm(dim=1, keepdim=True)
+        _sh = torch.full((_Pl.shape[0],), nd_lat, device=dev)
+        if _Pa.shape[1] >= 4:
+            # (n, 4): + the wall distance along the normal, left / right [m] -> the shift kept 0.3 m (half the car + 0.15) off
+            # the walls (the shifted line never runs into a wall where the line hugs one)
+            _sh = torch.minimum(torch.maximum(_sh, -(_Pa[:, 3] - 0.3).clamp_min(0.0)), (_Pa[:, 2] - 0.3).clamp_min(0.0))
+            # and it changes by at most 0.6 m per m along the line (where a wall cuts the shift, the shifted line eases in and
+            # out instead of jumping): the largest such profile under the bound, a forward and a backward pass, around the lap
+            _m = _sh.abs().cpu().numpy().astype(np.float64); _dm = 0.6 * float((_Pl[1] - _Pl[0]).norm())
+            for _ in range(2):
+                for _i in range(len(_m)):
+                    _m[_i] = min(_m[_i], _m[_i - 1] + _dm)
+                for _i in range(len(_m) - 1, -1, -1):
+                    _m[_i] = min(_m[_i], _m[(_i + 1) % len(_m)] + _dm)
+            _sh = torch.sign(_sh) * torch.as_tensor(_m, dtype=torch.float32, device=dev)
+        nd_path = _Pl + _sh[:, None] * torch.stack([-_tl[:, 1], _tl[:, 0]], 1)          # the shifted line (left of travel +)
+    print(f"[nudge] {NUDGE}: 세션 {int(nd_on.sum())}개에, 자리까지 {nd_d1:g} -> {nd_d0:g} m 동안", flush=True)
+
+    def nudge_plan(u_in, v_hat_in, cmd_d_in):
+        """(rows in the window, the re-rolled plan or None, the action driven (pre-tanh))"""
+        _tid = env.sim.tid[lid]
+        _dc = pr.goal.remaining(env.sim.state[lid, :2].float(), _tid)
+        _db = pr.goal.remaining(nd_spot, _tid)
+        _ah = torch.remainder(_dc - _db, pr.goal.lap[_tid])                 # along the track to the spot ahead [m]
+        win = nd_on & torch.isfinite(_ah) & (_ah >= nd_d0) & (_ah <= nd_d1)
+        if not bool(win.any()):
+            return win, None, u_in
+        a_ = torch.tanh(u_in).clone()
+        if nd_lat != 0.0:
+            st_ = env.sim.state[lid].float()
+            dd = (st_[:, None, :2] - nd_path[None]).norm(dim=-1)                # (Bl, n)
+            j_ = dd.argmin(1)
+            look = (0.5 * st_[:, dyn.IVX].abs()).clamp_min(1.5)
+            jt = (j_ + (look / 0.1).round().long()) % nd_path.shape[0]
+            tx, ty = nd_path[jt, 0] - st_[:, 0], nd_path[jt, 1] - st_[:, 1]
+            alpha = torch.atan2(ty, tx) - st_[:, dyn.IYAW]
+            alpha = torch.remainder(alpha + np.pi, 2 * np.pi) - np.pi
+            ld = torch.sqrt(tx * tx + ty * ty).clamp_min(0.3)
+            d_want = torch.atan(2.0 * lim.wheelbase * torch.sin(alpha) / ld)
+            vs_ = v_hat_in.detach().clamp(-PS.V_REV, PS.V_FWD)
+            # a gentle bias, not a swerve: at most ND_ALAT m/s^2 of lateral acceleration away from the policy's own first-step
+            # steering (an unbounded pure pursuit onto a line 1 m off turned so hard that the tyre limit in `PS.step_targets`
+            # capped the plan's speed to ~4.5 m/s -- a slowdown the bias made, not the policy)
+            d_pol = PS.step_targets(a_, vs_, cmd_d_in, lim)[0][:, 0]
+            dd_max = torch.atan(lim.wheelbase * ND_ALAT / vs_.abs().clamp_min(1.0) ** 2)
+            d_want = d_pol + torch.maximum(torch.minimum(d_want - d_pol, dd_max), -dd_max)
+            # the first step's turn range [lo, hi] (servo rate, grip) as `PS.step_targets` spreads it: a = -1 / +1
+            a_lo, a_hi = a_.clone(), a_.clone(); a_lo[:, 0] = -1.0; a_hi[:, 0] = 1.0
+            d_lo = PS.step_targets(a_lo, vs_, cmd_d_in, lim)[0][:, 0]; d_hi = PS.step_targets(a_hi, vs_, cmd_d_in, lim)[0][:, 0]
+            a0 = 2.0 * (torch.minimum(torch.maximum(d_want, d_lo), d_hi) - d_lo) / (d_hi - d_lo).clamp_min(1e-6) - 1.0
+            a_[:, 0] = torch.where(win, a0.clamp(-0.999999, 0.999999), a_[:, 0])
+        cap_ = None
+        if nd_cap > 0.0:
+            cap_ = torch.where(win, torch.full_like(v_hat_in, nd_cap), torch.full_like(v_hat_in, float("inf")))
+        p_ = PS.roll(a_, v_hat_in.detach().clamp(-PS.V_REV, PS.V_FWD), cmd_d_in, lim, cap_)
+        return win, p_, torch.atanh(a_.clamp(-0.999999, 0.999999))
 remover = (SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if (po is not None and not TMAZE) else None)
 KNOWN = bool(VIRT) or bool(TARGET)
 if KNOWN:
@@ -580,6 +660,8 @@ R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid",
 if RACE4:
     R["cfault"] = []                                        # car contact onsets this decision that the env's rule puts on us
 TWO = getattr(actor, "branches", 1) == 2
+if NUDGE:
+    R["nudge"] = []                                         # (11-27) rows driving the nudged plan this decision
 if TWO:
     # a two-plan policy (11-13): which plan was driven, both logits, and the plan NOT driven (world points, as "pl")
     R["br"] = []; R["logit"] = []; R["pl_other"] = []
@@ -786,6 +868,14 @@ for kd in range(T):
                else torch.zeros(Bl, actor.memory, device=dev))
     u_, mean, _, v_hat, p = (plan_v2(actor, obs, lim, sample=SAMPLE, eps=_eps, cap=_cap) if (_eps is not None or _cap is not None)
                              else plan_v2(actor, obs, lim, sample=SAMPLE))
+    if NUDGE:                                                   # (11-27) the nudge test: the window's rows drive the changed plan
+        _win, _pn, _un = nudge_plan(u_, v_hat, cmd_d0)
+        if _pn is not None:
+            p = {k_: (torch.where(_win.view(-1, *([1] * (v_.dim() - 1))), _pn[k_], v_) if (torch.is_tensor(v_) and v_.dim() >= 1
+                                                                                          and v_.shape[0] == Bl) else v_)
+                 for k_, v_ in p.items()}
+            u_ = torch.where(_win[:, None], _un, u_)
+        R["nudge"].append(_win.cpu())
     if os.environ.get("F1SIM_EXAM_SAVE_ACT") == "1":            # (11-22) every output the policy gave (pre-tanh), driven or not
         R.setdefault("uall", []).append(u_.float().cpu())
     if PRED:                                                    # the head's own answer this decision (computed in either mode)
@@ -931,6 +1021,8 @@ if RACE4:
     D.update(R_c, ref=np.array(REF), per=np.array(PER))
 if TMAZE:
     D.update(tm_b=tm_b.cpu().numpy(), tm_L=np.array(TM["L"], np.float32), tm_R=np.array(TM["R"], np.float32), tm_p=np.array(TM["p"]))
+if NUDGE:
+    D["nudge_cfg"] = np.array(json.dumps(NUDGE, sort_keys=True))
 if obs.cond is not None:                                    # (11-26) --contact-cond: each session's c
     D["cond"] = obs.cond.exp().float().cpu().numpy()
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
