@@ -16,10 +16,17 @@ noise -- white or held -- never makes the 1-2 s manoeuvre a blind box needs (ano
     embedding that enters it (concatenated, or added to the trunk's output) is exactly such a vector. A hidden-size
     embedding added to the trunk output would make the intent's effect W_pi e_z -- tied to the plan head's weights, which
     start at gain 0.01 and move every step; the table is the intent's effect itself, so its start is set in metres and it
-    moves only when PPO (first step) or the tail loss (the forecast) moves it. The trunk, the memory and the speed estimate
-    do not read z; the critic does (`PlanObs2.intent_priv`: z one-hot while held, the share of the hold left) -- z is part
-    of the state the value depends on, and a value blind to it would mix the intents' returns into every held decision's
-    baseline;
+    moves only when PPO (first step) or the tail loss (the forecast) moves it. The critic reads z (`PlanObs2.intent_priv`:
+    z one-hot while held, the share of the hold left) -- z is part of the state the value depends on, and a value blind to
+    it would mix the intents' returns into every held decision's baseline;
+  * (11-26, the coordinator's decision, plan_rl --intent-trunk, default on) the trunk reads z too: measured on scan31b2 u750
+    with the vectors alone (exam3, each intent fixed), the trained closed loop undid 85-93 % of the push -- the outer
+    intents at +-0.3 m drove -2 / +3 cm off its line (+-2 m: -15 / +37 cm, slower, wall touches). A vector the policy does
+    not know about is output noise held still, and RQ3's mechanism takes it back; design (c) needs z to move the setpoint,
+    so the control law itself is z-conditioned: z's one-hot enters the trunk's first layer (`Actor2.intent_in`, zero at the
+    start -- the plan is the vectors' alone until PPO moves it). pi_high's logits and the speed estimate read the trunk run
+    without z, the memory reads no z. `realized_effect` (plan_rl --intent-effect-every) logs what the outer intents make the
+    car drive;
   * the start (`init_bias`): intent k's 1 s plan point lies linspace(-LAT, +LAT, K)[k] m to the side (+ left) of the plan
     the same outputs draw without it, for a fresh net (outputs ~0) at V_REF from straight steering. The shape is the same
     number on all 10 turn outputs: at speed a turn output is the step's steering angle as a share of what the tyres hold
@@ -47,6 +54,7 @@ from .. import plan_steps as PS
 
 V_REF = 5.0               # [m/s] the start speed `init_bias` lays the intents out at (the approach speed before boxes)
 ENV_FIX = "F1SIM_INTENT_FIX"
+FREE = -1                 # F1SIM_INTENT_FIX=free: no intent at all -- the z-free plan (no vector, the trunk without z)
 
 
 def parse(spec: str) -> Optional[Tuple[int, int, float]]:
@@ -82,9 +90,12 @@ def entropy(logits: torch.Tensor) -> torch.Tensor:
 
 
 def fixed() -> Optional[int]:
-    """F1SIM_INTENT_FIX=<k> (exam, console): this intent at every decision, to see what each one does; None = not set"""
-    v = os.environ.get(ENV_FIX, "")
-    return int(v) if v.strip() != "" else None
+    """F1SIM_INTENT_FIX=<k> (exam, console): this intent at every decision, to see what each one does; 'free': FREE, the
+    z-free plan; None = not set"""
+    v = os.environ.get(ENV_FIX, "").strip()
+    if v == "":
+        return None
+    return FREE if v == "free" else int(v)
 
 
 def step(logits: torch.Tensor, z: torch.Tensor, left: torch.Tensor, hold: int, eps: float, mode: str = "sample",
@@ -120,9 +131,13 @@ def arc_shape(device=None) -> torch.Tensor:
 def lat_1s(mean: torch.Tensor, bias: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: PS.Limits) -> torch.Tensor:
     """(K, n) where each intent puts the plan's 1 s point sideways [m, + left, the car's frame at the decision]: the plan
     drawn from `mean` (n, 20, pre-tanh, without the intent) + `bias` (K, 20), from v0 / d0 (n,) -- one roll of K n rows"""
-    K, n = bias.shape[0], mean.shape[0]
-    u = (mean[None, :, :] + bias[:, None, :].to(mean.dtype)).reshape(K * n, -1)
-    p = PS.roll(torch.tanh(u), v0.repeat(K), d0.repeat(K), lim)
+    return lat_of(mean[None, :, :] + bias[:, None, :].to(mean.dtype), v0, d0, lim)
+
+
+def lat_of(means: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: PS.Limits) -> torch.Tensor:
+    """(K, n, 20) plans' pre-tanh outputs at the same n states -> (K, n) their 1 s points sideways [m]"""
+    K, n = means.shape[:2]
+    p = PS.roll(torch.tanh(means.reshape(K * n, -1)), v0.repeat(K), d0.repeat(K), lim)
     return p["y"][:, -1].view(K, n)
 
 
@@ -172,7 +187,8 @@ class IntentStats:
         self.lat = torch.zeros(K, device=device); self.spread = torch.zeros((), device=device); self.n_lat = 0
         self.lim = None
 
-    def decision(self, t: int, z, due, logits, ordm, mean_nom, bias, v0, d0, lim) -> None:
+    def decision(self, t: int, z, due, logits, ordm, mean_of, v0, d0, lim) -> None:
+        """`mean_of(idx, k)`: the plan's outputs (n, 20) at rows idx under intent k (k None: the z-free plan)"""
         zo, do = z[ordm], due[ordm]
         self.n += torch.bincount(zo, minlength=self.K).float()
         self.red += do.float().sum()
@@ -183,14 +199,15 @@ class IntentStats:
             idx = torch.nonzero(ordm)[:, 0]
             idx = idx[:: max(1, idx.numel() // self.rows)][: self.rows]
             if idx.numel():
-                L = lat_1s(mean_nom[idx].detach(), bias.detach(), v0[idx], d0[idx], lim)
-                L0 = lat_1s(mean_nom[idx].detach(), torch.zeros_like(bias[:1]), v0[idx], d0[idx], lim)
+                L = lat_of(torch.stack([mean_of(idx, k).detach() for k in range(self.K)]), v0[idx], d0[idx], lim)
+                L0 = lat_of(mean_of(idx, None).detach()[None], v0[idx], d0[idx], lim)
                 self.lat += (L - L0).mean(1); self.spread += pair_spread(L).mean(); self.n_lat += 1
 
     def row(self, bias: torch.Tensor) -> dict:
         nl = max(1, self.n_lat); red = float(self.red)
         # the table alone, at the start's reference (a zero plan from V_REF, straight): do the intents' vectors still differ --
-        # the same-state numbers above shrink with the cars' speed (a standing car's 1 s point barely moves)
+        # the same-state numbers above shrink with the cars' speed (a standing car's 1 s point barely moves); with the trunk
+        # reading z its share is not in this one (it is in the same-state numbers)
         ref = lat_1s(torch.zeros(1, PS.ACT_DIM, device=bias.device), bias.detach(), torch.full((1,), V_REF, device=bias.device),
                      torch.zeros(1, device=bias.device), self.lim)[:, 0] if self.lim is not None else None
         return {"intent_lat_ref": None if ref is None else [round(float(x), 4) for x in ref],
@@ -211,10 +228,15 @@ def log_line(row: dict) -> str:
     ent_s = "-" if ent is None else f"{ent:.2f}"
     spr_s = "-" if spr is None else f"{spr * 100:.1f}"
     ls = "" if lat is None else " (의도별 " + " / ".join(f"{x * 100:+.0f}" for x in lat) + " cm)"
+    eff = ""
+    if row.get("intent_eff_outer") is not None:
+        eff = (f", 실제 주행(의도 고정, z 없는 길 대비) 0번 {row['intent_eff_k0'] * 100:+.1f} cm / {len(row['intent_share']) - 1}번 "
+               f"{row['intent_eff_kK'] * 100:+.1f} cm, 차이 {row['intent_eff_outer'] * 100:.1f} cm, 속도 "
+               f"{row['intent_eff_speed_k0']:+.2f}/{row['intent_eff_speed_kK']:+.2f} m/s")
     ref = row.get("intent_lat_ref")
     rs = "" if ref is None else f", 5 m/s 기준 의도별 " + " / ".join(f"{x * 100:+.0f}" for x in ref) + " cm"
     return (f"의도: 고른 몫 {sh}, 다시 뽑음 {row['intent_redraws']}번 (가장 큰 확률이 아닌 것 {off_s} %, 엔트로피 {ent_s}), "
-            f"같은 상태에서 의도끼리 1 s 점 옆 차이 {spr_s} cm{ls}{rs} | ")
+            f"같은 상태에서 의도끼리 1 s 점 옆 차이 {spr_s} cm{ls}{rs}{eff} | ")
 
 
 def widen_critic(c_sd: dict, critic: nn.Module) -> Optional[dict]:
@@ -237,4 +259,104 @@ def widen_critic(c_sd: dict, critic: nn.Module) -> Optional[dict]:
             out[k] = torch.cat([s, torch.zeros(s.shape[0], v.shape[1] - s.shape[1], dtype=s.dtype, device=s.device)], 1)
         else:
             return None
+    return out
+
+
+def env_generators(env, depth: int = 4) -> list:
+    """every torch.Generator reachable from `env` through its (and its f1sim parts') attributes, lists and dicts"""
+    seen, out = set(), []
+
+    def walk(o, d):
+        if id(o) in seen or d > depth:
+            return
+        seen.add(id(o))
+        if isinstance(o, torch.Generator):
+            out.append(o)
+            return
+        if isinstance(o, (list, tuple)):
+            for x in o:
+                walk(x, d + 1)
+            return
+        if isinstance(o, dict):
+            for x in o.values():
+                walk(x, d + 1)
+            return
+        if torch.is_tensor(o) or isinstance(o, nn.Module):
+            return
+        mod = getattr(type(o), "__module__", "") or ""
+        if (o is env or mod.startswith("f1sim")) and hasattr(o, "__dict__"):
+            for x in vars(o).values():
+                walk(x, d + 1)
+    walk(env, 0)
+    return out
+
+
+EFFECT_ENVS = 32          # plan_rl --intent-effect-every: the eval's cars (16 races in a two-seat world) and seconds
+EFFECT_S = 10.0
+
+
+@torch.no_grad()
+def realized_effect(env, lim: PS.Limits, actor, seconds: float = EFFECT_S, seed: int = 0, skip_s: float = 2.0) -> dict:
+    """(11-26, the coordinator: log the intent's REALIZED effect) on a small env of its own (`env`, ideal execution as in
+    training): the same start driven three times for `seconds` -- the z-free plan (FREE), the outer intents 0 and K-1 fixed
+    -- and each outer run's line against the z-free run's path, per car and decision after `skip_s`: the signed distance
+    [m, + left of the z-free path's heading] to its nearest point (within 1.5 m). Returns means: 'intent_eff_k0', ..._kK,
+    'intent_eff_outer' (K-1 minus 0), their mean speed against the z-free run [m/s], hard contacts per run, how far apart the
+    three starts were [m], and how many points matched"""
+    from .plan_policy import PlanObs2, plan_v2, plan_world, PT_IDX
+    from .. import dynamics as dyn
+    K = int(actor.intent_k)
+    lid = env.learner_ids
+    dev = env.device
+    T = int(round(seconds / PS.DT)); sk = int(round(skip_s / PS.DT))
+    act0 = torch.zeros(env.B, env.act_dim, device=dev)
+    runs = {}
+    gens = env_generators(env)
+    g0 = [g.get_state() for g in gens]
+    for k in (FREE, 0, K - 1):
+        # the same start each time: every generator the env holds goes back to where it was (whatever a run drew from it),
+        # then the seeded reset
+        for g, s_ in zip(gens, g0):
+            g.set_state(s_)
+        torch.manual_seed(seed)
+        env.reset(seed=seed)
+        obs = PlanObs2(env, lim)
+        st0 = env.sim.state[lid, :3].clone()
+        c0 = env.sim.contact_counts[lid, 3:6].clone()
+        P, V = [], []
+        for _ in range(T):
+            st = env.sim.state[lid].clone()
+            P.append(st[:, :3].float()); V.append(st[:, dyn.IVX].float())
+            _, _, _, _, p = plan_v2(actor, obs, lim, intent_fix=k)
+            env.sim.ideal_vcap[lid] = 1e3
+            rs = torch.zeros(lid.numel(), dtype=torch.bool, device=dev)
+            for j in range(PS.SUB):
+                env.ideal_cmd[lid, 0] = torch.where(rs, torch.zeros_like(p["cmd_d"][:, j]), p["cmd_d"][:, j])
+                env.ideal_cmd[lid, 1] = torch.where(rs, torch.zeros_like(p["cmd_v"][:, j]), p["cmd_v"][:, j])
+                _, _, te, trc, _ = env.step(act0)
+                rs |= (te | trc)[lid]
+            x, y, _ = plan_world(p, st)
+            ii = PT_IDX.to(dev)
+            obs.push_scan(); obs.set_plan(torch.stack([x[:, ii], y[:, ii]], -1), p["pv"]); obs.set_plan2(p)
+            if bool(rs.any()):
+                obs.reset_rows(torch.nonzero(rs)[:, 0])
+        runs[k] = (torch.stack(P), torch.stack(V), st0, float((env.sim.contact_counts[lid, 3:6] - c0).clamp_min(0).sum()))
+    Pf, Vf, sf, hf = runs[FREE]
+    # how far apart the three starts are [m] (the reset puts the cars back exactly; the wheels' and actuators' state carried
+    # from the run before moves them ~2 mm in the reset's one settling step)
+    out = {"intent_eff_start_dx": max(float((runs[k][2][:, :2] - sf[:, :2]).norm(dim=-1).max()) for k in runs),
+           "intent_eff_hard": [hf, runs[0][3], runs[K - 1][3]]}
+    for name, k in (("k0", 0), ("kK", K - 1)):
+        Pk, Vk = runs[k][0], runs[k][1]
+        q, pf, hd = Pk[sk:, :, :2].transpose(0, 1), Pf[sk:, :, :2].transpose(0, 1), Pf[sk:, :, 2].transpose(0, 1)   # (B, T', .)
+        d = torch.cdist(q, pf)                                                                      # (B, T', T')
+        dmin, j = d.min(-1)
+        pj = pf.gather(1, j[..., None].expand(-1, -1, 2)); hj = hd.gather(1, j)
+        lat = -torch.sin(hj) * (q[..., 0] - pj[..., 0]) + torch.cos(hj) * (q[..., 1] - pj[..., 1])
+        ok = dmin < 1.5
+        out[f"intent_eff_{name}"] = float(lat[ok].mean()) if bool(ok.any()) else None
+        out[f"intent_eff_speed_{name}"] = float(Vk[sk:].mean() - Vf[sk:].mean())
+        out[f"intent_eff_n_{name}"] = int(ok.sum())
+    a, b = out["intent_eff_k0"], out["intent_eff_kK"]
+    out["intent_eff_outer"] = (b - a) if a is not None and b is not None else None
     return out

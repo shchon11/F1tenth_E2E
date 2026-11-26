@@ -376,16 +376,18 @@ class SelfOpponents:
     def add(self, actor, tag) -> None:
         """a frozen copy of `actor` joins the pool; a full pool gives up a random one of its older copies"""
         import copy
-        # (11-26) an intent actor keeps the update's last pi_high logits (a tensor in the graph, which deepcopy refuses): not
-        # part of the copy
-        _lg = getattr(actor, "intent_logits_out", None)
-        if _lg is not None:
-            actor.intent_logits_out = None
+        # (11-26) an intent actor keeps the update's last pi_high logits and trunk pre-activation (tensors in the graph, which
+        # deepcopy refuses): not part of the copy
+        _kept = {k_: getattr(actor, k_, None) for k_ in ("intent_logits_out", "trunk_a1")}
+        for k_, v_ in _kept.items():
+            if v_ is not None:
+                setattr(actor, k_, None)
         try:
             a = copy.deepcopy(actor).eval()
         finally:
-            if _lg is not None:
-                actor.intent_logits_out = _lg
+            for k_, v_ in _kept.items():
+                if v_ is not None:
+                    setattr(actor, k_, v_)
         for q in a.parameters():
             q.requires_grad_(False)
         if len(self.pool) < self.max_pool:
@@ -910,6 +912,8 @@ def _intent_problem(args) -> str:
         return "--intent: not with --hold-p / --plan-roll / --roll-grow / --branches 2 / --pace-caps / --line-shifts / --dump-rollout"
     if args.intent_ent < 0 or args.intent_lat < 0:
         return "--intent-ent, --intent-lat: >= 0"
+    if getattr(args, "intent_trunk", False) and args.memory and not args.mem_front:
+        return "--intent-trunk: a memory actor needs --mem-front (or --no-intent-trunk)"
     return ""
 
 
@@ -1553,6 +1557,16 @@ def main(argv=None):
                          "ends linspace(-LAT, LAT, K) m to the side at 1 s, --intent-lat), the critic reads z and the hold left. Its "
                          "log-probability joins the action's at a redraw. Output noise is taken back within ~0.1 s; a held intent "
                          "moves what the plan aims at for H decisions. '' = off (e.g. 4,15,0.1)")
+    ap.add_argument("--intent-trunk", action=argparse.BooleanOptionalAction, default=True,
+                    help="--intent: the trunk also reads z (one-hot; its first layer's columns for it start at zero, so the plan is "
+                         "the vectors' alone until PPO moves them) -- the control law itself z-conditioned (11-26, the "
+                         "coordinator: a vector the policy does not know about was 85-93 %% undone by its own closed loop). "
+                         "pi_high and the speed estimate stay z-free, the memory reads no z. --no-intent-trunk: the vectors only")
+    ap.add_argument("--intent-effect-every", type=int, default=25,
+                    help="--intent: every N updates (and the last) rank 0 drives a small env of its own (32 cars, 10 s, ideal "
+                         "execution, built once) from one start three times -- the z-free plan, the outer intents 0 and K-1 fixed "
+                         "-- and logs how far each outer run's line lies from the z-free path [m] (`plan_intent.realized_effect`; "
+                         "11-26, the coordinator). 0 = off")
     ap.add_argument("--intent-ent", type=float, default=0.01,
                     help="--intent: the entropy bonus on pi_high at the redraws (per decision, as the policy loss is)")
     ap.add_argument("--intent-lat", type=float, default=0.3,
@@ -2026,7 +2040,7 @@ def main(argv=None):
                     pace_floor=args.pace_floor, line_shifts=args.line_shifts, pred_opp=args.pred_opp,
                     pred_smooth=pred_smooth, pred_kin=pred_kin, pred_clear=pc_on,
                     pc_geom=(car_dims[0], car_dims[1], args.plan_car_margin) if pc_on else None,
-                    intent=args.intent) if v2
+                    intent=args.intent, intent_trunk=bool(args.intent) and args.intent_trunk) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     if intent_on:
         # the intents' start in metres (a checkpoint with intents, --init, keeps its own: `init_actor` loads them over this)
@@ -2037,7 +2051,9 @@ def main(argv=None):
               f"(1-{iEPS:g}) softmax + {iEPS:g}/{iK}에서 뽑음 (그 섞인 분포가 PPO가 매기는 policy), 다시 뽑는 결정의 log-prob = "
               f"log pi_high(z) + log pi_low(a|z); z는 plan 출력 20개에 더하는 의도별 벡터로 들어감 (처음엔 일정한 조향 차이 = 호, "
               f"{IN.V_REF:g} m/s 새 망에서 1 s 점 옆 " + " / ".join(f"{float(x_) * 100:+.0f}" for x_ in _l1) + " cm), critic은 z와 "
-              f"남은 유지를 읽음, 엔트로피 보너스 {args.intent_ent:g}", flush=True)
+              f"남은 유지를 읽음, 엔트로피 보너스 {args.intent_ent:g}"
+              + (", trunk도 z를 읽음(첫 층 z 열 0에서 시작; pi_high·속도 짐작은 z 없이)" if actor.intent_trunk else ", trunk는 z를 안 읽음"),
+              flush=True)
     cm_on = args.commit_plan > 0                                   # (11-25) --commit-plan: the plan as a commitment
     cm_parent = None                                               # --init: the parent actor, for the first decision's check
     if cm_on:
@@ -2305,6 +2321,7 @@ def main(argv=None):
             for k_, r_ in enumerate(pick[:args.live_taps], start=1):
                 taps.append(LiveTap(env, run, row=r_, name=f"live_tap_{k_}.json", label=lab_(r_)))
     tap_pm = torch.zeros(10, 2, device=dev)
+    ie_env = None                                                  # --intent-effect-every: the eval's own small env (rank 0)
     # (11-24) the live view's reward parts, named: every term that enters the reward this run, in `tap_parts`' order (a
     # contact kind that cannot happen here is 0 and left out); the plan-car cost is priced after each rollout (`settle`)
     tap_kinds = [0, 1] + ([2] if env.M > 1 else []) + ([3] if args.stall_s > 0 else [])
@@ -2606,11 +2623,12 @@ def main(argv=None):
                     # the decision's at a draw (below), a held intent is the state's (the critic reads it)
                     lg_z = actor.intent_logits_out
                     obs.intent_z, obs.intent_left, due_z = IN.step(lg_z, obs.intent_z, obs.intent_left, iH, iEPS, "sample")
-                    mean_nom = mean
+                    mean_nom, a1_z = mean, actor.trunk_a1                 # (the trunk's z-free run, for the stats)
                     mean = actor.intent_mean(mean, obs.intent_z)
                     ZD.append(due_z); ZI.append(obs.intent_z.clone())
-                    iz_st.decision(t, obs.intent_z, due_z, lg_z, ordm, mean_nom, actor.intent_bias, v_hat.clamp(-PS.V_REV, PS.V_FWD),
-                                   obs.cmd_d, lim)
+                    _mo = (lambda i_, k_: mean_nom[i_] if k_ is None else
+                           actor.intent_mean(mean_nom[i_], torch.full_like(i_, k_), a1=None if a1_z is None else a1_z[i_]))
+                    iz_st.decision(t, obs.intent_z, due_z, lg_z, ordm, _mo, v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
                 if args.noise_corr > 0 or stall_on:
                     # exploration noise that stays for several decisions (AR(1), each decision still N(0, 1) by itself; a
                     # restarted row draws afresh below). PPO's ratio uses that per-decision Gaussian, as gSDE (Raffin et al.
@@ -3271,7 +3289,9 @@ def main(argv=None):
                 if line_on:
                     with torch.no_grad():
                         aux_box["fc0"] = actor.features(bX[sel], lvl0(bS[sel]))
-                return heads_on(actor.features(bX[sel], bS[sel]), sel)
+                f_ = actor.features(bX[sel], bS[sel])
+                aux_box["a1"] = actor.trunk_a1 if intent_on else None    # (11-26) --intent-trunk: the plan under z runs from it
+                return heads_on(f_, sel)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
             h = h0 = bHM[sel[0]] if prev_mem is None else mem_prefix(actor.mem_cell, *prev_mem, sel[0] % Bl, bHM[sel[0]])
@@ -3292,6 +3312,7 @@ def main(argv=None):
                 pin_ = bPIN[mb_]                                   # (11-25) stored: the rollout's, not the moved head's
             pc_ = bPCL[mb_] if pc_on else None                 # (11-25) stored: the head moves during the update, the input must not
             fc = (actor.mem_trunk(fflat_, hcat_, pin_, pc_) if actor.mem_front else fflat_ + actor.mem_out(hcat_))
+            aux_box["a1"] = actor.trunk_a1 if intent_on else None        # (11-26) --intent-trunk: the plan under z runs from it
             if pred_on and drift_box["on"] and not two:
                 # (11-25) what the update read before 11-25 -- the prediction made again by the head as it is now, on the
                 # memory as it is now -- against the stored one: the inputs' gap and the log-probability's (same weights)
@@ -3300,9 +3321,14 @@ def main(argv=None):
                     pfd.append(float((rec_ - pin_).abs().mean())); pfd_p.append(float((rec_[:, 0] - pin_[:, 0]).abs().mean()))
                     ls_ = torch.maximum(actor.log_std, actor.log_std_floor).expand(mb_.numel(), -1)
                     fu_ = bFULL[mb_] if roll_on else None
-                    _im = (lambda m__: actor.intent_mean(m__, bZI[mb_])) if intent_on else (lambda m__: m__)
-                    dl_ = (lp_scored(bU[mb_], _im(actor.pi(actor.mem_trunk(fflat_, hcat_, rec_, pc_))), ls_, fu_)
-                           - lp_scored(bU[mb_], _im(actor.pi(fc)), ls_, fu_)).abs()
+                    fr_ = actor.mem_trunk(fflat_, hcat_, rec_, pc_); a1r_ = actor.trunk_a1
+                    if intent_on:
+                        m_rec_ = actor.intent_mean(actor.pi(fr_), bZI[mb_], a1=a1r_)
+                        m_fc_ = actor.intent_mean(actor.pi(fc), bZI[mb_], a1=aux_box["a1"])
+                    else:
+                        m_rec_, m_fc_ = actor.pi(fr_), actor.pi(fc)
+                    dl_ = (lp_scored(bU[mb_], m_rec_, ls_, fu_) - lp_scored(bU[mb_], m_fc_, ls_, fu_)).abs()
+                    del fr_, a1r_, m_rec_, m_fc_
                     pdl.append(float(dl_.mean())); pdl90.append(float(torch.quantile(dl_.float(), 0.9)))
                     pdlc.append(float((dl_ > math.log(1.0 + args.clip)).float().mean()))
                     del rec_, ls_, dl_
@@ -3542,7 +3568,7 @@ def main(argv=None):
             for sel in batches():
                 mean, log_std, _, mb, _ = actor_on(sel) if v2 else (*actor(bX[sel], bS[sel]), None, sel, None)
                 if intent_on:                                   # (11-26) the plan under the intent driven
-                    mean = actor.intent_mean(mean, bZI[mb])
+                    mean = actor.intent_mean(mean, bZI[mb], a1=aux_box.get("a1"))
                 # (11-22) what PPO scores -- under --plan-roll it read all 20 outputs, 18 of them without effect on a rolling
                 # decision: the noise scale of roll29c-e was too high and the auto batch grew on it
                 lp_ = lp_scored(bU[mb], mean, log_std, bFULL[mb] if roll_on else None)
@@ -3600,7 +3626,7 @@ def main(argv=None):
                     mean, log_std, v_hat, mb, f_heads = actor_on(sel)
                     el = (v_hat - bVT[mb]).pow(2).mean()
                     if intent_on:                              # (11-26) the plan under the intent driven; pi_high's logits
-                        mean = actor.intent_mean(mean, bZI[mb])
+                        mean = actor.intent_mean(mean, bZI[mb], a1=aux_box.get("a1"))
                         lg_z = actor.intent_logits_out
                 else:
                     mb = sel
@@ -3675,7 +3701,13 @@ def main(argv=None):
                                else f_heads[ok_].detach())     # same values; only tail_alpha of the gradient reaches the trunk
                         tail_mean = (actor.all_heads(fh_)[0][torch.arange(mb_c.numel(), device=dev), bBR[mb_c]]
                                      if two else actor.pi(fh_))      # the plan that was driven
-                        if intent_on:                             # (11-26) under its intent (its vector learns the forecast)
+                        if intent_on and aux_box.get("a1") is not None:
+                            # (11-26) --intent-trunk: the trunk run under its intent, the gradient into the shared weights as
+                            # above (tail_alpha / none); its vector learns the forecast
+                            fz_ = actor.trunk_z(aux_box["a1"][ok_], bZI[mb_c])
+                            tail_mean = actor.plan_out(fz_ * tail_alpha + fz_.detach() * (1.0 - tail_alpha) if args.tail_trunk
+                                                       else fz_.detach(), bZI[mb_c])
+                        elif intent_on:                           # (11-26) under its intent (its vector learns the forecast)
                             tail_mean = actor.intent_mean(tail_mean, bZI[mb_c])
                         a_c = torch.where((gm_all if grow_on else rl_mask)[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
                         pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim, bCAP[mb_c] if pace_on else None)
@@ -4055,6 +4087,32 @@ def main(argv=None):
             row["pace_share"] = [round(float(x_), 4) for x_ in (pace_n / pace_n.sum().clamp_min(1.0))]
         if intent_on:                                              # (11-26) --intent: this process's ordinary races
             row.update(iz_st.row(actor.intent_bias))
+            if (args.intent_effect_every > 0 and args.dist_rank == 0
+                    and (upd % args.intent_effect_every == 0 or upd == args.updates)):
+                # what the outer intents make the car drive, against the z-free plan, on a small env of this process's own
+                # (built at the first eval: whole first episodes, the training world's tracks / boxes / opponents); the
+                # training's random streams are put back after it
+                t_ie = time.time()
+                rng_ = (torch.get_rng_state(), torch.cuda.get_rng_state(dev) if dev.type == "cuda" else None)
+                if ie_env is None:
+                    _ns = os.environ.get("F1SIM_NO_STAGGER")
+                    os.environ["F1SIM_NO_STAGGER"] = "1"
+                    try:
+                        ie_env, _, _ = build(args.world, IN.EFFECT_ENVS, args.seed + 4242, dev, overrides=ov, fmt=args.format)
+                    finally:
+                        if _ns is None:
+                            os.environ.pop("F1SIM_NO_STAGGER", None)
+                        else:
+                            os.environ["F1SIM_NO_STAGGER"] = _ns
+                    ie_env.external_skip_unused = True
+                    if args.opp_every > 0:
+                        ie_env.opp_every = int(args.opp_every)
+                actor.eval()
+                row.update(IN.realized_effect(ie_env, lim, actor, IN.EFFECT_S, seed=args.seed + 4242))
+                torch.set_rng_state(rng_[0])
+                if rng_[1] is not None:
+                    torch.cuda.set_rng_state(rng_[1], dev)
+                row["t_intent_eff"] = time.time() - t_ie
         if line_on:                                                # --line-shifts: how far off its offset a level's plan ends
             row["line_err"] = float(torch.tensor(lfs).median()) if lfs else None
             row["line_moved"] = float(torch.tensor(lfd).median()) if lfd else None
