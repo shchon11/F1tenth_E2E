@@ -417,7 +417,7 @@ if TMAZE:
     po._write(dst_, src_, pose_t[..., :2], pose_t[..., 2], sid_t.clamp_min(0), live_t, P=po.C, Q=1)
     _nk = (po.p_sid[rl_t] >= 0).sum(1)
     print(f"[tmaze] 세션 {G_t}개: L {int((tm_b == 0).sum())} / R {int((tm_b == 1).sum())} / 없음 {int((tm_b == 2).sum())}, 상자 수 "
-          f"{[int(_nk[tm_b == k_].max()) for k_ in range(3)]}, L {TM['L'][:2]} R {TM['R'][:2]}, 치우지 않음", flush=True)
+          f"{[int(_nk[tm_b == k_].max()) for k_ in range(3)]}, L {TM['L']} R {TM['R']}, 치우지 않음", flush=True)
 remover = (SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if (po is not None and not TMAZE) else None)
 KNOWN = bool(VIRT) or bool(TARGET)
 if KNOWN:

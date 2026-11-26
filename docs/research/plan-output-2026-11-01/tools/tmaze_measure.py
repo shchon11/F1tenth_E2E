@@ -6,6 +6,7 @@
   - A_plan(tau): 그 결정의 plan이 상자의 트랙 따라 자리까지 닿을 때, 그 자리에서 plan의 옆 위치(같은 빈 트랙 길 기준)
   - 대조: 같은 자리(상자의 트랙 따라 자리 D m 앞)에서 옆 위치·속도 -- L과 R은 처음 보이는 때가 달라(같은 tau = 다른 자리) 시간 맞춤만으로는
     기억이 아닌 차이(제동 구간의 속도 차)가 d에 섞임
+  - 세게 닿음은 상자에 다가간 번마다 셈: 통과 + 지나가지 못한 채 세게 닿은 번 (멈춰 선 차)
   - I(h; b) [bit]: 처음 보이기 1 s 전 기억 h(_mem.npz의 mem, 그 결정 뒤 상태)에 로지스틱 read-out, 세션 절반으로 배우고 나머지 절반으로 잼
     (H(b) - 교차 엔트로피, 변분 하한). 1번째 / 2번째 이후, 세 갈래(L/R/없음)와 두 갈래(L/R)
 처음 보임 = 상자 중심이 스캔에 직접 보이기 시작한 때 (exam_boxes.py와 같은 규칙: 시야각 135도, 10 m, 벽에 안 가림). 상자 없는 세션은 L·R
@@ -22,6 +23,7 @@ TAUS = np.round(np.arange(0.0, 2.0001, 0.1), 2)
 # (another place on the track for the same tau, in a braking zone a speed difference that is not memory); both boxes sit at
 # the same along-track place, so the same D is the same place for both
 DISTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0)
+H_DISTS = (6.0, 10.0)        # [m] before the box: I(h; b) read at the same place (the control for the time-aligned one)
 FOV, RMAX = np.radians(135.0), 10.0
 BIN = 0.1                    # [m] the reference line's along-track bins
 NAME_B = ("L", "R", "없음")
@@ -148,7 +150,8 @@ def one(fn):
     prog = s + lap * L                                     # (T+1, B) unwrapped along-track [m]
     mount = float(z["lidar_mount_x"]) if float(z["lidar_mount_x"]) > 0 else 0.297
     tk = int(R.tid[0, 0])
-    Lb, Rb = z["tm_L"].astype(float), z["tm_R"].astype(float)
+    # a placement: one box [x, y, yaw, id] or a row of them -> its centre
+    Lb, Rb = (z[k_].astype(float).reshape(-1, 4)[:, :2].mean(0) for k_ in ("tm_L", "tm_R"))
     # this policy's own empty-track line: the sessions without a box, after their first 3 s
     none = b == 2
     okr = np.zeros((T + 1, Bn), bool); okr[int(round(3.0 / dt)):, none] = True
@@ -222,7 +225,7 @@ def one(fn):
             # the same place: the car where its along-track progress is D m short of the box's (the last crossing before the pass)
             tgt = s_b + nmax[t + 1] * L
             k_lo = max(int(R.k0[min(t, T - 1), i]), t - 80)
-            doff = np.full(len(DISTS), np.nan); dv = np.full(len(DISTS), np.nan)
+            doff = np.full(len(DISTS), np.nan); dv = np.full(len(DISTS), np.nan); dj = np.full(len(DISTS), -1)
             for q, D_ in enumerate(DISTS):
                 v_ = tgt - D_
                 js = [j for j in range(t, k_lo - 1, -1) if prog[j, i] <= v_ < prog[j + 1, i]]
@@ -232,10 +235,25 @@ def one(fn):
                 pq = xy[j, i] + f_ * (xy[j + 1, i] - xy[j, i])
                 doff[q] = project(P, pq[None], np.array([v_ % L]), L)[1][0]
                 dv[q] = V[j, i] + f_ * (V[j + 1, i] - V[j, i])
+                dj[q] = j
             h = mem[k_s - 10, i].astype(np.float32) if (mem is not None and k_s - 10 >= 0 and k_s - 10 >= R.k0[min(t, T - 1), i]) else None
-            rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any,
+            hD = {D_: (mem[int(dj[DISTS.index(D_)]), i].astype(np.float32) if (mem is not None and dj[DISTS.index(D_)] >= 0) else None)
+                  for D_ in H_DISTS}
+            rows.append(dict(sess=i, b=b[i], n=npass, t=t, k_s=k_s, see=(t - k_s) * dt, hit=hit, hit_any=hit_any, hD=hD,
                              off=off_c, v=v_c, offp=offp, doff=doff, dv=dv, h=h))
-    return R, rows, dict(L=L, sb=sb, P=P)
+    # attempts at the box: every pass, and every hard box hit not followed by a pass within 1 s (the car stopped at the box); the
+    # attempt's number = passes before it + 1
+    att = {}
+    for i in range(Bn):
+        if b[i] >= 2:
+            continue
+        tp = sorted(r["t"] for r in rows if r["sess"] == i)
+        for t in tp:
+            att[(i, tp.index(t) + 1)] = 0.0
+        for th in np.nonzero(hard_prop[:, i] > 0)[0]:
+            n_before = sum(1 for t in tp if t < th - 10)
+            att[(i, n_before + 1)] = 1.0
+    return R, rows, dict(L=L, sb=sb, P=P, att=att, b=b)
 
 
 def main():
@@ -248,18 +266,21 @@ def main():
             print(f"== {os.path.basename(fn)} · {z['name']}: 상자 없는 세션이 한 바퀴의 80 % 넘게 달리지 못해(0.5 m/s 넘게) 빈 트랙 길이 "
                   f"없음 -> 통과·옆 위치를 잴 수 없음 (세션 {n_s}개, 평균 속도 {np.abs(R.st[:, :, 3]).mean():.2f} m/s)")
             continue
-        print(f"== {os.path.basename(fn)} · {z['name']} · {z['mode']} · 세션 {n_s}개 x {R.T * R.dt:.0f} s · L {z['tm_L'][:2]} R {z['tm_R'][:2]}"
+        print(f"== {os.path.basename(fn)} · {z['name']} · {z['mode']} · 세션 {n_s}개 x {R.T * R.dt:.0f} s · L {np.round(z['tm_L'].reshape(-1, 4)[:, :2].mean(0), 3)} R {np.round(z['tm_R'].reshape(-1, 4)[:, :2].mean(0), 3)} "
+              f"(자리마다 상자 {z['tm_L'].reshape(-1, 4).shape[0]}개)"
               + (f" · c {np.unique(np.round(z['cond'], 3))}" if "cond" in z.files else ""))
         print(f"상자 통과 {len(rows)}번 (상자 자리의 트랙 따라 위치: L {g['sb'][0]:.2f} m, R {g['sb'][1]:.2f} m / 한 바퀴 {g['L']:.2f} m)")
         P1 = lambda r: r["n"] == 1
         P2 = lambda r: r["n"] >= 2
-        print("\n세게 닿음 비율 (통과 2 s 앞 ~ 1 s 뒤 상자 hard; 없음 = 아무 hard)")
+        print("\n세게 닿음 비율: 상자에 다가간 번마다 (통과, 또는 지나가지 못한 채 세게 닿음; 몇 번째 = 그 전 통과 수 + 1) / 없음 = 통과 2 s 앞 ~ 1 s 뒤 아무 hard")
         print(f"{'b':<6}{'1번째':>18}{'2번째 이후':>18}{'처음 보임 중앙 (1 / 2+)':>26}")
         for k in range(3):
             cell = []
             for f in (P1, P2):
-                rr = [r for r in rows if r["b"] == k and f(r)]
-                x = [r["hit"] if k < 2 else r["hit_any"] for r in rr]
+                if k < 2:
+                    x = [v_ for (i_, n_), v_ in g["att"].items() if g["b"][i_] == k and f({"n": n_})]
+                else:
+                    x = [r["hit_any"] for r in rows if r["b"] == k and f(r)]
                 cell.append(f"{100 * np.mean(x):5.1f} % ({len(x):4d})" if x else "-")
             se = [np.median([r["see"] for r in rows if r["b"] == k and f(r)]) if any(r["b"] == k and f(r) for r in rows) else np.nan
                   for f in (P1, P2)]
@@ -293,7 +314,7 @@ def main():
                 mn = lambda a: np.nanmean(a) if np.isfinite(a).any() else np.nan
                 print(f"  {D_:5.1f}{mn(oL):+8.3f}{mn(oR):+8.3f}{mn(oN):+8.3f}{A:8.3f}{d:7.2f}{mn(vL):7.2f}{mn(vR):7.2f}{Av:7.2f}{dv:7.2f}")
         print("\nI(h; b) [bit], 처음 보이기 1 s 전 기억 (세션 절반 학습 / 절반 시험, 시험 통과 수)")
-        if not any(r["h"] is not None for r in rows):
+        if not any(r["h"] is not None for r in rows) and not any(v_ is not None for r in rows for v_ in r["hD"].values()):
             print("  기억 기록(_mem.npz) 없음")
             continue
         for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
@@ -305,6 +326,17 @@ def main():
             m2 = y < 2
             i2, n2 = info_bits(H[m2], y[m2], ss[m2]) if m2.sum() >= 12 else (np.nan, 0)
             print(f"  {lab}: L/R/없음 {i3:+.3f} bit (최대 {np.log2(3):.2f}, 시험 {n3}) | L/R {i2:+.3f} bit (최대 1, 시험 {n2})")
+        print("I(h; b) [bit], 같은 자리 기억 (상자의 트랙 따라 자리 D m 앞 -- 시간 맞춤은 b마다 다른 자리를 읽어 '어디인지'가 섞임)")
+        for D_ in H_DISTS:
+            for lab, f in (("1번째 통과", P1), ("2번째 이후", P2)):
+                rr = [r for r in rows if f(r) and r["hD"][D_] is not None]
+                if len(rr) < 12:
+                    print(f"  {D_:g} m 앞 {lab}: 통과 {len(rr)}번 -- 너무 적음"); continue
+                H = np.stack([r["hD"][D_] for r in rr]); y = np.array([r["b"] for r in rr]); ss = np.array([r["sess"] for r in rr])
+                i3, n3 = info_bits(H, y, ss)
+                m2 = y < 2
+                i2, n2 = info_bits(H[m2], y[m2], ss[m2]) if m2.sum() >= 12 else (np.nan, 0)
+                print(f"  {D_:g} m 앞 {lab}: L/R/없음 {i3:+.3f} bit (시험 {n3}) | L/R {i2:+.3f} bit (시험 {n2})")
 
 
 if __name__ == "__main__":
