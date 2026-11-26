@@ -55,3 +55,20 @@ def test_pred_in_world(tmp_path):
     q[0], q[1] = 0.2, 0.0                                    # point 1: 1 m ahead (x PRED_SCALE 5) in the car's frame
     now = rec(tap, 0, pred=q, pose=torch.tensor([2.0, 3.0, math.pi / 2]))
     assert np.allclose(now["pred"]["pts"][0], [2.0, 4.0], atol=1e-3) and abs(now["pred"]["p"] - 0.5) < 1e-6
+
+
+def test_dec_in_round_trip(tmp_path):
+    """(11-26) what a state decoder reads goes out exactly (float32, base64), with the car as the decision found it"""
+    import base64
+    tap = LiveTap(fake_env(), str(tmp_path), row=0, name="tap_d.json")
+    z = torch.zeros(10, 2)
+    f, m, st = torch.randn(292), torch.randn(128), torch.tensor([1.0, 2.0, 0.5, 6.25, -0.75])
+    tap.record(1, 0, z, z, torch.zeros(10), torch.zeros(()), torch.zeros(()), torch.zeros(()), torch.zeros(()),
+               torch.zeros(()), torch.zeros(()), torch.zeros(()), torch.zeros(()), dec_in=(f, m, st))
+    now = json.load(open(tap.path))["now"]
+    d = now["dec_in"]
+    assert np.array_equal(np.frombuffer(base64.b64decode(d["f"]), "<f4"), f.numpy())
+    assert np.array_equal(np.frombuffer(base64.b64decode(d["m"]), "<f4"), m.numpy())
+    assert np.allclose(d["st"], st.numpy(), atol=1e-4)
+    now = rec(tap, 1)                                        # a trainer that passes none: null
+    assert now["dec_in"] is None

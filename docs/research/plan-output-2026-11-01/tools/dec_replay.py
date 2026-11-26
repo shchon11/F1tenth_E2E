@@ -52,8 +52,12 @@ def record_path(rec):
 class NPDecoder:
     """the decoder sets of one record, in numpy"""
 
-    def __init__(self, path):
+    def __init__(self, path, only=None):
+        """`only`: the input sets to load (the live view needs one; all three are ~40 MB as float32)"""
         z = np.load(path, allow_pickle=False)
+        self.path = path
+        self.feat_dim, self.mem_dim = int(z["feat_dim"]), int(z["mem_dim"])
+        self.record = str(z["record"]) if "record" in z.files else ""
         self.pose_ext = z["pose_ext"].astype(np.float64)
         self.ego_scale = z["ego_scale"].astype(np.float32)
         self.grid = z["grid"].astype(np.float64)
@@ -65,7 +69,8 @@ class NPDecoder:
         for k in z.files:
             if "|" in k:
                 s, n = k.split("|", 1)
-                self.sets.setdefault(s, {})[n] = z[k].astype(np.float32)
+                if only is None or s in only:
+                    self.sets.setdefault(s, {})[n] = z[k].astype(np.float32)
 
     def run(self, feat, mem, which):
         w = self.sets[which]

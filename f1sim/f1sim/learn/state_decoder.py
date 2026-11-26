@@ -123,6 +123,9 @@ class StateDecoder:
         self.ego_scale = z["ego_scale"].astype(np.float32)
         self.feat_dim, self.mem_dim = int(z["feat_dim"]), int(z["mem_dim"])
         self.checkpoint, self.has_opp = str(z["checkpoint"]), bool(z["has_opp"])
+        # (11-26) the file's own grid and other-car scale: a reader draws by these, not by this module's constants
+        self.grid = [float(v) for v in z["grid"]] if "grid" in z.files else [GRID_X0, GRID_X1, GRID_Y0, GRID_Y1, GRID_RES]
+        self.opp_scale = float(z["opp_scale"]) if "opp_scale" in z.files else OPP_SCALE
         sets: Dict[str, dict] = {}
         for k in z.files:
             if "|" in k:

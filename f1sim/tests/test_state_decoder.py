@@ -63,3 +63,42 @@ def test_grid_and_paths():
     assert np.allclose(c[1], [SD.GRID_X0 + SD.GRID_RES / 2, SD.GRID_Y0 + 1.5 * SD.GRID_RES])
     assert SD.decoder_path_of("/a/b/plan_u950.pt") == "/a/b/plan_u950_dec.npz"
     assert abs(SD.wrap(3 * math.pi) - math.pi) < 1e-9 or abs(SD.wrap(3 * math.pi) + math.pi) < 1e-9
+
+
+def test_live_view_decodes_the_tap(tmp_path, monkeypatch):
+    """(11-26) /live: the site runs the run's newest decoder on the tapped decision (tools/live_dec.py) and sends `dec` in
+    the tap's `dec_in` place -- the dashed edges in the world, the pose only on the decoder's own map, the numbers"""
+    import base64
+    import json
+    import sys
+    sys.path.insert(0, TOOLS)
+    import live_dec
+    path, _, _ = _random_decoders(tmp_path)                  # feat 12, mem 6; its map extent (-10, 30, -5, 25)
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    os.replace(path, run / "plan_u5_dec.npz")
+    np.savez(run / "plan_u3_dec.npz", version=np.array(0))   # an older one: never picked
+    edt = np.ones((300, 400), np.float32)                     # one 40 x 30 m track at 0.1 m: the decoder's map extent
+    np.savez(run / "live_tracks.npz", edt=edt.ravel(), t_off=np.array([0]), t_H=np.array([300]), t_W=np.array([400]),
+             t_res=np.array([0.1], np.float32), t_origin=np.array([[-10.0, -5.0]], np.float32), car=np.array([0.58, 0.31]))
+    monkeypatch.setattr(live_dec, "RUNS", str(tmp_path / "runs"))
+    monkeypatch.setattr(live_dec.DR, "DEC", str(tmp_path / "none"))
+    live_dec._memo.clear(); live_dec._body.clear()
+    b64 = lambda a: base64.b64encode(np.asarray(a, "<f4").tobytes()).decode()
+    rs = np.random.RandomState(7)
+    now = {"tid": 0, "dec_in": {"f": b64(rs.randn(12)), "m": b64(rs.randn(6)), "st": [1.0, 2.0, 0.3, 5.0, 0.2]}}
+    tap = run / "live_tap.json"
+    tap.write_text(json.dumps({"run": "r1", "now": now, "trail": []}))
+    out = json.loads(live_dec.live_body("r1", str(tap)))["now"]
+    assert "dec_in" not in out and out["dec"]["u"] == 5
+    d = out["dec"]
+    assert set(d) >= {"walls", "boxes", "pose", "v", "r", "tv", "tr", "opp"} and d["tv"] == 5.0 and d["tr"] == 0.2
+    assert d["pose"] is not None and len(d["pose"]) == 3                       # same extent, no record here: drawn
+    for q, lv in d["walls"] + d["boxes"]:                  # polylines in the world, a strength level per segment
+        assert len(q) == 2 * (len(lv) + 1) and all(0 <= v <= d["lv"] for v in lv) and max(lv) > 0
+    # input sizes that do not fit the decoder: nothing decoded, the tap passes through
+    now["dec_in"]["f"] = b64(rs.randn(13))
+    tap.write_text(json.dumps({"run": "r1", "now": now, "trail": []}))
+    live_dec._body.clear()
+    out = json.loads(live_dec.live_body("r1", str(tap)))["now"]
+    assert "dec" not in out and "dec_in" not in out

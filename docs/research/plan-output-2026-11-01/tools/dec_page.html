@@ -178,15 +178,17 @@ function mkOff(nx, ny) { const c = document.createElement("canvas"); c.width = n
 // ---------------------------------------------------------------- the decoder's grid as an image: column = cell along x (ahead),
 // row = cell along y from the left edge (row 0 = +y): drawn in the car's frame, rotated with the car
 // `edge`: a light wash over the decoded wall mass and its rim (a cell over 0.5 next to one under) strong, so the true walls
-// underneath stay readable
+// underneath stay readable. (11-26, the user: "ROI는 왜 걸어놓은 거야? 존나 거슬리게") no frame: everything fades out over the
+// grid's last metre, so its edge never shows
 function paintGrid(off, data, t, col, gain, edge) {
-  const { nx, ny } = ST.grid, g = off.getContext("2d"), im = g.createImageData(nx, ny), c = hex(col), base = t * nx * ny;
+  const { nx, ny, res } = ST.grid, g = off.getContext("2d"), im = g.createImageData(nx, ny), c = hex(col), base = t * nx * ny;
+  const fade = (ix, iy) => { const u = Math.min(1, Math.min(ix + 0.5, nx - ix - 0.5, iy + 0.5, ny - iy - 0.5) * res); return u * u * (3 - 2 * u); };
   const at = (ix, iy) => (ix < 0 || iy < 0 || ix >= nx || iy >= ny ? 255 : data[base + ix * ny + iy]);
   for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) {
     const p = data[base + ix * ny + iy], k = ((ny - 1 - iy) * nx + ix) * 4;
     let a = p * gain;
     if (edge && p > 127 && (at(ix - 1, iy) <= 127 || at(ix + 1, iy) <= 127 || at(ix, iy - 1) <= 127 || at(ix, iy + 1) <= 127)) a = 235;
-    im.data[k] = c[0]; im.data[k + 1] = c[1]; im.data[k + 2] = c[2]; im.data[k + 3] = Math.min(255, a);
+    im.data[k] = c[0]; im.data[k + 1] = c[1]; im.data[k + 2] = c[2]; im.data[k + 3] = Math.min(255, a) * fade(ix, iy);
   }
   g.putImageData(im, 0, 0);
 }
@@ -209,8 +211,6 @@ function draw() {
   g.save(); g.translate(px, py); g.rotate(-car[2]); g.imageSmoothingEnabled = true;
   g.drawImage(ST.off.wall, G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
   g.drawImage(ST.off.box, G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
-  g.strokeStyle = C.line; g.lineWidth = 1; g.setLineDash([4, 4]);
-  g.strokeRect(G.x0 * s, -G.y1 * s, (G.x1 - G.x0) * s, (G.y1 - G.y0) * s);
   g.restore();
   // true boxes: outlines
   g.lineWidth = 2; g.strokeStyle = C.box; g.setLineDash([]);

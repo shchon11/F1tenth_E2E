@@ -417,7 +417,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         ctl.addWidget(self.ctrl_panel)
         show = card("표시")
         for chk, text in ((self.chk_plan, "정책 궤적"), (self.chk_trails, "주행 자취"),
-                          (self.chk_lidar, "LiDAR")):
+                          (self.chk_lidar, "LiDAR"), (self.chk_decoder, "디코더")):
             chk.setText(text)
             show.addWidget(chk)
         v.addStretch(1)
@@ -1082,6 +1082,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             for t in (self.t_speed, self.t_steer, self.t_last, self.t_best, self.t_laps, self.t_simt, self.t_contact):
                 t.set_value("—")
             self.t_speed.set_sub("")
+            self.t_speed.set_dec("", None)
             return
         t_sim = frame.get("t")
         self.t_simt.set_value(f"{float(t_sim):.1f}" if t_sim is not None else "—")
@@ -1100,6 +1101,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         st["vmax"] = max(st["vmax"], v)
         self.t_speed.set_value(f"{v:4.2f}")
         self.t_speed.set_sub(f"최고 {st['vmax']:.1f} m/s")
+        # (11-26) the state decoder's speed beside the true one, its yaw rate beside the true yaw rate: dashed (as everything
+        # the decoder draws)
+        dec = frame.get("dec") if self.chk_decoder.isChecked() else None
+        try:
+            self.t_speed.set_dec(f"{float(dec['v']):.1f}" if dec else "",
+                                 (f"{math.degrees(float(frame['r'])):+.0f}", f"{math.degrees(float(dec['r'])):+.0f}", "°/s")
+                                 if dec and frame.get("r") is not None else None)
+        except (KeyError, TypeError, ValueError):
+            self.t_speed.set_dec("", None)
         try:
             self.t_steer.set_value(f"{math.degrees(float(frame['steer'][f])):+.1f}")
             dash = frame.get("dash")
@@ -2242,6 +2252,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # no racing line / centerline toggle (11-09, the user: "레이싱라인도 아예 지워"): neither is drawn any more
         self.chk_labels = QtWidgets.QCheckBox("차량 번호")
         self.chk_labels.setChecked(True)
+        # (11-26, the user: "디코더 시각화는 별도로 빼라는 게 아니라 콘솔에서 같이 보여주게") a plan checkpoint with a state decoder
+        # (plan_uN_dec.npz beside it, tools/lab_decoder_watch.sh): what its features and memory hold, drawn in the 3D view by
+        # default -- the decoded walls and boxes as dashed edges, where it puts our car and the other car as dashed outlines;
+        # its speed and yaw rate beside the true ones in the HUD. This only turns it off
+        self.chk_decoder = QtWidgets.QCheckBox("디코더")
+        self.chk_decoder.setChecked(True)
+        self.chk_decoder.setToolTip("checkpoint에 상태 디코더(plan_uN_dec.npz)가 있으면 정책 안쪽 값에서 읽어 낸 것을 점선으로 그립니다.")
+        self.chk_decoder.toggled.connect(self._emit_overlay_request)
         self.chk_contacts = QtWidgets.QCheckBox("접촉 지점")
         self.chk_contacts.setChecked(True)
         self.chk_contacts.setToolTip(
@@ -2265,14 +2283,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_internals = QtWidgets.QCheckBox("신경망 내부 활성화")
         self.chk_internals.toggled.connect(self._on_internals)
         cost.add(self.chk_internals)
-        # (11-26, the user: "그 정보들이 네트워크에 있는지 디버깅용 디코더 ... 콘솔에서도") a plan checkpoint with a state decoder
-        # (plan_uN_dec.npz beside it, tools/lab_decoder_watch.sh): what its features and memory hold, drawn over the scene
-        self.chk_decoder = QtWidgets.QCheckBox("상태 디코더 (정책 안쪽 값에서 되살린 벽·상자·pose·상대 차)")
-        self.chk_decoder.setToolTip("checkpoint 옆에 plan_uN_dec.npz가 있을 때만 그립니다 (시험 기록으로 학습한 읽기 전용 디코더).\n"
-                                    "청록 = 되살린 벽과 우리 차 자리, 주황 = 상자, 분홍 = 상대 차와 0.5·1.0 s 뒤 자리.\n"
-                                    "2D 패널에는 차 기준 격자(앞 -3..9 m, 옆 ±6 m)로, 3D에는 벽 가장자리·상자 칸 점으로.")
-        self.chk_decoder.toggled.connect(self._emit_overlay_request)
-        cost.add(self.chk_decoder)
         self.chk_interp = QtWidgets.QCheckBox("프레임 보간 (부드럽게)")
         self.chk_interp.setChecked(True)
         self.chk_interp.setToolTip("시뮬 프레임 사이를 시뮬의 실측 속도로 보간합니다. "

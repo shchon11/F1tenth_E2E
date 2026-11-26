@@ -599,7 +599,13 @@ class H(BaseHTTPRequestHandler):
         p = os.path.join(RUNS, os.path.basename(name), "live_tap.json" if k == 0 else f"live_tap_{k}.json")
         if not name or not os.path.isfile(p):
             return self._send(404, json.dumps({"error": "이 run에는 실시간 기록이 없습니다 (plan_rl --live-tap)"}))
-        body = open(p, "rb").read()
+        # (11-26, the user: "/live에서 그 차량에서 실시간으로 디코딩해서 보여주고") the run's newest state decoder on the tapped
+        # decision (live_dec.py): `dec` in place of the tap's `dec_in`
+        try:
+            import live_dec
+            body = live_dec.live_body(os.path.basename(name), p)
+        except Exception:                              # the live view goes on without it
+            body = open(p, "rb").read()
         # (11-17, the user: "update에 필요한 결정 수 비율이랑 현재 에피소드 진행 비율만 상단에") the rollout's length (the last
         # update's `horizon`, which --horizon-auto changes) and the episode lengths (`episode_s`, a replayed scene's `scene_episode_s`)
         meta = memo(("live_meta", name), 10, lambda: live_meta(name))
