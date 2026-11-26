@@ -751,6 +751,50 @@ def mem_prefix(gru, pF: torch.Tensor, pHM: torch.Tensor, pD: torch.Tensor, cars:
     return torch.where(pD[-1][cars][:, None] > 0, h_now, h)
 
 
+ENC_OUT = 256                 # the scan encoder's output: the first part of every input that reads the normalised state after it
+
+
+def zero_cols(w: torch.Tensor, at: int, n: int) -> torch.Tensor:
+    """`w` (out, in) with n zero columns inserted before column `at`"""
+    return torch.cat([w[:, :at], torch.zeros(w.shape[0], n, dtype=w.dtype, device=w.device), w[:, at:]], 1)
+
+
+def widen_state(sd: dict, actor, s0: int) -> list:
+    """(11-26, --contact-cond from a checkpoint without it) the actor's state has inputs past the checkpoint's `s0` (log(c),
+    last): every weight that reads the normalised state -- right after the scan encoding, before the memory and the other
+    inputs appended after it -- gets zero columns there: the trunk's first layer, the GRUs' inputs (`mem_front`: they read the
+    trunk's inputs), the prediction head's first layer. The speed estimate, the memory's value read-out and the side task's
+    read the trunk's features / the memory's state, not the state. `sd` changed in place; returns the keys widened"""
+    n = int(actor.norm.mean.numel()) - int(s0)
+    if n <= 0:
+        return []
+    at = ENC_OUT + int(s0)
+    own_sd = actor.state_dict()
+    out = []
+    for k_ in ("trunk.0.weight", "gru.weight_ih", "gru_box.weight_ih", "pred.mlp.0.weight"):
+        w = sd.get(k_)
+        own = own_sd.get(k_)
+        if w is None or own is None or w.dim() != 2 or w.shape[1] < at:
+            continue
+        if k_ != "trunk.0.weight" and own.shape[1] != w.shape[1] + n:
+            continue                                     # (a GRU after the trunk reads its features, not the state)
+        sd[k_] = zero_cols(w, at, n)
+        out.append(k_)
+    return out
+
+
+def widen_critic_state(c_sd: dict, s0: int, n: int) -> dict:
+    """(11-26) the critic's side of `widen_state`: its input is (scan encoding, state, privileged) and its statistics cover
+    (state, privileged) -- n zero columns after the checkpoint's state (`s0`) in its first layer, statistics mean 0 /
+    variance 1 there, everything else as saved"""
+    out = dict(c_sd)
+    for k_, fill in (("norm.mean", 0.0), ("norm.var", 1.0)):
+        v_ = c_sd[k_]
+        out[k_] = torch.cat([v_[:s0], torch.full((n,), fill, dtype=v_.dtype, device=v_.device), v_[s0:]])
+    out["mlp.0.weight"] = zero_cols(c_sd["mlp.0.weight"], ENC_OUT + int(s0), n)
+    return out
+
+
 def init_actor(actor, sd0: dict) -> str:
     """--init: `actor` from a checkpoint's actor weights `sd0` -- the trunk's first layer widened with zero columns for inputs
     the checkpoint had none of (the memory, the box memory, the other car's prediction: all appended last), the input
@@ -766,12 +810,19 @@ def init_actor(actor, sd0: dict) -> str:
     parent's head said the car was there (22 %), 0.2 / 0.9 cm elsewhere; against the parent with its point columns zeroed
     the fork is bit-identical (cuda). "" otherwise.
     (11-25) `pred_clear`: its PC_N columns are the trunk's last -- zero from a checkpoint without them, as every input added;
-    the clearance geometry (`pc_geom`) is the actor's own (this run's car and margin), never the checkpoint's"""
+    the clearance geometry (`pc_geom`) is the actor's own (this run's car and margin), never the checkpoint's.
+    (11-26) a state with more inputs than the checkpoint's (--contact-cond's log(c), last): zero columns right after the
+    parent's state wherever the state is read (`widen_state`), its statistics mean 0 / variance 1 -- the fork's outputs do
+    not depend on those inputs until their weights move"""
     sd = dict(sd0)
     if "pc_geom" in sd0 and not getattr(actor, "pred_clear", False):
         raise ValueError("--init: the checkpoint's trunk reads the plan clearances: add --pred-clear")
     if getattr(actor, "pred_clear", False):
         sd["pc_geom"] = actor.pc_geom.detach().clone()
+    if int(actor.norm.mean.numel()) < int(sd0["norm.mean"].numel()):
+        raise ValueError("--init: the checkpoint's state has more inputs than this actor's (a --contact-cond checkpoint: give "
+                         "--contact-cond)")
+    widen_state(sd, actor, int(sd0["norm.mean"].numel()))
     w = sd["trunk.0.weight"]
     sd["trunk.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], actor.trunk[0].in_features - w.shape[1], device=w.device)], 1)
     head = getattr(actor, "pred", None)
@@ -828,6 +879,8 @@ def _arg_problem(args) -> str:
             return "--init: the checkpoint's trunk reads the plan clearances: add --pred-clear"
         if bool((ck.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
             return "--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch"
+        if (ck.get("args") or {}).get("contact_cond") and not args.contact_cond:
+            return "--init: the checkpoint reads log(c) as its last state input: give --contact-cond"
     rules = (
         (args.dist_world > 1 and (args.dump_rollout or args.track_steps or args.level_replay > 0
                                   or args.branches == 2 or args.accum > 1),
@@ -909,9 +962,11 @@ def _rq_problem(args) -> str:
         if args.format != "v2" or args.pace_caps or args.line_shifts or args.self_opp > 0 or args.commit_plan > 0:
             return "--contact-cond: --format v2, without --pace-caps / --line-shifts / --self-opp / --commit-plan"
         if args.init:
+            # (11-26) from a checkpoint without it: a fork, log(c)'s weights start at zero (`widen_state`); with it: the same range
             ck = torch.load(args.init, map_location="cpu", weights_only=False)
-            if str((ck.get("args") or {}).get("contact_cond") or "") != args.contact_cond:
-                return "--contact-cond: from scratch (its log(c) input changes the state's size), or from a checkpoint with the same"
+            have = str((ck.get("args") or {}).get("contact_cond") or "")
+            if have and have != args.contact_cond:
+                return f"--contact-cond: the checkpoint was trained with --contact-cond {have}: the same range (or a checkpoint without it)"
     if args.term_split:
         if not args.init:
             return "--term-split measures a checkpoint: give --init (and --init-critic)"
@@ -1789,7 +1844,7 @@ def main(argv=None):
         pr.cond = cc_draw(Bl)
         obs.cond = pr.cond.log()
         print(f"[plan_rl] 접촉 비용 조건(--contact-cond): 판마다 c ~ LogUniform[{args.contact_cond}], 모든 접촉 비용 x c, log(c)를 "
-              f"상태 마지막 입력으로 (처음부터)", flush=True)
+              f"상태 마지막 입력으로 " + ("(처음부터)" if not args.init else "(--init: 부모에 없으면 그 입력 가중치 0에서 시작)"), flush=True)
     hce_on = bool(args.hard_contact_ends)              # (11-26) --hard-contact-ends: a hard contact ends the return
     if hce_on:
         print("[plan_rl] 세게 닿으면 return 끝(--hard-contact-ends): GAE는 끝값 0, 차는 그 자리에서 계속, 기억 유지, env 다시 시작 안 함",
@@ -2224,7 +2279,14 @@ def main(argv=None):
             raise SystemExit("--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch")
         if "pc_geom" in ck0["actor"] and not pc_on:
             raise SystemExit("--init: the checkpoint's trunk reads the plan clearances: add --pred-clear")
+        if (ck0.get("args") or {}).get("contact_cond") and not cc_on:
+            raise SystemExit("--init: the checkpoint reads log(c) as its last state input: give --contact-cond")
+        s0_ck = int(ck0["actor"]["norm.mean"].numel())               # the parent's state size (its actor reads the state only)
+        cc_fork = cc_on and not (ck0.get("args") or {}).get("contact_cond")
         _added = init_actor(actor, ck0["actor"])
+        if cc_fork:
+            print(f"[plan_rl] log(c) 상태 입력 {int(actor.norm.mean.numel()) - s0_ck}칸 새로 붙임 (--contact-cond 포크): trunk·GRU 입력이 "
+                  "읽는 가중치 0에서 시작, 통계 평균 0 분산 1 (부모와 같게 몲)", flush=True)
         if pc_on and "pc_geom" not in ck0["actor"]:
             print("[plan_rl] plan-예측 간격 입력 10칸 새로 붙임: trunk가 읽는 가중치 0에서 시작 (부모와 같게 몲)", flush=True)
         if _added == "new":
@@ -2236,6 +2298,10 @@ def main(argv=None):
         critic.enc.load_state_dict(enc)
         if args.init_critic:
             c_sd = ck0["critic"]
+            if cc_fork:
+                # (11-26) log(c) is the state's last input, before the privileged ones: zero weights on it (`widen_critic_state`)
+                c_sd = widen_critic_state(c_sd, s0_ck, int(actor.norm.mean.numel()) - s0_ck)
+                print("[plan_rl] critic: log(c) 입력을 상태 끝에 끼움 (가중치 0에서 시작)", flush=True)
             if intent_on and not (ck0.get("args") or {}).get("intent"):
                 # (11-26) the intent's inputs are the critic's last: from a checkpoint without them, zero weights on them
                 _w_sd = IN.widen_critic(c_sd, critic)
