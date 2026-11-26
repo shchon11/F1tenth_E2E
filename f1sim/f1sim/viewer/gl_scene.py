@@ -714,20 +714,23 @@ class Scene:
     DRV_MAX_POINTS = 8
 
     def set_driver_overlay(self, lines=None, points=None):
-        """What a non-policy driver computed (`viewer.driver_viz`): `lines` [(pts (n, 3), rgba (4,),
-        width px[, segments])] drawn as polylines -- or as separate segments, point pairs, when the
-        fourth item is true -- and `points` [(pts (n, 3), rgba (4,), size px)] as fixed-size discs
-        over the scene. None or empty clears them."""
+        """What a non-policy driver computed (`viewer.driver_viz`): `lines` [(pts (n, 3), rgba (4,) or one per
+        point (n, 4), width px[, segments[, over]])] drawn as polylines -- or as separate segments, point
+        pairs, when the fourth item is true; over the scene, depth test off, when the fifth is (11-26: the
+        state decoder's walls lie on a wall's face, its car outlines inside a car's body) -- and `points`
+        [(pts (n, 3), rgba (4,), size px)] as fixed-size discs over the scene. None or empty clears them."""
         self.drv_lines, self.drv_points = [], []
         for i, item in enumerate((lines or [])[:self.DRV_MAX_LINES]):
             pts, rgba, width = item[:3]
             segments = bool(item[3]) if len(item) > 3 else False
+            over = bool(item[4]) if len(item) > 4 else False
             pts = np.asarray(pts, np.float32).reshape(-1, 3)
             if len(pts) < 2:
                 continue
-            cols = np.tile(np.asarray(rgba, np.float32), (len(pts), 1))
+            rgba = np.asarray(rgba, np.float32)
+            cols = rgba.reshape(len(pts), 4) if rgba.ndim == 2 else np.tile(rgba.reshape(4), (len(pts), 1))
             self._upload_dyn(f"drvl{i}", np.concatenate([pts, cols], 1))
-            self.drv_lines.append((f"drvl{i}", len(pts), float(width), segments))
+            self.drv_lines.append((f"drvl{i}", len(pts), float(width), segments, over))
         for i, (pts, rgba, px) in enumerate((points or [])[:self.DRV_MAX_POINTS]):
             pts = np.asarray(pts, np.float32).reshape(-1, 3)
             if not len(pts):
@@ -924,10 +927,14 @@ class Scene:
             ctx.depth_mask = True
             self.ctx.line_width = 2.5
             self.plan0c_vao.render(moderngl.LINE_STRIP, vertices=n0)
-        for key, n, width, segments in self.drv_lines:
+        for key, n, width, segments, over in self.drv_lines:
             self.ctx.line_width = width
+            if over:
+                ctx.disable(moderngl.DEPTH_TEST)
             getattr(self, f"{key}_vao").render(moderngl.LINES if segments else moderngl.LINE_STRIP,
                                                vertices=n - (n % 2) if segments else n)
+            if over:
+                ctx.enable(moderngl.DEPTH_TEST)
         if self.ring_n > 1:
             self.ctx.line_width = 2.5
             self.ring_vao.render(moderngl.LINE_STRIP, vertices=self.ring_n)

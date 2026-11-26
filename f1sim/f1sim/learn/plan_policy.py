@@ -322,6 +322,7 @@ class PlanRunner:
         # memory hold, decoded at each decision for every learner row -- the console draws it (`dec_out`, `dec_pose`)
         self.dec = None
         self.dec_set = "feat+mem"
+        self.dec_on = True                      # the console's 디코더 toggle: off = the decoder is not run at all
         self.dec_out = None                     # {name: (B_l, ...) tensor} raw decoder outputs of each row's last decision
         self.dec_pose = None                    # (B_l, 3) the true pose each row's last decision was made at
         # mode "track" (11-09, the user: "얼추 여기에 맞는 제어기 좀 만들어놔"): full physics, `plan_follow.PlanFollower` follows
@@ -485,7 +486,7 @@ class PlanRunner:
                     self._roll_check(due)
                 # what the memory reads this decision (Actor2.features), for the decoder only
                 f_dec = (torch.cat([self.actor.enc(self.obs.scans), self.actor.norm(self.obs.state())], 1)
-                         if self.dec is not None else None)
+                         if self.dec is not None and self.dec_on else None)
                 u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 if self.pred_w is not None and self.actor.pred_out is not None:
                     # the other car's predicted next second, from the pose this decision is made at, in the world

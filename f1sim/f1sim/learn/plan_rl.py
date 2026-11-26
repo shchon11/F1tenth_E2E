@@ -2486,6 +2486,17 @@ def main(argv=None):
                               flush=True)
                         cm_parent = None; del _par
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
+                    if taps:
+                        # (11-26) the live view's state decoder (tools/live_dec.py runs it on the site's CPU): what the memory
+                        # read this decision (Actor2.features' inputs: the scan encoder's output and the normalised state, as
+                        # exam_reward.py's F1SIM_EXAM_SAVE_MEM keeps them), the memory after it, and the car as the decision
+                        # found it (x, y, yaw, vx, yaw rate) -- the tapped rows only (index copies: a restart's
+                        # `reset_rows` cannot clear them), read with the tap's one copy to the host; nothing trains on them
+                        _tq = tap_rows
+                        _tf = torch.cat([actor.enc(sc[_tq]), actor.norm(s[_tq])], 1)
+                        _tm, _ts = obs.mem_h[_tq], env.sim.state[lid[_tq]][:, [0, 1, 2, dyn.IVX, dyn.IR]]
+                        for k_, tp_ in enumerate(taps):
+                            tp_.dec_in = (_tf[k_], _tm[k_], _ts[k_])
                     if pc_on:
                         PCL.append(actor.pc_out.detach().clone())  # the update reads exactly these
                     if pred_on:
@@ -2772,7 +2783,7 @@ def main(argv=None):
                                pred=actor.pred_out[_q] if (pred_on and getattr(actor, "pred_out", None) is not None) else None,
                                pred_pose=getattr(tp_, "pose0", None),
                                pred_clear=(actor.pc_out[_q] * PC_SCALE) if (pc_on and actor.pc_out is not None) else None,
-                               **tap_opp_plan(_q))
+                               dec_in=getattr(tp_, "dec_in", None), **tap_opp_plan(_q))
                 if args.dump_rollout:
                     DMP["hard"].append((env.sim.contact_counts[lid, 3:6] - hard_d0).clamp_min(0).float())
                     for k in ("contact", "lap", "shaping"):

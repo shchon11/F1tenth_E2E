@@ -75,6 +75,13 @@
   .hud .v { font-size: 34px; font-weight: 600; line-height: 1; }
   .hud .u { font-size: 13px; color: var(--ink-2); margin-left: 4px; }
   .hud .sub { color: var(--ink-2); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  /* (11-26) what the state decoder reads out of the network, next to the truth: a number in a dashed outline of our car's
+     colour (everything decoded is dashed or hollow), the yaw rate's row only while there is a decoder */
+  .hud .dn { display: inline-block; margin-left: 8px; padding: 0 6px; border: 1.5px dashed var(--ego); border-radius: 6px;
+             color: var(--ego); font-size: 15px; font-weight: 600; line-height: 1.35; vertical-align: 5px; font-variant-numeric: tabular-nums; }
+  .hud .yr { margin-top: 6px; font-size: 15px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .hud .yr .u { font-size: 12px; margin-left: 2px; }
+  .hud .yr .dn { vertical-align: 0; font-size: 13px; margin-left: 6px; }
   .viewbar { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; align-items: center; }
   /* (11-17, the user: "update 반영중을 좀 지도 뿌옇게 하고 문구를 박아놔. 렉걸린줄 알잖아") between rollouts the car stands still on
      purpose: the map goes hazy and says so, with the seconds it has waited (no spinner: nothing on this page animates on its own) */
@@ -154,13 +161,12 @@
   <span class="pill" id="opp">-</span>
   <span class="grow"></span>
   <button id="b_spots" title="시험(같은 128판)에서 세게 닿은 자리를 checkpoint마다 -- 슬라이더를 끌어 넘겨 봄">시험 충돌 지도</button>
-  <!-- (11-26) the exam replay of the state decoders (dec_page.html) -->
-  <button id="b_dec" onclick="location.href='/dec'">디코더</button>
 </header>
 <main>
   <section class="panel mapwrap">
     <canvas id="map"></canvas>
-    <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span></div>
+    <div class="hud"><div><span class="v" id="hud_v">-</span><span class="u">m/s</span><span class="dn" id="hud_vd" hidden></span></div>
+      <div class="yr" id="hud_r" hidden><span id="hud_rt">-</span><span class="u">°/s</span><span class="dn" id="hud_rd"></span></div>
       <div class="sub" id="hud_sub">-</div></div>
     <div id="veil"><div id="veil_t">update 반영 중</div></div>
     <div class="viewbar"><button id="v_follow" class="on">차 따라가기</button><button id="v_track">전체 트랙</button></div>
@@ -445,6 +451,33 @@ function drawMap(f, carP, oppP, T, trail) {
   };
   for (const b of boxes) if (boxPath(b)) { g.strokeStyle = C.band; g.lineWidth = T.car[1] * s; g.stroke(); }
   for (const b of boxes) if (boxPath(b)) { g.fillStyle = C.box; g.fill(); }
+  // (11-26) the state decoder (live_dec.py): the walls and boxes it reads out of the network, as their dashed edges -- in the
+  // walls' grey ink and the boxes' amber, each stretch as strong as the decoder is sure there, fading out before the edge of
+  // what it covers. A line is [points, level per segment]: a run of one level is stroked at once, the dash pattern carried on
+  // across runs (lineDashOffset = the length of the line before the run) so it does not restart where the strength steps
+  const dec = f.dec || null;
+  const dashLines = (ls, col, w, a0, dash) => {
+    if (!Array.isArray(ls) || !dec) return;
+    const L = +dec.lv || 6;
+    g.save(); g.strokeStyle = col; g.lineWidth = w; g.lineCap = "butt"; g.setLineDash(dash);
+    for (const [q, lv] of ls) {
+      if (!Array.isArray(q) || !Array.isArray(lv) || q.length < 4) continue;
+      const pts = []; for (let i = 0; i + 1 < q.length; i += 2) pts.push(P(q[i], q[i + 1]));
+      let run = 0, len = 0;
+      for (let k = 0; k <= lv.length; k++) {
+        if (k < lv.length && lv[k] === lv[run]) continue;      // the run [run, k) of one level ends here
+        if (lv[run] > 0) {
+          g.globalAlpha = Math.min(1, a0 * lv[run] / L); g.lineDashOffset = len; g.beginPath(); g.moveTo(pts[run][0], pts[run][1]);
+          for (let j = run + 1; j <= k; j++) g.lineTo(pts[j][0], pts[j][1]);
+          g.stroke();
+        }
+        for (let j = run + 1; j <= k; j++) len += Math.hypot(pts[j][0] - pts[j - 1][0], pts[j][1] - pts[j - 1][1]);
+        run = k;
+      }
+    }
+    g.restore();
+  };
+  if (dec) { dashLines(dec.walls, C["ink-2"], 1.6, 0.9, [5, 4]); dashLines(dec.boxes, C.box, 2.2, 1, [4, 3]); }
   // the memory's read-out: where it thinks the boxes ahead are (dashed circles, stronger = surer)
   for (const b of f.mem_boxes || []) {
     if (b[0] < 0.3) continue;
@@ -523,6 +556,22 @@ function drawMap(f, carP, oppP, T, trail) {
   };
   if (oppP) car(oppP, odims, C.opp);
   car(carP, dims, C.ego);
+  // (11-26) the decoder's own car (where it puts us) and the other car (when it says one is within 10 m) as dashed outlines in
+  // their colours, the other car's 0.5 s and 1.0 s as hollow rings -- over the true cars, which they should cover
+  const ghost = (st, d, col, alpha) => {
+    const B = body(st, d);
+    rect(B, Math.min(B.hw, B.hl) * 0.3);
+    g.save(); g.globalAlpha = alpha; g.setLineDash([4, 3]); g.strokeStyle = col; g.lineWidth = 2; g.stroke(); g.restore();
+  };
+  if (dec && Array.isArray(dec.pose) && dec.pose.every(isFinite)) ghost(dec.pose, dims, C.ego, 1);
+  if (dec && dec.opp && isFinite(dec.opp.x) && isFinite(dec.opp.y)) {
+    const pa = Math.min(1, 0.4 + (+dec.opp.p || 0));
+    ghost([dec.opp.x, dec.opp.y, +dec.opp.yaw || 0], odims, C.opp, pa);
+    for (const q of okPts(dec.opp.fut) ? dec.opp.fut : []) {
+      const [x, y] = P(q[0], q[1]);
+      g.save(); g.globalAlpha = pa; g.strokeStyle = C.opp; g.lineWidth = 2; g.beginPath(); g.arc(x, y, 5 * zf, 0, 2 * Math.PI); g.stroke(); g.restore();
+    }
+  }
   if ((f.hit || []).some((x) => x > 0)) {
     const [x, y] = P(carP[0], carP[1]); g.strokeStyle = C.critical; g.lineWidth = 2.5; g.beginPath(); g.arc(x, y, Math.max(12, 0.55 * s), 0, 7); g.stroke();
   }
@@ -630,6 +679,11 @@ async function frame() {
   const moving = drawMap(F1, carP, oppP, T, F1.trail || []);
   setText($("hud_v"), carP[3].toFixed(1));
   $("hud_v").style.color = (F1.hit || []).some((x) => x > 0) ? C.critical : C.ink;
+  // (11-26) the decoder's speed beside the true one; its yaw rate beside the true yaw rate at the decision [°/s]
+  const dc = F1.dec, deg = (v) => Math.round(v * 180 / Math.PI).toString();
+  const okd = dc && isFinite(dc.v) && isFinite(dc.r) && isFinite(dc.tr);
+  if ($("hud_vd").hidden === !!okd) { $("hud_vd").hidden = !okd; $("hud_r").hidden = !okd; }
+  if (okd) { setText($("hud_vd"), (+dc.v).toFixed(1)); setText($("hud_rt"), deg(+dc.tr)); setText($("hud_rd"), deg(+dc.r)); }
   if (u < 1 || moving) requestDraw();                  // easing toward the newest frame; idle once there
 }
 

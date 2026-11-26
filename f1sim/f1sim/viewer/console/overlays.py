@@ -111,7 +111,7 @@ class PolicyInputPanel(QtWidgets.QWidget):
         # A driver other than our policy (`viewer.driver_viz`, already in the body frame): its own
         # lines and markers replace the policy's reading of this panel, and its legend says what they are.
         self._drv = drv
-        self.setToolTip(drv["legend"] if drv else self.POLICY_TIP)
+        self.setToolTip(drv["legend"] if drv and drv.get("legend") else self.POLICY_TIP)
         self.update()
 
     def clear(self):
@@ -207,7 +207,7 @@ class PolicyInputPanel(QtWidgets.QWidget):
 
         p.setPen(QtGui.QColor(C["text.2"]))
         f = p.font(); f.setPointSizeF(7.0); p.setFont(f)
-        if self._drv:
+        if self._drv and self._drv.get("legend"):
             # The driver's own legend (hover for all of it): the colours are its method's, not the policy's.
             legend = f"반경 {self.span:.0f}m · " + str(self._drv.get("legend", ""))
         else:
@@ -268,8 +268,18 @@ class PolicyInputPanel(QtWidgets.QWidget):
         for ln in self._drv.get("lines") or []:
             pts = q(np.asarray(ln["xy"], np.float32).reshape(-1, 2))
             if len(pts) > 1:
-                p.setPen(QtGui.QPen(_qc(ln["rgba"], float(ln["rgba"][3])), max(1.0, float(ln.get("w", 2.0)) * 0.8),
-                                    QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+                rgba = np.asarray(ln["rgba"], np.float32)
+                width = max(1.0, float(ln.get("w", 2.0)) * 0.8)
+                pen = lambda c: QtGui.QPen(_qc(c, float(c[3])), width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+                if rgba.ndim == 2:
+                    # (11-26) one colour per point (the state decoder's edges fade): each segment in its first point's
+                    for k, (a, b) in enumerate(zip(pts[0::2], pts[1::2]) if ln.get("segments") else zip(pts[:-1], pts[1:])):
+                        c = rgba[2 * k] if ln.get("segments") else rgba[k]
+                        if c[3] > 0.02:
+                            p.setPen(pen(c))
+                            p.drawLine(a, b)
+                    continue
+                p.setPen(pen(rgba))
                 if ln.get("segments"):
                     for a, b in zip(pts[0::2], pts[1::2]):
                         p.drawLine(a, b)

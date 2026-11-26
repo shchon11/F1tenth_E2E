@@ -345,6 +345,11 @@ class Tile(QtWidgets.QFrame):
         self.unit = QtWidgets.QLabel(unit)
         self.unit.setObjectName("TileUnit")
         row.addWidget(self.unit, 0, QtCore.Qt.AlignBottom)
+        # (11-26) a state decoder's reading of the same value (`set_dec`), hidden without one
+        self.dec = QtWidgets.QLabel("")
+        self.dec.setObjectName("TileDec")
+        self.dec.setVisible(False)
+        row.addWidget(self.dec, 0, QtCore.Qt.AlignBottom)
         row.addStretch(1)
         v.addLayout(row)
         self.sub = QtWidgets.QLabel("")
@@ -352,6 +357,22 @@ class Tile(QtWidgets.QFrame):
         self.sub.setWordWrap(True)
         self.sub.setVisible(False)
         v.addWidget(self.sub)
+        # and a second pair under it (true, decoded, unit): the speed tile's yaw rate
+        self.dec_row = QtWidgets.QWidget()
+        dr = QtWidgets.QHBoxLayout(self.dec_row)
+        dr.setContentsMargins(0, 2, 0, 0)
+        dr.setSpacing(6)
+        self.dec2_true = QtWidgets.QLabel("")
+        self.dec2_true.setObjectName("TileSub")
+        self.dec2_unit = QtWidgets.QLabel("")
+        self.dec2_unit.setObjectName("TileUnit")
+        self.dec2 = QtWidgets.QLabel("")
+        self.dec2.setObjectName("TileDec")
+        for w_ in (self.dec2_true, self.dec2_unit, self.dec2):
+            dr.addWidget(w_, 0, QtCore.Qt.AlignBottom)
+        dr.addStretch(1)
+        self.dec_row.setVisible(False)
+        v.addWidget(self.dec_row)
 
     def set_value(self, text: str, colour: Optional[str] = None):
         self.value.setText(text)
@@ -360,3 +381,18 @@ class Tile(QtWidgets.QFrame):
     def set_sub(self, text: str):
         self.sub.setText(text)
         self.sub.setVisible(bool(text))
+
+    def set_dec(self, text: str, second=None):
+        """(11-26) the decoder's reading beside the value (empty: none), and `second` = (true, decoded, unit) as a row of its
+        own under the tile (None: hidden)"""
+        if self.dec.text() != text:
+            self.dec.setText(text)
+        if self.dec.isHidden() == bool(text):
+            self.dec.setVisible(bool(text))
+        on = second is not None
+        if on:
+            for w_, t_ in zip((self.dec2_true, self.dec2, self.dec2_unit), second):
+                if w_.text() != t_:
+                    w_.setText(t_)
+        if self.dec_row.isHidden() == on:
+            self.dec_row.setVisible(on)

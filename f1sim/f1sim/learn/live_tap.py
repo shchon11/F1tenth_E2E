@@ -29,7 +29,14 @@ training reads or writes changes because of it.
   smallest free distance between our car where its previous plan puts it and the predicted other car (3 discs each, the
   plan-car margin; 3 = nothing predicted there or no previous plan; clipped to [-1, 3]); null without --pred-clear.
 The old ``parts_ep`` / ``parts_win`` (lap, shaping, contact, plan hit, total) stay.
+* ``dec_in`` (11-26, the user: "실시간 학습하는 차량 보여주는 거(/live)에서 그 차량에서 실시간으로 디코딩해서 보여주고"): what a state
+  decoder (f1sim/learn/state_decoder.py) reads -- {"f": the features the memory read this decision (the scan encoder's
+  output and the normalised state, float32 little-endian, base64), "m": the memory after it (same), "st": [x, y, yaw, vx,
+  yaw rate] of the car as the decision found it (the frame the decoder's grid and other car are in)}; null without a
+  memory or when the trainer passes none. The site (tools/live_dec.py, in dash_server.py) runs the run's newest decoder
+  on it and sends `dec` in its place.
 """
+import base64
 import json
 import os
 import time
@@ -115,14 +122,15 @@ class LiveTap:
                value: torch.Tensor, reward: torch.Tensor, lap: torch.Tensor, contact: torch.Tensor, shaping: torch.Tensor,
                vhat: torch.Tensor, noise: torch.Tensor, std: torch.Tensor, mem=None, replay: bool = False,
                copy_opp: bool = False, mem_read=None, mem_pose=None, known=None, parts=None, pred=None, pred_pose=None,
-               opp_plan=None, opp_live=None, pred_clear=None) -> None:
+               opp_plan=None, opp_live=None, pred_clear=None, dec_in=None) -> None:
         """after a decision, learner `row`'s: `pts` (10, 2) the plan it drove (world), `pts_mean` (10, 2) the plan its mean
         action makes, `plan_v` (10,) the driven plan's speeds, the critic's `value`, the reward and its parts, the speed
         estimate `vhat`, the size of the noise drawn (`noise`, in std units) and the policy's mean std, `mem` (memory,) the
         memory after this decision. The car as it stands at the decision's end. (11-24) `parts` (n,) the reward's terms
         named by `set_parts`; `pred` (21,) the prediction head's raw output and `pred_pose` (3,) the pose the decision was
         made at; `opp_plan` (10, 2) the other car's copy's plan (world) and `opp_live` () whether a copy drives it. (11-25)
-        `pred_clear` (10,) [m] the clearance inputs this decision read."""
+        `pred_clear` (10,) [m] the clearance inputs this decision read. (11-26) `dec_in` (feat (F,), mem (H,), st (5,)): what
+        a state decoder reads, see the module's docstring."""
         env, sim, r, o = self.env, self.env.sim, self.r, self.o
         dev = sim.state.device
         st = sim.state[r, :4].float()
@@ -142,6 +150,8 @@ class LiveTap:
         extra = [sc(parts) if parts is not None else e0, sc(pred) if pred is not None else e0,
                  sc(pred_pose)[:3] if pred_pose is not None else e0, sc(opp_plan) if opp_plan is not None else e0,
                  sc(opp_live) if opp_live is not None else e0, sc(pred_clear) if pred_clear is not None else e0]
+        di = list(dec_in) if dec_in is not None and len(dec_in) == 3 else [e0, e0, e0]
+        extra += [sc(di[0]), sc(di[1]), sc(di[2])]
         parts_l = [st, ost, present, sc(pts), sc(pts_mean), sc(plan_v), hard, sim.tid[r].float().reshape(1),
                    sc(value), sc(reward), sc(lap), sc(contact), sc(shaping), sc(vhat), sc(noise), sc(std), box, m, rng] + extra
         sizes = [int(p_.numel()) for p_ in parts_l]
@@ -150,7 +160,9 @@ class LiveTap:
         for n_ in sizes:
             out.append(flat[i:i + n_]); i += n_
         car, opp, pres, plan, plan_m, pv, hit, tid, val, rew, lap_, con, shp, vh, noi, sd, bx, mm, rr = out[:19]
-        npart, pq, ppose, oplan, olive, pclr = out[19:]
+        npart, pq, ppose, oplan, olive, pclr, d_f, d_m, d_st = out[19:]
+        b64 = lambda a: base64.b64encode(np.ascontiguousarray(a, dtype="<f4").tobytes()).decode()
+        dec_js = {"f": b64(d_f), "m": b64(d_m), "st": _r(d_st, 4)} if (d_f.size and d_m.size and d_st.size == 5) else None
         a = self.angles + car[2]
         sx, sy = car[0] + self.mount_x * np.cos(car[2]), car[1] + self.mount_x * np.sin(car[2])
         ok = np.isfinite(rr) & (rr > 0.05) & (rr < 29.0)
@@ -228,7 +240,7 @@ class LiveTap:
                "known": None if known is None else int(known),
                "parts": named, "parts_lag_s": lag, "parts_resid": round(self.resid_ep, 6),
                "pred": pred_js, "opp_plan": opp_js, "car_dims": self.car_dims, "opp_dims": self.car_dims,
-               "pred_clear": _r(pclr, 3) if pclr.size else None}
+               "pred_clear": _r(pclr, 3) if pclr.size else None, "dec_in": dec_js}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"run": self.run, "row": self.row, "now": now, "trail": list(self.trail)}, f, separators=(",", ":"))

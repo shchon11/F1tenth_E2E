@@ -756,7 +756,8 @@ class SimWorker:
         self._sim_rate = 0.0
         self._last_send = 0.0
         self._min_send_dt = 1.0 / MAX_FRAME_HZ
-        self._overlay = {"saliency": False, "internals": False, "plan": True}
+        # (11-26, the user: "콘솔에서 같이 보여주게") a checkpoint's state decoder is drawn by default; 표시 > 디코더 turns it off
+        self._overlay = {"saliency": False, "internals": False, "plan": True, "decoder": True}
         self._sal_cache: Optional[np.ndarray] = None
         #: (car, steer, speed, received) from the console's keyboard driving (`CMD_MANUAL`), None when off
         self._manual: Optional[Tuple[int, float, float, float]] = None
@@ -2235,16 +2236,17 @@ class SimWorker:
                 drv_fr = dict(drv_fr or {})
                 drv_fr["lines"] = list(drv_fr.get("lines") or []) + [pred_line]
                 drv_fr["points"] = list(drv_fr.get("points") or []) + [pred_pts]
+        dec_num = None
         if dec_t is not None:
             vals = []
             for t_ in dec_t:
                 nq = int(t_.numel()); vals.append(_copy(flat[i:i + nq])); i += nq
             try:
-                dfr = self._decoder_frame(session, vals, (p[focus, 0], p[focus, 1], p[focus, 2]), float(p[focus, 3]))
+                dfr = self._decoder_frame(session, vals)
                 drv_fr = dict(drv_fr or {})
                 drv_fr["lines"] = list(drv_fr.get("lines") or []) + dfr["lines"]
-                drv_fr["points"] = list(drv_fr.get("points") or []) + dfr["points"]
-                drv_fr["grid"], drv_fr["legend"], drv_fr["title"] = dfr["grid"], dfr["legend"], dfr["title"]
+                drv_fr.setdefault("title", "상태 디코더")
+                dec_num = dfr["num"]
             except Exception as exc:                # a drawing aid never stops the simulation it draws
                 self._overlay["decoder"] = False
                 self.say(P.MSG_LOG, gen=self.gen, text=f"디코더 표시를 끕니다 (오류: {type(exc).__name__}: {exc})")
@@ -2294,6 +2296,10 @@ class SimWorker:
         }
         if drv_fr is not None:
             fr["drv"] = drv_fr
+        if dec_num is not None:
+            # (11-26) the decoder's speed and yaw rate for the HUD, beside the focus car's true ones (`r`, from the pack)
+            fr["dec"] = dec_num
+            fr["r"] = float(p[focus, 5])
         if props_dyn is not None:
             fr["props_dyn"] = props_dyn
         if contact is not None:
@@ -2324,7 +2330,7 @@ class SimWorker:
         """(11-26, the user: "그 정보들이 네트워크에 있는지 디버깅용 디코더 ... 사이트나 콘솔에서도") a plan checkpoint's state decoder,
         when one was trained for it (tools/lab_decoder_watch.sh puts `plan_uN_dec.npz` beside `plan_uN.pt`): the file beside
         the checkpoint (or beside what a `watch_<run>/state_latest.pt` link points at), else the run's `plan_u<update>_dec.npz`.
-        Read-only: it decodes the policy's features and memory at each decision; 표시 > '디코더' draws it."""
+        Read-only: it decodes the policy's features and memory at each decision; drawn by default, 표시 > '디코더' turns it off."""
         runner = session.get("act_fn")
         if not hasattr(runner, "attach_decoder"):
             return
@@ -2346,14 +2352,15 @@ class SimWorker:
                 self.say(P.MSG_LOG, gen=gen, text=f"상태 디코더를 못 씀 ({os.path.basename(c)}: {exc})")
                 return
             session["decoder"] = c
-            self.say(P.MSG_LOG, gen=gen, text=f"상태 디코더 있음: {name} 시험 기록으로 학습 ({runner.dec_set}) · 표시 > 디코더로 켭니다")
+            runner.dec_on = bool(self._overlay.get("decoder", True))
+            self.say(P.MSG_LOG, gen=gen, text=f"상태 디코더 있음: {name} 시험 기록으로 학습 ({runner.dec_set}) · 표시 > 디코더로 끕니다")
             return
 
     def _decoder_overlay(self, session, focus: int):
         """the decoder's answer for the focus car, as tensors to ride in the frame's single copy (None: nothing to draw)"""
         import torch
         runner = session.get("act_fn")
-        if not self._overlay.get("decoder") or getattr(runner, "dec_out", None) is None:
+        if not self._overlay.get("decoder", True) or getattr(runner, "dec_out", None) is None:
             return None
         k = runner.pred_row(focus)
         if k < 0:
@@ -2362,54 +2369,81 @@ class SimWorker:
         return [torch.sigmoid(o["wall"][k].float()), torch.sigmoid(o["box"][k].float()), o["pose"][k].float(),
                 o["ego"][k].float(), o["opp"][k].float(), runner.dec_pose[k].float()]
 
-    def _decoder_frame(self, session, vals, true_pose, true_v) -> dict:
-        """the decoder's layers in the console's driver overlay (`fr["drv"]`): walls (teal) and boxes (amber) as the 2D
-        panel's grid image and, in 3D, the wall edges and box cells as markers; where it puts our car (teal outline) and the
-        other car (magenta outline, its 0.5 / 1.0 s points), all in the frame of the car at the decision"""
-        from ..learn import state_decoder as SD
-        dec = session["act_fn"].dec
-        nx, ny = SD.NX, SD.NY
-        wall, box = vals[0].reshape(nx, ny), vals[1].reshape(nx, ny)
-        pr, eg, q, dp = vals[2], vals[3], vals[4], vals[5]
-        TEAL, AMBER, MAG = (0.13, 0.80, 0.58), (0.95, 0.62, 0.05), (1.0, 0.2, 0.85)
-        wm = wall > 0.5
-        edge = wm & ~(np.pad(wm, 1, constant_values=True)[:-2, 1:-1] & np.pad(wm, 1, constant_values=True)[2:, 1:-1]
-                      & np.pad(wm, 1, constant_values=True)[1:-1, :-2] & np.pad(wm, 1, constant_values=True)[1:-1, 2:])
-        # a light wash over the decoded wall mass, its rim strong (as the site's /dec), boxes over it
-        img = np.zeros((nx, ny, 4), np.uint8)
-        img[..., :3] = np.array(TEAL) * 255
-        img[..., 3] = np.where(edge, 235, np.clip(wall * 80, 0, 255))
-        bm = box > 0.15
-        img[bm, :3] = np.array(AMBER) * 255
-        img[bm, 3] = np.clip(box[bm] * 255, 0, 255)
-        cx, cy, cyaw = float(dp[0]), float(dp[1]), float(dp[2])
-        c0, s0 = math.cos(cyaw), math.sin(cyaw)
-        cells = SD.cell_centres().reshape(nx, ny, 2)
-        to_w = lambda u, v: np.stack([cx + u * c0 - v * s0, cy + u * s0 + v * c0], -1).astype(np.float32)
-        pts = [{"xy": to_w(cells[edge][:, 0], cells[edge][:, 1]), "rgba": TEAL + (0.85,), "px": 4.0, "panel": False},
-               {"xy": to_w(cells[box > 0.5][:, 0], cells[box > 0.5][:, 1]), "rgba": AMBER + (1.0,), "px": 8.0, "panel": False}]
-        x0, x1, y0, y1 = dec.pose_ext
-        px_, py_ = x0 + float(pr[0]) * (x1 - x0), y0 + float(pr[1]) * (y1 - y0)
-        pyaw = math.atan2(float(pr[3]), float(pr[2]))
+    #: (11-26) the decoder's colours in the 3D view, the console's own for each thing: our car's cyan ring, the rival's orange
+    #: tint, the prop-contact yellow; the decoded walls a light grey (the 3D walls' tone, brighter)
+    DEC_WALL, DEC_BOX, DEC_EGO, DEC_OPP = (0.86, 0.88, 0.93), (1.0, 0.83, 0.15), (0.35, 0.9, 1.0), (0.95, 0.62, 0.25)
 
-        def rect(x, y, yaw, L=0.58, W=0.31):
-            c, s_ = math.cos(yaw), math.sin(yaw)
-            q_ = [(L / 2, W / 2), (L / 2, -W / 2), (-L / 2, -W / 2), (-L / 2, W / 2), (L / 2, W / 2)]
-            return np.array([[x + a * c - b * s_, y + a * s_ + b * c] for a, b in q_], np.float32)
-        lines = [{"xy": rect(px_, py_, pyaw), "rgba": TEAL + (1.0,), "w": 2.5}]
-        p_opp = 1.0 / (1.0 + math.exp(-float(q[0])))
-        S = SD.OPP_SCALE
-        if p_opp > 0.5:
-            ox, oy = to_w(np.array([float(q[1]) * S]), np.array([float(q[2]) * S]))[0]
-            lines.append({"xy": rect(float(ox), float(oy), cyaw + math.atan2(float(q[4]), float(q[3]))), "rgba": MAG + (0.95,), "w": 2.5})
-            fut = to_w(np.array([float(q[6]), float(q[8])]) * S, np.array([float(q[7]), float(q[9])]) * S)
-            pts.append({"xy": fut, "rgba": MAG + (1.0,), "px": 7.0})
-        r_deg = math.degrees(float(eg[2]) * float(dec.ego_scale[2]))
-        v_dec = float(eg[0]) * float(dec.ego_scale[0])
-        legend = (f"디코더 {session['act_fn'].dec_set}: 청록 벽·pose, 주황 상자, 분홍 상대 차"
-                  + (f" {p_opp:.2f}" if p_opp > 0.5 else "") + f" · 속도 {v_dec:.2f} (참 {true_v:.2f}) m/s · 회전 {r_deg:.0f}°/s")
-        return {"title": "상태 디코더", "legend": legend, "lines": lines, "points": [q_ for q_ in pts if len(q_["xy"])],
-                "grid": {"rgba": img, "res": SD.GRID_RES, "x0": SD.GRID_X0}}
+    def _decoder_frame(self, session, vals) -> dict:
+        """(11-26, the user: "ROI는 왜 걸어놓은 거야? 존나 거슬리게", "콘솔에서 같이 보여주게") the decoder's answer as lines in the
+        3D view (and the 2D panel), all in the frame of the car at the decision, no grid frame or fill: the decoded walls and
+        boxes as their dashed edges (`learn.dec_shapes`: where the probability crosses one half, as strong as the decoder is
+        sure, fading out over the grid's last metre -- the site's /live draws the same dashes), where it puts our car and the
+        other car as dashed outlines, the other car's 0.5 / 1.0 s as rings; drawn over the scene (a wall's face or a car's
+        body would hide them). `num`: the decoded speed and yaw rate for the HUD."""
+        from ..learn import dec_shapes as DS
+        dec = session["act_fn"].dec
+        wall, box, pr, eg, q, dp = vals
+        pose = (float(dp[0]), float(dp[1]), float(dp[2]))
+        key = (wall.tobytes(), box.tobytes(), pose)
+        cache = session.get("_dec_draw")
+        if cache is not None and cache[0] == key:               # the same decision as the last frame: the same lines
+            return cache[1]
+        grid = [float(v) for v in getattr(dec, "grid", (-3.0, 9.0, -6.0, 6.0, 0.25))]
+        nx, ny = int(round((grid[1] - grid[0]) / grid[4])), int(round((grid[3] - grid[2]) / grid[4]))
+        lines = []
+
+        def dashed(segs, w, rgb, width):
+            if not len(segs):
+                return
+            rgba = np.repeat(np.concatenate([np.tile(np.asarray(rgb, np.float32), (len(w), 1)), w[:, None]], 1), 2, 0)
+            lines.append({"xy": segs.reshape(-1, 2), "rgba": rgba.astype(np.float32), "w": width, "segments": True, "over": True})
+        dashed(*DS.dashed_edges(np.asarray(wall, np.float32).reshape(nx, ny), grid, pose), self.DEC_WALL, 2.0)
+        dashed(*DS.dashed_edges(np.asarray(box, np.float32).reshape(nx, ny), grid, pose, on=0.09, off=0.06), self.DEC_BOX, 3.0)
+
+        def outline(x, y, yaw, rgb, alpha):
+            d, _ = DS.dashes(DS.outline(x, y, yaw), None, on=0.07, off=0.05)
+            lines.append({"xy": d.reshape(-1, 2), "rgba": tuple(rgb) + (alpha,), "w": 2.5, "segments": True, "over": True})
+        x0, x1, y0, y1 = dec.pose_ext
+        if self._dec_same_map(session, dec):
+            outline(x0 + float(pr[0]) * (x1 - x0), y0 + float(pr[1]) * (y1 - y0), math.atan2(float(pr[3]), float(pr[2])),
+                    self.DEC_EGO, 1.0)
+        p_opp = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, float(q[0])))))
+        if getattr(dec, "has_opp", True) and p_opp > 0.5:
+            S = float(getattr(dec, "opp_scale", 5.0))
+            loc = DS.to_world(np.array([[q[1] * S, q[2] * S], [q[6] * S, q[7] * S], [q[8] * S, q[9] * S]], np.float64), pose)
+            a = min(1.0, 0.4 + p_opp)
+            outline(float(loc[0, 0]), float(loc[0, 1]), pose[2] + math.atan2(float(q[4]), float(q[3])), self.DEC_OPP, a)
+            rings = [DS.ring(float(x), float(y), 0.12) for x, y in loc[1:]]
+            segs = np.concatenate([np.stack([r_[:-1], r_[1:]], 1) for r_ in rings], 0)
+            lines.append({"xy": segs.reshape(-1, 2), "rgba": self.DEC_OPP + (a,), "w": 2.5, "segments": True, "over": True})
+        num = {"v": float(eg[0]) * float(dec.ego_scale[0]), "r": float(eg[2]) * float(dec.ego_scale[2])}
+        out = {"lines": lines, "num": num}
+        session["_dec_draw"] = (key, out)
+        return out
+
+    @staticmethod
+    def _dec_same_map(session, dec) -> bool:
+        """whether the focus car's track is the map the decoder was trained on (its pose is in that map's frame; on another
+        map the decoded pose means nothing and is not drawn): the two maps' extents within 1.5 m of each other on every side
+        (korea26scan's hose variants are the bag map grown 1 m on every side)"""
+        env = session["env"]
+        tr = env.sim.track
+        try:
+            k = int(env.sim.tid[int(session["focus"])])
+        except Exception:
+            k = 0
+        memo = session.setdefault("_dec_map", {})
+        if k not in memo:
+            try:
+                res = float(tr.t_res.reshape(-1)[k if tr.t_res.numel() > k else 0])
+                org = tr.t_origin.reshape(-1, 2)[k if tr.t_origin.reshape(-1, 2).shape[0] > k else 0]
+                ox, oy = float(org[0]), float(org[1])
+                ex = (ox, ox + int(tr.t_W[k]) * res, oy, oy + int(tr.t_H[k]) * res)
+                x0, x1, y0, y1 = (float(v) for v in dec.pose_ext)
+                memo[k] = max(abs(a - b) for a, b in zip((x0, x1, y0, y1), ex)) <= 1.5
+            except Exception:
+                memo[k] = False
+        return memo[k]
 
     def _viz_failure(self, session, exc) -> None:
         """A driver overlay that fails is switched off for the session and said once: a drawing aid
@@ -2538,6 +2572,9 @@ class SimWorker:
             self._overlay.update({k: bool(v) for k, v in (msg.get("overlay") or {}).items()})
             if not self._overlay.get("saliency"):
                 self._sal_cache = None
+            _rn = session.get("act_fn") if session else None
+            if _rn is not None and hasattr(_rn, "dec_on"):            # off: the decoder is not run at all
+                _rn.dec_on = bool(self._overlay.get("decoder", True))
             self.say(P.MSG_ACK, seq=seq, command="overlay", gen=self.gen, state=dict(self._overlay))
         return reanchor
 

@@ -903,8 +903,9 @@ class SessionController(QtCore.QObject):
         self.window.apply_state(STATE_RUNNING)
         self.window.settle_pause(False)
         self.window.viewport.reset_timing()
-        # (11-26) the live toggles a fresh worker does not know yet (the state decoder's is not in the session config)
-        if getattr(self.window, "chk_decoder", None) is not None and self.window.chk_decoder.isChecked():
+        # (11-26) the live toggles a fresh worker does not know yet (the state decoder's is not in the session config: the
+        # worker draws it by default, so an unticked 디코더 has to be said)
+        if getattr(self.window, "chk_decoder", None) is not None:
             self.window._emit_overlay_request()
         self.window.spark.clear()
         self.window.status_text.setText(

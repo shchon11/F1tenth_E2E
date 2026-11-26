@@ -341,6 +341,9 @@ QPushButton#IconButton:disabled {{ color: {c['text.2']}; background: {c['bg.pane
 #TileValueBig {{ font-family: "{MONO_FONT}", monospace; font-size: {SIZE['hud']}px; font-weight: 600; color: {c['text.0']}; }}
 #TileUnit {{ font-size: 12px; color: {c['text.2']}; }}
 #TileSub {{ font-family: "{MONO_FONT}", monospace; font-size: 12px; color: {c['text.1']}; }}
+/* (11-26) a state decoder's reading beside the true value: dashed, in our car's colour (as its outlines in the 3D view) */
+#TileDec {{ font-family: "{MONO_FONT}", monospace; font-size: 13px; font-weight: 600; color: {c['ego']};
+            border: 1px dashed {c['ego']}; border-radius: 4px; padding: 0px 4px; }}
 /* 11-03: the condition bar under the top bar -- the obstacle seed / layout and the opponent of the chosen condition */
 #CondBar {{ background: {c['bg.panel']}; border-bottom: 1px solid {c['line']}; }}
 #CondBar QLabel#CondLabel {{ font-size: 11px; font-weight: 700; color: {c['text.2']}; letter-spacing: 0.8px; }}
