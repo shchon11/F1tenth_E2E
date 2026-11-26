@@ -239,24 +239,29 @@ def main():
     grow = SD.BOX_GROW
 
     def box_cells(i, sids, poses):
-        """(n, K, C) bool: the cells of each box's zone (centre within the outline grown by BOX_GROW), K slots"""
+        """(n, K, C) bool: the cells of each box's zone (centre within the outline grown by BOX_GROW), K slots. Only the live
+        slots are computed (a record keeps 18 slots, ~3 live: all of them made a (n, 18, C, V) tensor of ~1.4 GB a chunk)"""
         n, K = sids.shape
-        live = sids >= 0
-        q = fp_t[sids.clamp(min=0)]                                                  # (n, K, V, 2) box frame
-        cb, sb = torch.cos(poses[..., 2])[..., None], torch.sin(poses[..., 2])[..., None]
-        wx = poses[..., 0:1] + q[..., 0] * cb - q[..., 1] * sb; wy = poses[..., 1:2] + q[..., 0] * sb + q[..., 1] * cb
-        s0 = st_f[i]
-        c0, s0_ = torch.cos(s0[:, 2])[:, None, None], torch.sin(s0[:, 2])[:, None, None]
-        dx, dy = wx - s0[:, 0, None, None], wy - s0[:, 1, None, None]
-        cx, cy = dx * c0 + dy * s0_, -dx * s0_ + dy * c0                              # (n, K, V) car frame
+        out = torch.zeros(n, K, cells.shape[0], dtype=torch.bool, device=dev)
+        r, k = torch.nonzero(sids >= 0, as_tuple=True)
+        if len(r) == 0:
+            return out
+        q = fp_t[sids[r, k]]                                                         # (M, V, 2) box frame
+        pz = poses[r, k]                                                             # (M, 3)
+        cb, sb = torch.cos(pz[:, 2])[:, None], torch.sin(pz[:, 2])[:, None]
+        wx = pz[:, 0:1] + q[..., 0] * cb - q[..., 1] * sb; wy = pz[:, 1:2] + q[..., 0] * sb + q[..., 1] * cb
+        s0 = st_f[i][r]
+        c0, s0_ = torch.cos(s0[:, 2])[:, None], torch.sin(s0[:, 2])[:, None]
+        dx, dy = wx - s0[:, 0:1], wy - s0[:, 1:2]
+        cx, cy = dx * c0 + dy * s0_, -dx * s0_ + dy * c0                              # (M, V) car frame
         ex, ey = torch.roll(cx, -1, -1) - cx, torch.roll(cy, -1, -1) - cy
         ln = torch.sqrt(ex * ex + ey * ey).clamp_min(1e-9)
         nx, ny = ey / ln, -ex / ln                                                   # outward (counter-clockwise outline)
         deg = ln < 1e-6
-        dd = (cells[None, None, :, None, 0] - cx[:, :, None, :]) * nx[:, :, None, :] + \
-             (cells[None, None, :, None, 1] - cy[:, :, None, :]) * ny[:, :, None, :]  # (n, K, C, V)
-        dd = torch.where(deg[:, :, None, :], torch.full_like(dd, -1e9), dd)
-        return (dd.max(-1).values < grow) & live[:, :, None]
+        dd = (cells[None, :, None, 0] - cx[:, None, :]) * nx[:, None, :] + (cells[None, :, None, 1] - cy[:, None, :]) * ny[:, None, :]
+        dd = torch.where(deg[:, None, :], torch.full_like(dd, -1e9), dd)             # (M, C, V)
+        out[r, k] = dd.max(-1).values < grow
+        return out
 
     N = len(tt)
     wall_t = torch.zeros(N, NCL, dtype=torch.uint8, device=dev)
