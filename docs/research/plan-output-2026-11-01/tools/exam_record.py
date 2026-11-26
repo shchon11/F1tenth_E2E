@@ -331,6 +331,8 @@ def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
 obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
 if getattr(actor, "pace_levels", 0):                         # (11-21) a pace policy: its state inputs exist before the first read
     obs.pace_on(actor.pace_levels, actor.pace_hold)
+if getattr(actor, "intent_k", 0):                            # (11-26) an intent policy (argmax at each redraw; F1SIM_INTENT_FIX=k:
+    obs.intent_on(actor.intent_k, actor.intent_hold)         # that intent throughout), its critic's inputs from the first read
 # (11-22) a rolling-plan policy (plan_rl --plan-roll) is examined the way it was trained: every decision the committed plan
 # keeps its next 0.9 s and the policy's last step is appended; a whole new plan at a start, after a contact, or when something
 # out of view (a box: nor passed) when a part was added now blocks the committed path (`plan_rl.roll_blocked`)
@@ -777,6 +779,8 @@ for kd in range(T):
         obs.pace_idx[:] = int(LINE_LEVEL)
     if getattr(obs, "pace_idx", None) is not None:              # (11-21) a pace policy: the level in force each decision
         R.setdefault("pace", []).append(obs.pace_idx.to(torch.int8).cpu())
+    if getattr(obs, "intent_z", None) is not None:              # (11-26) an intent policy: the intent each decision drove
+        R.setdefault("intent", []).append(obs.intent_z.to(torch.int8).cpu())
     if FREEZE and h_prev is not None:
         obs.mem_h = torch.where(_fz[:, None], h_prev, obs.mem_h)
     if SAVE_MEM:
@@ -894,6 +898,8 @@ if RACE4:
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)
+if getattr(actor, "intent_k", 0):                           # (11-26) argmax at each redraw, or F1SIM_INTENT_FIX's
+    D["intent_fix"] = np.array(os.environ.get("F1SIM_INTENT_FIX", "")); D["intent_hold"] = np.array(actor.intent_hold)
 D["pred_mode"] = np.array("oracle" if PRED_ORACLE else ("clear_oracle" if PRED_CLEAR_ORACLE else ("probe" if PRED_PROBE else ("save" if PRED_SAVE else "")))); D["wipe"] = np.array(WIPE); D["wipe_box"] = np.array(WIPE_BOX); D["sample"] = np.array(SAMPLE); D["noise_rho"] = np.array(NOISE_RHO); D["steer_std_floor"] = np.array(STEER_STD_FLOOR); D["freeze"] = np.array(FREEZE); D["corridor"] = np.array(CORRIDOR)
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
