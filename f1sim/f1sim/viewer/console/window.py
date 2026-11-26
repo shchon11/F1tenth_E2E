@@ -2265,6 +2265,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_internals = QtWidgets.QCheckBox("신경망 내부 활성화")
         self.chk_internals.toggled.connect(self._on_internals)
         cost.add(self.chk_internals)
+        # (11-26, the user: "그 정보들이 네트워크에 있는지 디버깅용 디코더 ... 콘솔에서도") a plan checkpoint with a state decoder
+        # (plan_uN_dec.npz beside it, tools/lab_decoder_watch.sh): what its features and memory hold, drawn over the scene
+        self.chk_decoder = QtWidgets.QCheckBox("상태 디코더 (정책 안쪽 값에서 되살린 벽·상자·pose·상대 차)")
+        self.chk_decoder.setToolTip("checkpoint 옆에 plan_uN_dec.npz가 있을 때만 그립니다 (시험 기록으로 학습한 읽기 전용 디코더).\n"
+                                    "청록 = 되살린 벽과 우리 차 자리, 주황 = 상자, 분홍 = 상대 차와 0.5·1.0 s 뒤 자리.\n"
+                                    "2D 패널에는 차 기준 격자(앞 -3..9 m, 옆 ±6 m)로, 3D에는 벽 가장자리·상자 칸 점으로.")
+        self.chk_decoder.toggled.connect(self._emit_overlay_request)
+        cost.add(self.chk_decoder)
         self.chk_interp = QtWidgets.QCheckBox("프레임 보간 (부드럽게)")
         self.chk_interp.setChecked(True)
         self.chk_interp.setToolTip("시뮬 프레임 사이를 시뮬의 실측 속도로 보간합니다. "
@@ -3727,7 +3735,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def _emit_overlay_request(self):
         self.overlay_requested.emit({"saliency": self.chk_saliency.isChecked(),
                                      "internals": self.chk_internals.isChecked(),
-                                     "plan": self.chk_plan.isChecked()})
+                                     "plan": self.chk_plan.isChecked(),
+                                     "decoder": self.chk_decoder.isChecked()})
 
     def _on_screenshot(self):
         """A PNG of the 3D view, at the resolution the 녹화 card is set to.

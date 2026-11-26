@@ -318,6 +318,12 @@ class PlanRunner:
         self.pred_w = (torch.zeros(Bl, PRED_OUT, device=device)
                        if getattr(getattr(self, "actor", None), "pred_opp", False) else None)
         self._row_of = {int(r): k for k, r in enumerate(self.lid.tolist())}
+        # (11-26) a state decoder (`state_decoder.StateDecoder`, `attach_decoder`): read-only, what the policy's features and
+        # memory hold, decoded at each decision for every learner row -- the console draws it (`dec_out`, `dec_pose`)
+        self.dec = None
+        self.dec_set = "feat+mem"
+        self.dec_out = None                     # {name: (B_l, ...) tensor} raw decoder outputs of each row's last decision
+        self.dec_pose = None                    # (B_l, 3) the true pose each row's last decision was made at
         # mode "track" (11-09, the user: "얼추 여기에 맞는 제어기 좀 만들어놔"): full physics, `plan_follow.PlanFollower` follows
         # the plan in time (actuator lags inverted), its command goes in through the env's external-command path
         self.follower = None
@@ -345,6 +351,36 @@ class PlanRunner:
                                         **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"),
                                                    [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
             env.claim_external(self.lid)
+
+    def attach_decoder(self, path: str, which: str = "feat+mem") -> str:
+        """load a checkpoint's state decoder (`<checkpoint>_dec.npz`); raises ValueError when it does not fit this policy"""
+        from .state_decoder import StateDecoder
+        if not self.v2 or self.v3:
+            raise ValueError("state decoders read v2 plan policies only")
+        dec = StateDecoder(path, self.device)
+        if which not in dec.nets:
+            raise ValueError(f"no '{which}' decoder in {path}")
+        sd = int(self.actor.norm.mean.shape[0])
+        if dec.feat_dim != 256 + sd or dec.mem_dim != int(getattr(self.actor, "memory", 0) or 0):
+            raise ValueError(f"decoder for feat {dec.feat_dim} / mem {dec.mem_dim}, this policy has {256 + sd} / "
+                             f"{int(getattr(self.actor, 'memory', 0) or 0)}")
+        self.dec, self.dec_set = dec, which
+        return dec.checkpoint
+
+    @torch.no_grad()
+    def _decode(self, due: torch.Tensor, feat: torch.Tensor, st: torch.Tensor) -> None:
+        """the decoder on this decision's features and the memory after it, kept for the rows deciding now"""
+        mem = getattr(self.obs, "mem_h", None)
+        if mem is None:
+            return
+        o = self.dec.raw(feat.float(), mem.float(), self.dec_set)
+        if self.dec_out is None:
+            self.dec_out = {k: v.clone() for k, v in o.items()}
+            self.dec_pose = st[:, :3].float().clone()
+        else:
+            for k, v in o.items():
+                self.dec_out[k] = torch.where(due.view(-1, *([1] * (v.dim() - 1))), v, self.dec_out[k])
+            self.dec_pose = torch.where(due[:, None], st[:, :3].float(), self.dec_pose)
 
     def pred_row(self, env_row: int) -> int:
         """the learner index of env row `env_row` (-1: not a learner car) -- the console's frame reads `pred_w[k]`"""
@@ -447,6 +483,9 @@ class PlanRunner:
                           if getattr(self.obs, "pace_idx", None) is not None else None)
                 if self.roll:
                     self._roll_check(due)
+                # what the memory reads this decision (Actor2.features), for the decoder only
+                f_dec = (torch.cat([self.actor.enc(self.obs.scans), self.actor.norm(self.obs.state())], 1)
+                         if self.dec is not None else None)
                 u_, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 if self.pred_w is not None and self.actor.pred_out is not None:
                     # the other car's predicted next second, from the pose this decision is made at, in the world
@@ -461,6 +500,8 @@ class PlanRunner:
                 if h_old is not None and getattr(self.actor, "memory", 0):
                     # a memory steps once per decision: rows not deciding now keep theirs
                     self.obs.mem_h = torch.where(due[:, None], self.obs.mem_h, h_old)
+                if f_dec is not None:
+                    self._decode(due, f_dec, st)
                 if b_old is not None:
                     self.obs.prev_branch = torch.where(due, self.obs.prev_branch, b_old)
                 if pc_old is not None:                            # the pace level: only deciding rows move on
