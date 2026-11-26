@@ -24,7 +24,9 @@ policy는 얼린 채(기록된 값만 읽음), 디코더만 배움 -- 디버깅 
 출력: <out>_dec.npz (디코더 셋; 콘솔은 torch로, 사이트는 numpy로 돌림), <out>_decin.npz (시험 세션의 feat·mem, 사이트 재생용),
 <out>_decode.txt (지표).
 --ckpt-copy 경로: 같은 디코더 파일을 checkpoint 옆(plan_uN_dec.npz, 콘솔이 찾는 자리)에도 씀.
-인자: 기록npz [--out 앞머리] [--epochs 60] [--device auto|cpu|cuda] [--ckpt-copy 경로]"""
+대조(기록에 F1SIM_EXAM_SAVE_SCAN의 <기록>_scan.npz가 있거나 --scan 경로): 같은 디코더를 policy가 읽는 가장 새 스캔 그대로에 학습해 같은 표에
+한 줄 더 -- 스캔 안에 있는 것을 이 크기의 디코더가 얼마나 꺼내는지 (policy 안쪽 값이 그보다 못하면 인코더가 버린 것). 저장은 안 함.
+인자: 기록npz [--out 앞머리] [--epochs 60] [--device auto|cpu|cuda] [--ckpt-copy 경로] [--scan 경로]"""
 import argparse
 import json
 import math
@@ -48,6 +50,7 @@ else:
 LF, LR = 0.15875, 0.17145
 WB = LF + LR
 FOV, RMAX = math.radians(135.0), 10.0
+SCAN = "(대조) 원시 스캔"
 
 
 def parse():
@@ -60,6 +63,9 @@ def parse():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--ckpt-copy", default="")
     ap.add_argument("--hidden", type=int, default=512)
+    # a control: the same decoder on the raw newest scan (F1SIM_EXAM_SAVE_SCAN's <record>_scan.npz, or this path) -- what a
+    # decoder of this size gets out of the scan itself; never saved with the policy's decoders
+    ap.add_argument("--scan", default=None)
     return ap.parse_args()
 
 
@@ -272,6 +278,11 @@ def main():
 
     # ---- inputs
     feat_np = feat_all.reshape(T * B, -1); mem_np = mem_all.reshape(T * B, -1)
+    scan_p = a.scan or rec[:-4] + "_scan.npz"
+    SETS = list(SD.SETS)
+    if os.path.exists(scan_p):
+        scan_np = np.load(scan_p)["scan"][:T].reshape(T * B, -1)                     # range / range_max, float16
+        SETS.append(SCAN)
     F_, H_ = feat_np.shape[1], mem_np.shape[1]
     tr_i = np.nonzero(rl == 0)[0]; va_i = np.nonzero(rl == 1)[0][::2]
     te_i = np.nonzero((rl == 2) & (tt - k0[tt, bb] >= 10))[0]
@@ -292,9 +303,10 @@ def main():
         return lp + le + lw + lb + lo
 
     nets, norms, preds = {}, {}, {}
-    for which in SD.SETS:
+    for which in SETS:
         t0 = time.time()
-        Xn = feat_np if which == "feat" else (mem_np if which == "mem" else np.concatenate([feat_np, mem_np], 1))
+        Xn = (feat_np if which == "feat" else mem_np if which == "mem" else scan_np if which == SCAN
+              else np.concatenate([feat_np, mem_np], 1))
         mu = Xn[tr_i].astype(np.float32).mean(0); sd = Xn[tr_i].astype(np.float32).std(0) + 1e-4
         Xg = torch.as_tensor(Xn, device=dev)                                         # float16 on the device
         mu_g, sd_g = torch.as_tensor(mu, device=dev), torch.as_tensor(sd, device=dev)
@@ -398,8 +410,8 @@ def main():
                 v[:, k] = los(trk, sx[:, 0], sy[:, 0], s0[:, 2], px[:, k], py[:, k], tid_f[i], 0.35 if k == 0 else 0.05)
             opp_vis[te_i] = v.any(1).cpu().numpy()
     scan_chk = ""
-    if has_opp and os.path.exists(rec[:-4] + "_scan.npz"):       # F1SIM_EXAM_SAVE_SCAN: what each beam hit -> the test above checked
-        typ = np.load(rec[:-4] + "_scan.npz")["typ"]
+    if has_opp and os.path.exists(scan_p):                       # F1SIM_EXAM_SAVE_SCAN: what each beam hit -> the test above checked
+        typ = np.load(scan_p)["typ"]
         beam_car = (typ[tt[te_i], bb[te_i]] == 4).any(-1)                                      # lidar.HIT_CAR
         m_ = there[te_i]
         if m_.any():
@@ -514,7 +526,7 @@ def main():
     pct = lambda k, n: f"{100.0 * k / n:.1f} % ({k}/{n})" if n else "-"
     BASE = "기준: 이 자리의 평균 지도"
     box_rows, box_near = [], []
-    for which in list(SD.SETS) + [BASE]:
+    for which in SETS + [BASE]:
         if which in preds:
             P = preds[which]
             ph = SD.physical({"pose": P["pose"]}, [x0, x1, y0, y1], ego_scale)
@@ -545,6 +557,9 @@ def main():
     W("|---|---|---|---|---|")
     for r in box_near:
         W(r)
+    if SCAN in SETS:
+        W(f"{SCAN} = 같은 디코더를 policy가 읽는 가장 새 스캔 그대로에 학습한 대조 (policy 안쪽 값이 아님; 저장 안 함): 스캔 안에 있는 것을 이 "
+          "크기의 디코더가 얼마나 꺼내는지.")
     W("상자 찾음 = 그 상자가 걸친 칸 중 하나라도 디코더 확률 > 0.5. (b)는 기억이 지나온 상자를 들고 있는지, (c)·(d)는 0이어야 함 "
       "(아니면 배치를 외웠거나 샘). 정밀도 = 0.5 넘는 덩어리 중 참 상자(한 칸 둘레)에 걸친 것. 보임 = 상자 중심이 시야각·10 m 안, 벽에 안 가림.")
     W("")
@@ -552,7 +567,7 @@ def main():
     eg_te = ego[te_i]; egm_te = ego_m[te_i] > 0
     W("| 입력 | 앞 속도 vx 오차 | 옆 속도 vy 오차 | 회전 속도 r 오차 | 조향 오차 |")
     W("|---|---|---|---|---|")
-    for which in SD.SETS:
+    for which in SETS:
         e = preds[which]["ego"].float().numpy() * ego_scale
         cells_ = []
         for k, (u, f) in enumerate((("m/s", 1.0), ("m/s", 1.0), ("°/s", 180 / math.pi), ("°", 180 / math.pi))):
@@ -568,7 +583,7 @@ def main():
         th_te = there[te_i]; ov = opp_vis[te_i]; od = odist[te_i]
         W("| 입력 | 상대 차 경우 | 결정 수 | 찾음 (P > 0.5) | 위치 오차 중앙 / 90 % | 방향 오차 중앙 | 속도 오차 | 0.5 s 뒤 위치 오차 중앙 | 1.0 s 뒤 |")
         W("|---|---|---|---|---|---|---|---|---|")
-        for which in SD.SETS:
+        for which in SETS:
             q = preds[which]["opp"].float().numpy()
             p_ = 1.0 / (1.0 + np.exp(-q[:, 0]))
             px_, py_ = q[:, 1] * SD.OPP_SCALE, q[:, 2] * SD.OPP_SCALE
@@ -606,7 +621,7 @@ def main():
 
     # ---- the decoder file (+ a copy beside the checkpoint for the console) and the replay inputs of the test sessions
     for pth in [out + "_dec.npz"] + ([a.ckpt_copy] if a.ckpt_copy else []):
-        SD.save(pth, nets, norms, [x0, x1, y0, y1], ego_scale, F_, H_, record=os.path.basename(rec), checkpoint=name,
+        SD.save(pth, {k: v for k, v in nets.items() if k in SD.SETS}, norms, [x0, x1, y0, y1], ego_scale, F_, H_, record=os.path.basename(rec), checkpoint=name,
                 hidden=a.hidden, has_opp=has_opp, extra={"test_sessions": np.nonzero(role == 2)[0], "role": role,
                                                          "epochs": a.epochs})
     ts = np.nonzero(role == 2)[0]

@@ -2372,9 +2372,13 @@ class SimWorker:
         wall, box = vals[0].reshape(nx, ny), vals[1].reshape(nx, ny)
         pr, eg, q, dp = vals[2], vals[3], vals[4], vals[5]
         TEAL, AMBER, MAG = (0.13, 0.80, 0.58), (0.95, 0.62, 0.05), (1.0, 0.2, 0.85)
+        wm = wall > 0.5
+        edge = wm & ~(np.pad(wm, 1, constant_values=True)[:-2, 1:-1] & np.pad(wm, 1, constant_values=True)[2:, 1:-1]
+                      & np.pad(wm, 1, constant_values=True)[1:-1, :-2] & np.pad(wm, 1, constant_values=True)[1:-1, 2:])
+        # a light wash over the decoded wall mass, its rim strong (as the site's /dec), boxes over it
         img = np.zeros((nx, ny, 4), np.uint8)
         img[..., :3] = np.array(TEAL) * 255
-        img[..., 3] = np.clip(wall * 170, 0, 255)
+        img[..., 3] = np.where(edge, 235, np.clip(wall * 80, 0, 255))
         bm = box > 0.15
         img[bm, :3] = np.array(AMBER) * 255
         img[bm, 3] = np.clip(box[bm] * 255, 0, 255)
@@ -2382,9 +2386,6 @@ class SimWorker:
         c0, s0 = math.cos(cyaw), math.sin(cyaw)
         cells = SD.cell_centres().reshape(nx, ny, 2)
         to_w = lambda u, v: np.stack([cx + u * c0 - v * s0, cy + u * s0 + v * c0], -1).astype(np.float32)
-        wm = wall > 0.5
-        edge = wm & ~(np.pad(wm, 1, constant_values=True)[:-2, 1:-1] & np.pad(wm, 1, constant_values=True)[2:, 1:-1]
-                      & np.pad(wm, 1, constant_values=True)[1:-1, :-2] & np.pad(wm, 1, constant_values=True)[1:-1, 2:])
         pts = [{"xy": to_w(cells[edge][:, 0], cells[edge][:, 1]), "rgba": TEAL + (0.85,), "px": 4.0, "panel": False},
                {"xy": to_w(cells[box > 0.5][:, 0], cells[box > 0.5][:, 1]), "rgba": AMBER + (1.0,), "px": 8.0, "panel": False}]
         x0, x1, y0, y1 = dec.pose_ext

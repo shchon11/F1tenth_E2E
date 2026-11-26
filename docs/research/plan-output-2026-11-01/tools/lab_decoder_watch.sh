@@ -38,7 +38,8 @@ lab_free() {          # 0 when no exam runs on the lab and it has room; prints w
 }
 while true; do
   # every finished record with a memory file and no decoder yet: "mtime path" (exam/ = the exam loops', dec/ = made for this)
-  list=$($SSH $H "cd $LX && for f in exam/*_mem.npz dec/*_mem.npz; do [ -e \"\$f\" ] || continue; b=\${f%_mem.npz}; n=\${b##*/}
+  # (the lab's login shell is zsh: a glob with no match would abort the whole line -- NULL_GLOB there, a no-op in bash)
+  list=$($SSH $H "setopt NULL_GLOB 2>/dev/null; cd $LX && for f in exam/*_mem.npz dec/*_mem.npz; do [ -e \"\$f\" ] || continue; b=\${f%_mem.npz}; n=\${b##*/}
       [ -e \$b.npz ] && grep -q '^rc 0' \$b.log 2>/dev/null || continue
       [ -e dec/\$n.dec.done ] || [ -e dec/\$n.dec.fail ] && continue
       echo \$(stat -c %Y \$f) \$b; done" 2>/dev/null | sort -n)
