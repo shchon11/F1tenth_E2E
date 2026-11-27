@@ -92,8 +92,11 @@
               font-size: 20px; font-weight: 600; color: var(--ink); text-align: center; line-height: 1.35; font-variant-numeric: tabular-nums; }
   .side { min-height: 0; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
   /* (11-22, the user: "항목별 보상값들이라던지 아니면 좀 기억관련 좀 직관적이게") the reward's parts and what the memory thinks */
-  #rwp, #memp { padding: 10px 12px 10px; }
-  #rwp h3, #memp h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  #rwp, #memp, #decp { padding: 10px 12px 10px; }
+  #rwp h3, #memp h3, #decp h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  /* (11-27, the user: "디코더 거슬린다 아예 별도칸에다가 하던지 해라") the decoder in its own panel, not over the map */
+  #decmap { width: 100%; aspect-ratio: 1 / 1; display: block; border-radius: 6px; }
+  #dec_t { color: var(--ink-2); font-size: 12px; margin-top: 4px; }
   .rwt { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
   .rwt th { font-weight: 400; font-size: 12px; color: var(--muted); text-align: right; padding: 0 6px 4px; white-space: nowrap; }
   .rwt td { text-align: right; padding: 3px 6px; color: var(--ink); white-space: nowrap; border-top: 1px solid var(--grid); }
@@ -177,6 +180,7 @@
       <table class="rwt"><thead><tr><th></th><th>최근 10초</th><th>이번 에피소드</th><th></th></tr></thead><tbody id="rw_b"></tbody></table>
       <div class="laps" id="laps"></div></div>
     <div class="panel" id="memp" hidden><h3>기억</h3><div id="mem_b"></div></div>
+    <div class="panel" id="decp" hidden><h3>디코더</h3><canvas id="decmap"></canvas><div id="dec_t"></div></div>
   </section>
   <section class="panel" id="spots">
     <div class="sp_top">
@@ -393,11 +397,14 @@ function headAt(Q, k, fb) {
   return a && Math.hypot(b[0] - a[0], b[1] - a[1]) > 0.01 ? Math.atan2(b[1] - a[1], b[0] - a[0]) : fb;
 }
 
-function drawMap(f, carP, oppP, T, trail) {
-  const { g, W, H } = fit($("map"));
+function drawMap(f, carP, oppP, T, trail, decView) {
+  // decView (11-27): the decoder's own panel -- the car in the middle, 8 m across, the track, the true cars and boxes, and what
+  // the decoder reads (dashed); the main map no longer draws anything of the decoder
+  const { g, W, H } = fit($(decView ? "decmap" : "map"));
   g.fillStyle = C.wall; g.fillRect(0, 0, W, H);
   let cx, cy, span, moving = false;
-  if (VIEW.mode === "follow") {
+  if (decView) { cx = carP[0]; cy = carP[1]; span = 8; }
+  else if (VIEW.mode === "follow") {
     // (11-17, the user: "차 따라가는거 뭐이리 어지럽냐 ... 머리아파") the car in the middle, north up, nothing else: the camera trails
     // the car by a quarter second so the wiggles of an early policy do not shake the whole map. A jump (a new episode) moves it at once.
     const tx = carP[0] + VIEW.ox, ty = carP[1] + VIEW.oy, now = performance.now();
@@ -409,7 +416,7 @@ function drawMap(f, carP, oppP, T, trail) {
   else if (VIEW.mode === "track") { cx = T.x0 + T.W * T.res / 2; cy = T.y0 + T.H * T.res / 2; span = Math.max(T.W * T.res, T.H * T.res * W / H) * 1.05; }
   else { cx = VIEW.cx; cy = VIEW.cy; span = VIEW.span; }
   const s = W / span, P = (x, y) => [(x - cx) * s + W / 2, H / 2 - (y - cy) * s];
-  LAST = Object.assign(LAST || {}, { cx, cy, s, W, H, T });
+  if (!decView) LAST = Object.assign(LAST || {}, { cx, cy, s, W, H, T });
   const [ix, iy] = P(T.x0, T.y0 + T.H * T.res);
   g.imageSmoothingEnabled = s < 40; g.drawImage(T.img, ix, iy, T.W * T.res * s, T.H * T.res * s);
   g.lineCap = "round"; g.lineJoin = "round";
@@ -440,7 +447,7 @@ function drawMap(f, carP, oppP, T, trail) {
   // LiDAR: quiet points
   g.fillStyle = C.scan;
   const ps = Math.max(1.5, Math.min(3.5, 0.03 * s));
-  for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - ps / 2, y - ps / 2, ps, ps); }
+  if (!decView) for (const p of f.scan || []) { const [x, y] = P(p[0], p[1]); g.fillRect(x - ps / 2, y - ps / 2, ps, ps); }
   // boxes, each in its band of the car's half width (a stroke of the car's width centred on the outline), bands first
   const boxes = f.boxes || [];
   const boxPath = (b) => {
@@ -455,7 +462,7 @@ function drawMap(f, carP, oppP, T, trail) {
   // walls' grey ink and the boxes' amber, each stretch as strong as the decoder is sure there, fading out before the edge of
   // what it covers. A line is [points, level per segment]: a run of one level is stroked at once, the dash pattern carried on
   // across runs (lineDashOffset = the length of the line before the run) so it does not restart where the strength steps
-  const dec = f.dec || null;
+  const dec = decView ? (f.dec || null) : null;
   const dashLines = (ls, col, w, a0, dash) => {
     if (!Array.isArray(ls) || !dec) return;
     const L = +dec.lv || 6;
@@ -478,6 +485,7 @@ function drawMap(f, carP, oppP, T, trail) {
     g.restore();
   };
   if (dec) { dashLines(dec.walls, C["ink-2"], 1.6, 0.9, [5, 4]); dashLines(dec.boxes, C.box, 2.2, 1, [4, 3]); }
+  if (!decView) {
   // the memory's read-out: where it thinks the boxes ahead are (dashed circles, stronger = surer)
   for (const b of f.mem_boxes || []) {
     if (b[0] < 0.3) continue;
@@ -544,6 +552,7 @@ function drawMap(f, carP, oppP, T, trail) {
     quad(cs); g.save(); g.globalAlpha = 0.45; g.fillStyle = C.critical; g.fill(); g.restore();
     g.strokeStyle = C.critical; g.lineWidth = 2; g.stroke();
   }
+  }
 
   // ---- the cars, at their true size (the contact's and the plan-hit cost's footprint), a notch at the front
   const car = (st, d, col) => {
@@ -572,7 +581,7 @@ function drawMap(f, carP, oppP, T, trail) {
       g.save(); g.globalAlpha = pa; g.strokeStyle = C.opp; g.lineWidth = 2; g.beginPath(); g.arc(x, y, 5 * zf, 0, 2 * Math.PI); g.stroke(); g.restore();
     }
   }
-  if ((f.hit || []).some((x) => x > 0)) {
+  if (!decView && (f.hit || []).some((x) => x > 0)) {
     const [x, y] = P(carP[0], carP[1]); g.strokeStyle = C.critical; g.lineWidth = 2.5; g.beginPath(); g.arc(x, y, Math.max(12, 0.55 * s), 0, 7); g.stroke();
   }
   return moving;
@@ -677,13 +686,17 @@ async function frame() {
   const oppP = F1.opp ? (F0 && F0.opp && !F1.new_ep ? pose(F0.opp, F1.opp, u) : F1.opp) : null;
   const T = TRACK[RUN + ":" + F1.tid] || await track(F1.tid);
   const moving = drawMap(F1, carP, oppP, T, F1.trail || []);
+  const hasDec = !!F1.dec;
+  if ($("decp").hidden === hasDec) $("decp").hidden = !hasDec;
+  if (hasDec) drawMap(F1, carP, oppP, T, [], true);
   setText($("hud_v"), carP[3].toFixed(1));
   $("hud_v").style.color = (F1.hit || []).some((x) => x > 0) ? C.critical : C.ink;
   // (11-26) the decoder's speed beside the true one; its yaw rate beside the true yaw rate at the decision [°/s]
   const dc = F1.dec, deg = (v) => Math.round(v * 180 / Math.PI).toString();
   const okd = dc && isFinite(dc.v) && isFinite(dc.r) && isFinite(dc.tr);
-  if ($("hud_vd").hidden === !!okd) { $("hud_vd").hidden = !okd; $("hud_r").hidden = !okd; }
-  if (okd) { setText($("hud_vd"), (+dc.v).toFixed(1)); setText($("hud_rt"), deg(+dc.tr)); setText($("hud_rd"), deg(+dc.r)); }
+  // (11-27) the decoder's numbers in its own panel, not on the map's HUD
+  if (!$("hud_vd").hidden) { $("hud_vd").hidden = true; $("hud_r").hidden = true; }
+  setText($("dec_t"), okd ? `속도 ${carP[3].toFixed(1)} → ${(+dc.v).toFixed(1)} m/s · 회전 ${deg(+dc.tr)} → ${deg(+dc.r)} °/s` : "");
   if (u < 1 || moving) requestDraw();                  // easing toward the newest frame; idle once there
 }
 
