@@ -226,7 +226,15 @@ case "$1" in
   launch) shift; launch "$@" ;;
   status) status "$2" ;;
   fetch)  [ -n "$2" ] || die "fetch NAME [EVERY_S]"
-          if [ -n "$3" ]; then while alive "$2"; do fetch_once "$2"; sleep "$3"; done; fi
+          # (11-28) a lab/ACE connection that times out once no longer ends the loop: the run counts as gone only after 3
+          # failed checks in a row, and a failed fetch (die inside a subshell) is retried next round
+          if [ -n "$3" ]; then miss=0
+            while [ $miss -lt 3 ]; do
+              if alive "$2"; then miss=0; ( fetch_once "$2" ) || echo "$(date +%T) fetch $2 failed, retry in $3 s"
+              else miss=$((miss + 1)); echo "$(date +%T) $2 not seen running ($miss/3)"; fi
+              sleep "$3"
+            done
+          fi
           fetch_once "$2" ;;
   stop)   [ -n "$2" ] || die "stop NAME"
           ace <<EOF
