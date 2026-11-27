@@ -585,7 +585,7 @@ async function poll() {
   try { r = await fetch(`/api/live?run=${encodeURIComponent(RUN)}&car=${CAR}`, { cache: "no-store" }); } catch (e) { return; }
   if (!r.ok) return;
   const age = parseFloat(r.headers.get("X-Age") || "0");
-  const live = age < 2;
+  const live = age < (parseFloat(r.headers.get("X-Live-S") || "2") || 2);
   const stCls = "pill " + (live ? "live" : "wait"), vlCls = live ? "" : "on";
   if ($("status").className !== stCls) $("status").className = stCls;
   setText($("status_t"), live ? "실시간" : age < 300 ? `update 반영 중 · ${age.toFixed(0)}초` : `멈춤 · ${(age / 60).toFixed(0)}분 전`);

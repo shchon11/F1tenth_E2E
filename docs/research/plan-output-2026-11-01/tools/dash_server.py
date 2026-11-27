@@ -621,7 +621,10 @@ class H(BaseHTTPRequestHandler):
         # (11-17, the user: "update에 필요한 결정 수 비율이랑 현재 에피소드 진행 비율만 상단에") the rollout's length (the last
         # update's `horizon`, which --horizon-auto changes) and the episode lengths (`episode_s`, a replayed scene's `scene_episode_s`)
         meta = memo(("live_meta", name), 10, lambda: live_meta(name))
-        return self._send(200, body, extra={"X-Age": f"{time.time() - os.path.getmtime(p):.2f}",
+        # (11-27, the user: "step 다 차지도 않았는데 계속 이러는건 뭐야") a run on ACE arrives in 3 s pulls (ace_live_sync.sh),
+        # so its tap is 1-3 s old mid-rollout: the page calls it live up to X-Live-S seconds (local runs 2 s, ACE runs 6 s)
+        ace = os.path.exists(os.path.join(RUNS, os.path.basename(name), ".from_ace"))
+        return self._send(200, body, extra={"X-Age": f"{time.time() - os.path.getmtime(p):.2f}", "X-Live-S": "6" if ace else "2",
                                             "X-Horizon": str(meta.get("horizon") or ""), "X-Episode-S": str(meta.get("episode_s") or ""),
                                             "X-Scene-S": str(meta.get("scene_episode_s") or "")})
 
