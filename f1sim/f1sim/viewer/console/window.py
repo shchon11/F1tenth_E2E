@@ -1387,12 +1387,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         # -- who follows the policy's plan (2026-10-19, the user: "우리도 그냥 map 쓰자")
         self.combo_follower = QtWidgets.QComboBox()
-        self.combo_follower.addItem("MAP (ForzaETH)", "map")
-        self.combo_follower.addItem("MPC (학습 때 추종기)", "mpc")
+        self.combo_follower.addItem("MAP (ForzaETH, 실차 방식)", "map")
+        self.combo_follower.addItem("MPC (차 모델 예측 추종)", "mpc")
+        # (11-27, the user: "콘솔에서 제어기 없이 이상적인 학습 환경으로 주행할 수 있게도 ... map, mpc, ideal 이렇게 선택가능하게")
+        self.combo_follower.addItem("ideal (plan대로 정확히, 학습·시험 조건)", "ideal")
         self.combo_follower.addItem("체크포인트대로", "auto")
         self.combo_follower.setToolTip(
-            "정책이 낸 계획(경로·속도)을 무엇으로 따라갈지. MAP: ForzaETH의 MAP 제어기(논문 방식, 차별로 측정한 "
-            "지연 보상). MPC: 지금까지의 iLQR 추종기 — 맵별 최종 정책은 이것으로 학습됐습니다. 상대 차는 언제나 MPC입니다.")
+            "정책이 낸 계획(경로·속도)을 무엇으로 따라갈지. MAP: ForzaETH의 MAP 제어기(실차와 같은 방식). "
+            "MPC: 차 모델로 앞을 예측해 plan의 길을 따라가는 추종기(plan_mpc). ideal: 제어기 없이 차가 plan을 정확히 그대로 "
+            "달림 — 학습과 시험(exam)이 쓰는 조건이라, 제어기 탓인지 policy 탓인지 가를 때 씀(실차에는 없음).")
         self.row_follower = FieldRow("계획 추종기", self.combo_follower,
                                      "MAP: ICCAS 혼자 주행 8.40 → 7.92초 (같은 정책, 128/128 완주).")
         cfg_card.add(self.row_follower)

@@ -332,6 +332,10 @@ class PlanRunner:
         # mode "track" (11-09, the user: "얼추 여기에 맞는 제어기 좀 만들어놔"): full physics, `plan_follow.PlanFollower` follows
         # the plan in time (actuator lags inverted), its command goes in through the env's external-command path
         self.follower = None
+        _use_mpc = os.environ.get("F1SIM_TRACK_MPC") == "1"
+        if mode == "mpc":                       # (11-27) the console's "MPC": mode "track" with plan_mpc.PlanMPC
+            _use_mpc = True
+            mode = self.mode = "track"
         if mode == "track":
             from ..plan_follow import PlanFollower
             # diagnosis knobs (11-10, the user: the car wobbles more and more in the console): F1SIM_TRACK_GAINS="k_v,k_lat,k_head",
@@ -345,11 +349,13 @@ class PlanRunner:
                                          ff_window=float(os.environ.get("F1SIM_TRACK_FFWIN", "0")),
                                          slow_tau=float(os.environ.get("F1SIM_TRACK_SLOWTAU", "0")),
                                          k_yaw=float(os.environ.get("F1SIM_TRACK_KYAW", "0")), **_kw)
-            if os.environ.get("F1SIM_TRACK_MPC") == "1":
+            if _use_mpc:
                 # 11-10 (the user: "제어기좀 똑바로 만들어라"): the model-predictive follower (`plan_mpc.PlanMPC`); weights
                 # F1SIM_MPC_W="w_lat,w_head,w_rate,w_yaw", horizon F1SIM_MPC_H, device F1SIM_MPC_DEV (cpu for one car)
                 from ..plan_mpc import PlanMPC
-                self.follower = PlanMPC(Bl, os.environ.get("F1SIM_MPC_DEV", str(device)), env.tracker.nominal,
+                # (11-27) the console (a car or a few): the CPU -- on the GPU one iLQR a control step ran the console at ~0.3x
+                _mdev = os.environ.get("F1SIM_MPC_DEV") or ("cpu" if Bl <= 4 else str(device))
+                self.follower = PlanMPC(Bl, _mdev, env.tracker.nominal,
                                         s_max=float(env.s_max), k_v=_g[0], horizon=int(os.environ.get("F1SIM_MPC_H", "20")),
                                         sub=int(os.environ.get("F1SIM_MPC_SUB", "4")), every=int(os.environ.get("F1SIM_MPC_EVERY", "1")),
                                         lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0),

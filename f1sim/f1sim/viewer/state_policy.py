@@ -99,7 +99,8 @@ def describe(ck: dict, kind: str, path: str) -> str:
         # the controller that follows the plan (11-09: the time-indexed follower was the default; 11-15: MAP again -- re-tuned on
         # the policy's plans it hits walls 0.2-0.5 per 90 s session against the time follower's 1.5, and the car drives MAP)
         mode = os.environ.get("F1SIM_PLAN_MODE", "map")
-        follow = {"track": "시간 기준 추종기(plan을 시각대로 추종)", "map": "MAP(11-15 튜닝, 실차와 같음)", "ideal": "plan대로 정확히(학습 조건)"}.get(mode, mode)
+        follow = {"track": "시간 기준 추종기(plan을 시각대로 추종)", "map": "MAP(11-15 튜닝, 실차와 같음)", "mpc": "MPC(차 모델 예측 추종)",
+                  "ideal": "plan대로 정확히(학습 조건, 제어기 없음)"}.get(mode, mode)
         if ck.get("format") == "plan_steps3":
             return (f"planner(v3, 제어 지연을 앎): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan·서보 각, "
                     f"속도는 스스로 짐작 -> 0.1 s마다 조향·속도 명령 10개(지연·서보·속도 루프·조향표를 거친 차의 반응이 plan), 10 Hz")

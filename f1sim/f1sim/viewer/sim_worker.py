@@ -47,6 +47,8 @@ Honesty rules this file is responsible for
 """
 from __future__ import annotations
 
+import os as _os_pm
+_PLAN_MODE0 = _os_pm.environ.get("F1SIM_PLAN_MODE")   # (11-27) the worker's own F1SIM_PLAN_MODE, for the console's "auto"
 import faulthandler
 import functools
 import math
@@ -1269,6 +1271,15 @@ class SimWorker:
         from ..learn.common import plan_output_of
         _plan_out = plan_output_of(extra)
         _pf = str(getattr(cfg, "plan_follower", "auto") or "auto")
+        if skind == "plan" and _pf in ("map", "mpc", "ideal"):
+            # (11-27) a plan_rl checkpoint: the console's follower choice (map / mpc / ideal) -- read below by the ideal switch,
+            # `state_policy.StatePolicyRunner` (PlanRunner's mode) and `state_policy.describe`; "auto" keeps F1SIM_PLAN_MODE
+            os.environ["F1SIM_PLAN_MODE"] = _pf
+        elif skind == "plan":                  # "auto": what the worker was started with (an earlier session's choice undone)
+            if _PLAN_MODE0 is None:
+                os.environ.pop("F1SIM_PLAN_MODE", None)
+            else:
+                os.environ["F1SIM_PLAN_MODE"] = _PLAN_MODE0
         if _pf in ("mpc", "map") and mode == "plan":
             # the console's choice over the checkpoint's own (`SessionConfig.plan_follower`)
             _plan_out = dict(_plan_out, plan_follower=_pf)
