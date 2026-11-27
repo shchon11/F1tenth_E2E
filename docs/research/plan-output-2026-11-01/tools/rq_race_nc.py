@@ -1,0 +1,37 @@
+"""(11-27 20:10, user OK "ㅇ") nc45a = rc42a u950 with the held exploration noise near a car ahead widened 2-4 m -> 2-8 m
+(--noise-corr-car 2.0,8.0); everything else rc42a (a hard contact incl. an at-fault car one ends the return). Why: the
+F1SIM_EXAM_FOLLOW test showed braking that starts >= 5 m behind avoids 75 % of the hard closing rear-ends (20 -> 5) for -1.6 %
+race distance, while the held noise only covered 2-4 m ahead (3 m is too late: 20 -> 23). Prediction: hard at-fault rear-ends
+in exam4 halve (<= 10 per 128 sessions) within 100 updates, race distance within -2 %. Falsifier: unchanged -> exploration
+window is not the bottleneck -> off-policy next.
+(Below: the rc42a builder this copies.)
+(11-27) Race stage with the hit price that worked in the qualifier: rc42a = hc41a u900 (scan31b2 u600 + --hard-contact-ends,
+box hard 0.057 vs 0.17 pooled u650-u750) forked into the race world (solo 70 % half with boxes, 1v1 with self-copy opponents,
+race33b's race settings) with --hard-contact-ends kept: a hard wall / box contact, or a car contact this car is responsible for
+(--car-fault), ends the return. Left out vs race33b (user 11-26, end-to-end only): the opponent prediction head (--pred-*) and
+the plan-forecast car cost (--plan-car-*, gamed by dg35a). Question: does the price that cut box hits 3x also cut at-fault car
+contacts in 1v1 without slowing passes? Compare with race33b u975 on exam4 (at-fault 0.97 per 1v1, 0.6x opponent 1.84) and
+keep exam3 (solo speed / boxes) against hc41a. ACE GPU 3, 1536 envs, updates 901..1200, checkpoints every 50.
+Usage: python3 rq_race_hc.py args"""
+import json
+RUNS = "/home/shchon11/f1sim_runs"; SRC = "/home/shchon11/F1tenth_E2E/f1sim"
+NAME, PARENT, OFFSET, N_UPD, EVERY, ENVS = "nc45a", RUNS + "/rc42a/plan_u950.pt", 950, 300, 50, 1536   # 11-27 10:00: from u750 now on ACE GPU 2 (user: "병렬로", GPU 2 free) instead of waiting for u900
+LR0, LR1 = 1.33e-4, 1e-4      # nc45a: rc42a's lr at u950 (its schedule 2e-4 -> 1e-4 over u751-1050), so only the noise window differs
+A = json.load(open(RUNS + "/race33b/args.json"))["args"]
+SKIP = {"name", "dist_world", "dist_rank", "dist_init", "dist_backend", "dist_same_seed", "runs", "check_args", "init",
+        "update_offset", "envs", "updates", "init_critic", "save_every", "lr", "lr_end", "world",
+        "pred_opp", "pred_smooth", "pred_lr", "pred_range", "plan_car_cost", "plan_car_margin", "plan_car_w_end", "noise_corr_car"}
+base = []
+for k, v in A.items():
+    if k in SKIP or v is None or v is False or v == "":
+        continue
+    opt = "--" + k.replace("_", "-")
+    base += [opt] if v is True else ([opt] + [str(x) for x in v] if isinstance(v, (list, tuple)) else [opt, str(v)])
+U_LAST = OFFSET + N_UPD
+f0 = OFFSET / (U_LAST - 1)
+LR_ARG = (LR0 - LR1 * f0) / (1.0 - f0)
+base += ["--world", SRC + "/f1sim/learn/configs/plan_world_korea26scan_race_ace.json", "--envs", str(ENVS),
+         "--updates", str(U_LAST), "--update-offset", str(OFFSET), "--save-every", str(EVERY), "--init", PARENT, "--init-critic",
+         "--lr", f"{LR_ARG:.6g}", "--lr-end", f"{LR1:g}", "--hard-contact-ends", "--noise-corr-car", "2.0,8.0", "--name", NAME]
+if __name__ == "__main__":
+    print(" ".join(base))
