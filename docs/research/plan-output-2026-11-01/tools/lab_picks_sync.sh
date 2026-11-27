@@ -10,6 +10,12 @@ while true; do
   m=$(stat -c %Y $P 2>/dev/null)
   if [ "$m" != "$last" ]; then
     have=$($SSH $H 'ls ~/f1sim_runs' 2>/dev/null | tr '\n' ' ')
+    # (11-27) a pick whose folder is only here (pick_hc41a_u800: copied here, never sent) goes over first -- before, such picks
+    # were silently left out and the lab console never showed hc41a
+    for r in $(python3 -c "import json; print(' '.join(e['run'] for e in json.load(open('$P'))['picks']))"); do
+      case " $have " in *" $r "*) continue ;; esac
+      [ -d /home/shchon11/f1sim_runs/$r ] && tar -chf - -C /home/shchon11/f1sim_runs $r | $SSH $H 'tar -x -C ~/f1sim_runs' && have="$have $r" && echo "$(date +%T) $r 폴더 보냄"
+    done
     if [ -n "$have" ] && python3 - "$have" <<'PY' | $SSH $H 'cat > ~/f1sim_runs/console_picks.json.new && mv ~/f1sim_runs/console_picks.json.new ~/f1sim_runs/console_picks.json'
 import json, sys
 have = set(sys.argv[1].split())
