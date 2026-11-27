@@ -122,6 +122,10 @@ SPEED_RHO = float(os.environ.get("F1SIM_EXAM_SPEED_RHO", "0") or 0)
 # box is present within D m ahead along the track, the plan's speeds are capped at C m/s (braking to it at most a_brake a step).
 # An oracle: it knows every box from the start (perfect memory, the first pass too)
 CAP = [float(x) for x in os.environ.get("F1SIM_EXAM_CAP", "").split(",") if x.strip()]
+# (11-27, the race stage: would braking earlier have avoided the closing rear-ends?) F1SIM_EXAM_FOLLOW="G,DV": while the other car
+# is ahead along the track within G m, the plan's speed is capped at its speed + DV (a scripted 'brake earlier when closing', the
+# policy does not know about it). Analysis only; the rows capped go to the record ("follow")
+FOLLOW = [float(x) for x in os.environ.get("F1SIM_EXAM_FOLLOW", "").split(",") if x.strip()]
 # (11-21, the user: "미리 알고 미리 라인 다르게" -- a known box is not blind any more) "oracle": every box the car has passed
 # once in this session is drawn into the policy's LiDAR input at its true place, as if no wall hid it (min with the real
 # scan); the walls, the contacts and the boxes themselves are untouched. Measures whether the avoid-when-visible skill, fed
@@ -812,6 +816,18 @@ for kd in range(T):
         _ah = torch.remainder(_dc[:, None] - _db, _L)
         _ok = (po.p_sid[lid] >= 0) & torch.isfinite(_ah) & (_ah < CAP[1])
         _cap = torch.where(_ok.any(1), torch.full_like(_dc, CAP[0]), torch.full_like(_dc, float("inf")))
+    if FOLLOW and env.M > 1:                                    # (11-27) F1SIM_EXAM_FOLLOW: the other car close ahead -> its speed + DV
+        _tid = env.sim.tid[lid]; _oi = env.sim.other_idx[lid, 0]
+        _dme = pr.goal.remaining(env.sim.state[lid, :2].float(), _tid)
+        _dop = pr.goal.remaining(env.sim.state[_oi, :2].float(), _tid)
+        _ahd = torch.remainder(_dme - _dop, pr.goal.lap[_tid])
+        _okf = torch.isfinite(_ahd) & (_ahd > 0.0) & (_ahd <= FOLLOW[0])
+        if getattr(env.sim, "absent_any", False):
+            _okf = _okf & ~env.sim.absent[_oi]
+        _vo = env.sim.state[_oi, dyn.IVX].float()
+        _cf = torch.where(_okf, (_vo + FOLLOW[1]).clamp_min(0.5), torch.full_like(_vo, float("inf")))
+        _cap = _cf if _cap is None else torch.minimum(_cap, _cf)
+        R.setdefault("follow", []).append(_okf.cpu())
     if ROLL:                                                    # the known boxes and the scanner now; is the committed path blocked
         _ds, _live, _pos = box_along(env, pr.goal, lid)
         if sb_seen is None:
