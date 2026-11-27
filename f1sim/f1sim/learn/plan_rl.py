@@ -56,7 +56,7 @@ from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models, PRED_N, PR
     pred_zigzag, PC_N, PC_SCALE
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
-from .plan_reward import PlanReward, SEEN_S, T_REF, ww_totals
+from .plan_reward import CONTACT_S, CONTACT_S_PER_MPS, PlanReward, SEEN_S, T_REF, ww_totals
 from . import plan_car_cost as PCC
 from . import plan_grad_cost as PG
 from . import plan_commit as PC
@@ -1597,6 +1597,15 @@ def main(argv=None):
                          "'세게 닿음'; a car's only when the reward charges it) ends the return: done with terminal value 0 for "
                          "GAE (the shaping's next potential left out, so it stays exact per segment). The car drives on from "
                          "there as the start of a new return segment; the env is not restarted and the memory is NOT reset")
+    ap.add_argument("--car-lagrange", default="",
+                    help="(11-27) with --hard-contact-ends: TARGET,LR,LMAX,L0 -- a hard car contact this car is charged for no "
+                         "longer ends the return (walls and boxes still do); instead it costs lambda x one hard contact's time "
+                         "price ((CONTACT_S + CONTACT_S_PER_MPS x HARD_MPS) / T_REF x contact_scale = 0.164 laps at 0.82), and "
+                         "lambda follows the constraint 'hard at-fault car contacts per minute of 1v1 driving <= TARGET': after "
+                         "every update lambda += LR x (rate / TARGET - 1), clipped to [0, LMAX], starting at L0. Why: a "
+                         "terminated return costs ~2.5 laps against ~0.5 laps for a clean pass of a 0.8x car, so the policy "
+                         "stopped trying passes it could make (rc42a: 0.8x passes 1.78 -> 0.22, room beside the car 47 %% of the "
+                         "time following); fixed prices were either dirty (race33b, 0.88 hard per 0.8x pass) or timid")
     ap.add_argument("--contact-cond", default="",
                     help="LO,HI (11-26, RQ3/4): every episode draws c ~ LogUniform[LO, HI]; every contact cost (contacts, the "
                          "plan-hit price, the plan-car cost) is multiplied by c and log(c) is the state's last input (actor "
@@ -1849,6 +1858,15 @@ def main(argv=None):
     if hce_on:
         print("[plan_rl] 세게 닿으면 return 끝(--hard-contact-ends): GAE는 끝값 0, 차는 그 자리에서 계속, 기억 유지, env 다시 시작 안 함",
               flush=True)
+    lg_on = bool(args.car_lagrange)                    # (11-27) --car-lagrange: at-fault hard car contacts priced, not ended
+    if lg_on:
+        if not hce_on:
+            raise SystemExit("--car-lagrange goes with --hard-contact-ends (walls and boxes still end the return)")
+        lg_target, lg_lr, lg_max, lg_lam = (float(x) for x in args.car_lagrange.split(","))
+        lg_base = pr.contact_scale * (CONTACT_S + CONTACT_S_PER_MPS * 1.0) / T_REF     # one hard contact's time price [laps]
+        LG = {"ev": 0.0, "dec": 0.0}
+        print(f"[plan_rl] 차 접촉 값 조절(--car-lagrange): 우리 책임 세게 닿음은 return을 끊지 않고 lambda x {lg_base:.3f}바퀴; 1v1 1분당 "
+              f"{lg_target:g}번 넘으면 lambda 올림(update마다 x{lg_lr:g}, 0..{lg_max:g}), 시작 {lg_lam:g}", flush=True)
     term_on = bool(args.term_split)                    # (11-26) --term-split: RQ2's measurement, no update
     if term_on and env.procedural is None:
         raise SystemExit("--term-split: the box passes need a world with boxes")
@@ -2974,6 +2992,15 @@ def main(argv=None):
                     # next decision starts a new segment from Phi there
                     _hd = (env.sim.contact_counts[lid, 3:6] - hce0).clamp_min(0).float()
                     _hd[:, 2] = _hd[:, 2] * ((out["car_charged"] > 0) if args.car_fault else (pr.seen_t <= SEEN_S + PS.DT)).float()
+                    if lg_on:                                      # (11-27) --car-lagrange: the car's priced, not ended
+                        _pen = lg_lam * lg_base * _hd[:, 2] * (~out["restarted"]).float()
+                        out["reward"] = out["reward"] - _pen
+                        out["contact"] = out["contact"] + _pen
+                        _pres = ((~env.sim.absent[env.sim.other_idx[lid, 0]]) if getattr(env.sim, "absent_any", False)
+                                 else torch.ones(Bl, dtype=torch.bool, device=dev))
+                        LG["ev"] += float((_hd[:, 2] * (~out["restarted"]).float())[ordm & _pres].sum())
+                        LG["dec"] += float((ordm & _pres).sum())
+                        _hd[:, 2] = 0.0
                     _end = (_hd.sum(1) > 0) & ~out["restarted"]
                     out["reward"] = out["reward"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
                     out["shaping"] = out["shaping"] - pr.shaping_w * args.gamma * pr.phi * _end.float()
@@ -4355,6 +4382,18 @@ def main(argv=None):
             _ne = float(E_[:, ordm].sum())
             row.update(hard_ends=_ne, hard_ends_per_min=_ne / mins)
             print(f"[plan_rl] update {upd}: 세게 닿아 끊은 return {_ne:.0f}번 ({_ne / mins:.3f}/분)", flush=True)
+        if lg_on:                                                   # (11-27) --car-lagrange: the dual step
+            _m1 = LG["dec"] * PS.DT / 60.0
+            _rate = LG["ev"] / max(_m1, 1e-6)
+            if args.dist_world > 1:                                 # the same lambda on every rank: the pooled rate
+                _t = torch.tensor([LG["ev"], _m1], device=dev); torch.distributed.all_reduce(_t)
+                _rate = float(_t[0]) / max(float(_t[1]), 1e-6)
+            lam_used = lg_lam
+            lg_lam = min(lg_max, max(0.0, lg_lam + lg_lr * (_rate / lg_target - 1.0)))
+            row.update(car_lambda=lam_used, car_lambda_next=lg_lam, car_hard_fault_per_1v1_min=_rate, car_1v1_min=_m1)
+            print(f"[plan_rl] update {upd}: 우리 책임 세게 닿음(차) {LG['ev']:.0f}번 / 1v1 {_m1:.0f}분 = {_rate:.3f}/분 (목표 "
+                  f"{lg_target:g}) -> lambda {lam_used:.2f} -> {lg_lam:.2f}", flush=True)
+            LG["ev"] = LG["dec"] = 0.0
         if cc_on:                                                   # (11-26) --contact-cond: the c the decisions were priced with
             _cv = torch.stack(CCV)[:, ordm]
             row.update(contact_cond_gmean=float(_cv.log().mean().exp()), contact_cond_lo=float(_cv.min()),
