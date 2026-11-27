@@ -15,7 +15,7 @@ import threading
 import time
 
 NAME = sys.argv[1]
-LAB = "shchon11@10.100.0.2"; AB = "/nas/workspace/shchon11_f1sim"; AR = AB + "/runs"
+LAB = "shchon11@10.100.0.2"; AB = os.environ.get("ACE_BASE", "/nas/workspace/shchon11_f1sim"); AR = AB + "/runs"
 D = os.path.join(os.path.expanduser("~/f1sim_runs"), NAME)
 HERE = os.path.dirname(os.path.abspath(__file__))
 CM = ["-o", "ControlMaster=auto", "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-ace-play-%r@%h:%p",
@@ -74,12 +74,12 @@ def head(raw):
 def puller():
     off, rest, t_chk, name = 0, b"", time.time(), None
     # start at the log's end: replay from now on, not the run's whole past
-    r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} 999999999999"))
+    r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} 999999999999 {AR}"))
     if r:
         off, name = r[0], r[1]
     t_grow = time.time()
     while not stop.is_set():
-        r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} {off}"))
+        r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} {off} {AR}"))
         if r is None:
             time.sleep(1.5); continue
         size, n, age, body = r

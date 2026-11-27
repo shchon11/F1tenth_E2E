@@ -35,11 +35,11 @@ TREL=docs/research/plan-output-2026-11-01/tools
 OUTRQ=$MAIN/docs/research/plan-output-2026-11-01/out/rq
 RUNS=/home/shchon11/f1sim_runs
 STAGE=F1tenth/ace_stage                      # on the lab PC, relative to its home
-AB=/nas/workspace/shchon11_f1sim              # on ACE
+AB=${ACE_BASE:-/nas/workspace/shchon11_f1sim}   # on ACE (11-27 22:20: the NAS hung -> ACE_BASE=/data1/shchon11_f1sim, ACE's local disk)
 AR=$AB/runs
 MAXGB=${ACE_MAX_GB:-100}
 GPU=${ACE_GPU:-3}                            # (11-27) the user allowed GPU 2 too
-case "$GPU" in 2|3) ;; *) echo "ace_run: ACE_GPU must be 2 or 3" >&2; exit 1 ;; esac
+case "$GPU" in 0|1|2|3) ;; *) echo "ace_run: ACE_GPU must be 0-3" >&2; exit 1 ;; esac   # (11-27 22:25) the user allowed GPUs 0 and 1 while 2 and 3 are held by the runs the NAS hung
 
 lab() { ssh $O "$LAB" "$@" < /dev/null; }
 ace() { ssh $O "$LAB" "ssh $O ACE bash -s"; }          # the script comes on stdin (no quoting through two shells)
@@ -55,6 +55,7 @@ sync_code() {
   local stamp
   stamp="$(date '+%F %T') $(git -C "$SRC" rev-parse --short HEAD) $(git -C "$SRC" rev-parse --abbrev-ref HEAD) src=$SRC dirty_files=$(git -C "$SRC" status --short -- f1sim $TREL | wc -l)"
   echo "$stamp" | ssh $O "$LAB" "cat > ~/$STAGE/F1tenth_E2E/SYNCED"
+  lab "ssh $O ACE 'mkdir -p $AB/F1tenth_E2E/f1sim $AB/F1tenth_E2E/$TREL'" || die "mkdir on ACE"     # (11-27) a fresh base (/data1)
   lab "cd ~/$STAGE && rsync -rlt --delete --exclude __pycache__ F1tenth_E2E/f1sim/ ACE:$AB/F1tenth_E2E/f1sim/ && rsync -rlt --delete --exclude __pycache__ F1tenth_E2E/$TREL/ ACE:$AB/F1tenth_E2E/$TREL/ && rsync -rlt F1tenth_E2E/SYNCED ACE:$AB/F1tenth_E2E/SYNCED" \
     || die "rsync lab -> ACE"
   echo "synced: $stamp"
@@ -168,7 +169,7 @@ fetch_once() {
 }
 
 setup() {
-  ace <<'EOF'
+  sed "s#/nas/workspace/shchon11_f1sim#$AB#g" <<'EOF' | ace
 set -e
 B=/nas/workspace/shchon11_f1sim
 mkdir -p $B/F1tenth_E2E/external $B/runs $B/tmp $B/home/.cache/f1sim $B/home/.f1sim/maps $B/home/.config/matplotlib
@@ -184,6 +185,7 @@ export CUDA_CACHE_PATH=$B/home/.nv/ComputeCache MPLCONFIGDIR=$B/home/.config/mat
 export F1SIM_RUNS=$B/runs F1SIM_MAPS=$B/home/.f1sim/maps F1SIM_EXTERNAL=$B/F1tenth_E2E/external F1SIM_SCENES=$B/home/f1sim_scenes
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 PYTHONNOUSERSITE=1 WANDB_MODE=disabled PYTHONPATH=$B/F1tenth_E2E/f1sim
 [ -f $B/venv/bin/activate ] && source $B/venv/bin/activate
+true   # (11-27) the line above fails while there is no venv yet; sourcing this under set -e must not stop the setup
 ENV
 source $B/env.sh
 if [ ! -x $B/venv/bin/python ]; then

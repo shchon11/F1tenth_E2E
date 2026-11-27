@@ -18,10 +18,10 @@ def world_path(ck) -> str:
     if os.path.exists(w):
         return w
     base = os.path.basename(w)
-    if base.endswith("_ace.json"):
+    if base.endswith("_ace.json") or base.endswith("_d1.json"):
         # (11-27) a run trained on the lab server ACE names a copy of the world whose bank paths point at ACE's NAS
         # (configs/<world>_ace.json); off ACE the same world with this machine's bank paths is <world>.json
-        base = base[:-len("_ace.json")] + ".json"
+        base = base[:-len("_ace.json" if base.endswith("_ace.json") else "_d1.json")] + ".json"
     here = os.path.join(os.path.dirname(WORLD), base)
     if os.path.exists(here) and (base == os.path.basename(w) or not os.path.exists(w)):
         return here
