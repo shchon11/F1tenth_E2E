@@ -13,7 +13,7 @@ NAME, PARENT, OFFSET, N_UPD, EVERY, ENVS = "hc41a", RUNS + "/scan31b2/plan_u600.
 LR0, LR1 = 2e-4, 1e-4
 A = json.load(open(RUNS + "/scan31b2/args.json"))["args"]
 SKIP = {"name", "dist_world", "dist_rank", "dist_init", "dist_backend", "dist_same_seed", "runs", "check_args", "init",
-        "update_offset", "envs", "updates", "init_critic", "self_opp_init", "save_every", "lr", "lr_end", "live_tap", "live_taps"}
+        "update_offset", "envs", "updates", "init_critic", "self_opp_init", "save_every", "lr", "lr_end"}   # (11-27) live tap kept: ace_live_sync.sh shows ACE runs on /live
 base = []
 for k, v in A.items():
     if k in SKIP or v is None or v is False or v == "":     # an empty string is the default and does not survive a shell

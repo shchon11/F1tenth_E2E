@@ -78,7 +78,32 @@ def newest(run):
     if not re.fullmatch(r"[A-Za-z0-9_]+", run or ""):
         return None
     fs = _cached(("files", run), 30.0, lambda: decoder_files(run))
-    return fs[-1][2] if fs else None
+    if fs:
+        return fs[-1][2]
+    # (11-27) none of its own yet (a fork's first exam is ~50 updates away): the decoder of the checkpoint it started from
+    # (args.json "init" = ~/f1sim_runs/<parent>/plan_uN.pt), the parent's newest at or before N, up the init chain
+    par = _cached(("parent", run), 300.0, lambda: parent_of(run))
+    for prun, pu in par:
+        ps = [f for f in _cached(("files", prun), 30.0, lambda: decoder_files(prun)) if f[0] <= pu]
+        if ps:
+            return ps[-1][2]
+    return None
+
+
+def parent_of(run, depth=4):
+    """[(parent run, update it was forked at), grandparent, ...] from each run's args.json "init" (plan_uN.pt / state_latest)"""
+    out = []
+    for _ in range(depth):
+        try:
+            a = json.load(open(os.path.join(RUNS, run, "args.json"))).get("args", {})
+        except (OSError, ValueError):
+            break
+        m = re.search(r"/([A-Za-z0-9_]+)/plan_u(\d+)\.pt$", str(a.get("init") or ""))
+        if not m:
+            break
+        run = m.group(1)
+        out.append((run, int(m.group(2))))
+    return out
 
 
 def decoder(path):

@@ -8,7 +8,7 @@ keep exam3 (solo speed / boxes) against hc41a. ACE GPU 3, 1536 envs, updates 901
 Usage: python3 rq_race_hc.py args"""
 import json
 RUNS = "/home/shchon11/f1sim_runs"; SRC = "/home/shchon11/F1tenth_E2E/f1sim"
-NAME, PARENT, OFFSET, N_UPD, EVERY, ENVS = "rc42a", RUNS + "/hc41a/plan_u900.pt", 900, 300, 50, 1536
+NAME, PARENT, OFFSET, N_UPD, EVERY, ENVS = "rc42a", RUNS + "/hc41a/plan_u750.pt", 750, 300, 50, 1536   # 11-27 10:00: from u750 now on ACE GPU 2 (user: "병렬로", GPU 2 free) instead of waiting for u900
 LR0, LR1 = 2e-4, 1e-4
 A = json.load(open(RUNS + "/race33b/args.json"))["args"]
 SKIP = {"name", "dist_world", "dist_rank", "dist_init", "dist_backend", "dist_same_seed", "runs", "check_args", "init",
