@@ -231,7 +231,8 @@ case "$1" in
           if [ -n "$3" ]; then miss=0
             while [ $miss -lt 3 ]; do
               if alive "$2"; then miss=0; ( fetch_once "$2" ) || echo "$(date +%T) fetch $2 failed, retry in $3 s"
-              else miss=$((miss + 1)); echo "$(date +%T) $2 not seen running ($miss/3)"; fi
+              else miss=$((miss + 1)); echo "$(date +%T) $2 not seen running ($miss/3)"
+                   ( fetch_once "$2" ) || true; fi                      # (11-28) the last checkpoints of a run that just ended, now
               sleep "$3"
             done
           fi
