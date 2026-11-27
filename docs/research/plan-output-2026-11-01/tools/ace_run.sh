@@ -153,10 +153,12 @@ EOF
 
 fetch_once() {
   local name=$1
-  lab "mkdir -p ~/$STAGE/back && rsync -a ACE:$AR/$name ACE:$AR/$name.log ~/$STAGE/back/ 2>/dev/null; rsync -a ACE:$AR/$name.code ~/$STAGE/back/ 2>/dev/null; true"
+  # (11-27) the live view's files (rewritten several times a second; ace_live_play.py replays them here) are not fetched: rsync
+  # failed on them ("failed verification", code 23) and that ended the fetch loop
+  lab "mkdir -p ~/$STAGE/back && rsync -a --exclude 'live_tap*' --exclude 'live_log*' ACE:$AR/$name ACE:$AR/$name.log ~/$STAGE/back/ 2>/dev/null; rsync -a ACE:$AR/$name.code ~/$STAGE/back/ 2>/dev/null; true"
   if [ -e "$RUNS/$name" ] && [ ! -e "$RUNS/$name/.from_ace" ]; then die "$RUNS/$name exists and did not come from ACE: not mixing runs"; fi
   mkdir -p "$RUNS/$name" "$OUTRQ" && touch "$RUNS/$name/.from_ace"
-  rsync -az -e "ssh $O" "$LAB:$STAGE/back/$name/" "$RUNS/$name/" || die "fetch $name"
+  rsync -az --exclude 'live_tap*' --exclude 'live_log*' -e "ssh $O" "$LAB:$STAGE/back/$name/" "$RUNS/$name/" || die "fetch $name"
   rsync -az -e "ssh $O" "$LAB:$STAGE/back/$name.log" "$OUTRQ/$name.log"
   rsync -az -e "ssh $O" "$LAB:$STAGE/back/$name.code" "$RUNS/$name/ace_code.txt" 2>/dev/null
   echo "$(date +%T) fetched $name: $(ls "$RUNS/$name" | grep -c '\.pt$') checkpoints, log $OUTRQ/$name.log"
