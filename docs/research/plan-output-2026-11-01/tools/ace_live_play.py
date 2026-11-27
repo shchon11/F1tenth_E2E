@@ -46,9 +46,11 @@ def setup():
         subprocess.run(["tar", "-x", "-C", D], input=tb)
 
 
-def ensure_logger():
-    ace(f"pgrep -u $(id -u) -f 'live_tap_log.py {AR} {NAME}$' > /dev/null || (cd {AB} && setsid nohup {AB}/venv/bin/python "
-        f"{AB}/tools/live_tap_log.py {AR} {NAME} > {AR}/{NAME}.live_log.out 2>&1 < /dev/null &)")
+def ensure_logger(force=False):
+    """start the logger on ACE unless one runs; force: start a new one anyway (it supersedes a hung one through live_log.cur)"""
+    start = (f"(cd {AB} && setsid nohup {AB}/venv/bin/python {AB}/tools/live_tap_log.py {AR} {NAME} "
+             f">> {AR}/{NAME}.live_log.out 2>&1 < /dev/null &)")
+    ace(start if force else f"pgrep -u $(id -u) -f 'live_tap_log.py {AR} {NAME}$' > /dev/null || {start}")
 
 
 def alive():
@@ -58,24 +60,38 @@ def alive():
 Q = collections.deque(); lock = threading.Lock(); stop = threading.Event()
 
 
-def puller():
-    off, rest, t_chk = 0, b"", time.time()
-    # start at the log's end: replay from now on, not the run's whole past
-    raw = ace(f"{AB}/tools/live_log_tail.sh {NAME} 999999999999")
+def head(raw):
+    """(size, log name, seconds since the run's last tap, body) of a live_log_tail.sh reply, or None"""
     try:
-        off = int(gzip.decompress(raw).split(b"\n", 1)[0])
+        data = gzip.decompress(raw)
+        h, body = data.split(b"\n", 1)
+        s, n, a = h.decode().split()
+        return int(s), n, int(a), body
     except (OSError, ValueError, EOFError):
-        off = 0
+        return None
+
+
+def puller():
+    off, rest, t_chk, name = 0, b"", time.time(), None
+    # start at the log's end: replay from now on, not the run's whole past
+    r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} 999999999999"))
+    if r:
+        off, name = r[0], r[1]
+    t_grow = time.time()
     while not stop.is_set():
-        raw = ace(f"{AB}/tools/live_log_tail.sh {NAME} {off}")
-        try:
-            data = gzip.decompress(raw)
-            size_s, body = data.split(b"\n", 1)
-            size = int(size_s)
-        except (OSError, ValueError, EOFError):
+        r = head(ace(f"{AB}/tools/live_log_tail.sh {NAME} {off}"))
+        if r is None:
             time.sleep(1.5); continue
+        size, n, age, body = r
+        if n != name:                                               # a new logger (a restart): its log from the start
+            name, off, rest = n, 0, b""; t_grow = time.time(); continue
         if size < off:                                              # rotated: read the new file from its start
             off, rest = 0, b""; continue
+        if body:
+            t_grow = time.time()
+        elif age < 10 and time.time() - t_grow > 45:                # the taps change but the log does not: the logger hung
+            print(time.strftime("%T"), "logger stalled -> a new one", flush=True)
+            ensure_logger(force=True); t_grow = time.time()
         off += len(body)
         buf = rest + body; lines = buf.split(b"\n"); rest = lines.pop()
         fr = []
@@ -119,7 +135,12 @@ def player():
             print(time.strftime("%T"), f"delay -> {delay:.1f} s", flush=True)
         with lock:
             Q.popleft()
+            newest = Q[-1][0] if Q else t
         write(k, body)
+        # back towards DELAY0 once the pulls keep ahead again: each frame shown 0.05 s early (playback ~12 % fast) while the
+        # newest frame already here is more than 2 s inside the delay
+        if delay > DELAY0 and time.time() - newest < delay - 2.0:
+            delay = max(DELAY0, delay - 0.05)
 
 
 if __name__ == "__main__":
