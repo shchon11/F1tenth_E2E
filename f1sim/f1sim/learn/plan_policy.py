@@ -256,6 +256,7 @@ class PlanRunner:
     def __init__(self, env, ck: dict, device, mode: str = "map"):
         from .. import map_controller as M
         self.env, self.device, self.mode = env, device, mode
+        self._ideal_W = None                    # (11-28) mode "ideal": each row's plan (x, y, heading, speed in the world) for the viewers
         self.kind = "plan"
         self.lid = env.learner_ids
         self.v3 = ck.get("format") == "plan_steps3"
@@ -535,6 +536,13 @@ class PlanRunner:
                 # steering of the same turn, which the follower turns back into the car's through MAP's table
                 d_kin = self.turn3.eff(p["delta"], p["v"]) if self.v3 else p["delta"]
                 self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], d_kin[due])
+            if self.mode == "ideal":
+                # (11-28, the user: "ideal 제어기로 하려니까 시각화에 보여지는 plan이 그냥 직선임") MAP is not run for rows on
+                # ideal execution (11-14, gym_env `map_rows`), so the viewers' plan (MAP's reference) stayed a straight line:
+                # this runner hands them its plan itself, as it does with its own follower
+                W_ = torch.stack([x, y, psi, p["v"]], -1).float()
+                self._ideal_W = W_.clone() if (self._ideal_W is None or self._ideal_W.shape != W_.shape) else \
+                    torch.where(due[:, None, None], W_, self._ideal_W)
             idx = PT_IDX.to(self.device)
             self.obs.set_plan(torch.stack([x[:, idx], y[:, idx]], -1), p["pv"], due)
             if self.v2:
@@ -567,6 +575,15 @@ class PlanRunner:
             jj = j[:, None]
             env.ideal_cmd[lid, 0] = self.cmd_d.gather(1, jj)[:, 0]
             env.ideal_cmd[lid, 1] = self.cmd_v.gather(1, jj)[:, 0]
+            if self._ideal_W is not None:                           # the plan for the viewers (car frame now, `GymEnv.ext_ref`)
+                st_now = env.sim.state[lid]
+                c, s_ = torch.cos(st_now[:, 2:3]), torch.sin(st_now[:, 2:3])
+                W_ = self._ideal_W.to(st_now.device)
+                dx, dy = W_[..., 0] - st_now[:, 0:1], W_[..., 1] - st_now[:, 1:2]
+                ref = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c, W_[..., 2] - st_now[:, 2:3], W_[..., 3]], -1)
+                if env.ext_ref is None or env.ext_ref.shape[1:] != ref.shape[1:]:
+                    env.ext_ref = torch.zeros(env.B, *ref.shape[1:], device=self.device)
+                env.ext_ref[lid] = ref
         return torch.zeros(env.B, env.act_dim, device=self.device)
 
 

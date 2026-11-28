@@ -3309,7 +3309,7 @@ class F1VecEnv:
                 st_ = self.sim.state                          # MAP's pursuit angle from the direction of travel (11-15)
                 self.tracker.beta = torch.atan2(st_[:, _dyn.IVY], st_[:, _dyn.IVX].abs().clamp_min(0.3))
             raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
-            if self._ext_ids and self.ext_ref is not None:
+            if (self._ext_ids or self.sim.ideal_rows is not None) and self.ext_ref is not None:
                 self._ext_ref_to_viewers()
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
@@ -4543,7 +4543,10 @@ class F1VecEnv:
         i0 = pos_.floor().long().clamp(max=er.shape[1] - 2)
         w_ = (pos_ - i0.to(pos_.dtype))[None, :, None]
         smp = (er[:, i0, :4] * (1 - w_) + er[:, i0 + 1, :4] * w_).to(lr_.dtype)
-        m_ = self.ext_mask[:, None, None]
+        em_ = self.ext_mask if self._ext_ids else torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if self.sim.ideal_rows is not None:                    # (11-28) rows on ideal execution: MAP does not run for them either
+            em_ = em_ | self.sim.ideal_rows
+        m_ = em_[:, None, None]
         self.tracker.last_ref = torch.where(m_, smp, lr_)
         lp_ = getattr(self.tracker, "last_pred", None)
         if lp_ is not None and lp_.shape == lr_.shape:
