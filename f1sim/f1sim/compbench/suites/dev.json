@@ -1,0 +1,216 @@
+{
+ "name": "dev",
+ "version": "1.0.0",
+ "purpose": "development suite: use freely to compare and pick; a winner here is re-checked on 'confirm'. Several real floors and variants, all with smoothed walls (Track.with_smooth_walls, '+smooth': no 5 cm grid stairs in contacts or LiDAR), weighted evenly in the pooled table (each map its own row too). The physics is an argument (conditions[].profile): today the code's current default physics ('real-2026-11'), recorded by name in every result; a venue-free default profile is being built separately and replaces it by name. The exam3 layouts on the Korea map were already used by the prior developer to pick checkpoints.",
+ "world": "f1sim/f1sim/learn/configs/plan_world_korea26scan_qual.json",
+ "host_ckpt": "~/f1sim_runs/pick_scan31b_u475/state_latest.pt",
+ "host_ckpt_note": "baselines drive through exam_record.py, which needs a plan_steps2 checkpoint of this world for its loop (its plan is computed and never reaches the car; it also sets the LiDAR place 0.12555 m, the same for every November checkpoint)",
+ "seed": 20261112,
+ "noise_seeds": [
+  20261113,
+  20261114
+ ],
+ "maps": [
+  {
+   "id": "k26scan",
+   "track": "real:korea26_scan+duct+smooth",
+   "bank": "banks/exam3_k26scan",
+   "bank_sha256": "80eb5f5950719f7d186d5709d23624bedc313df2fc6e342e9c5314b6073f9c11",
+   "sessions": 128,
+   "role": "the Korea 2026 venue rebuilt from the bag (bag-scan map, hoses as a 10 cm band, smoothed walls) -- the map every November policy trained on; the 64 exam3 layouts (3 boxes on the empty-track line) were never in training; 2 sessions per layout, different physics draws"
+  },
+  {
+   "id": "k26scan_h23",
+   "track": "real:korea26_scan+duct+smooth+hose23",
+   "bank": "banks/exam3_on_hose23",
+   "bank_sha256": "30c316589fc7a67539e45e32952a1b28c1c046a0fa64139dcd1b02576fa97e31",
+   "sessions": 128,
+   "role": "held-out variant: duct hoses laid another way (variant 23; training used 0-15), exam3 layouts at the same coordinates (2/192 boxes within 0.15 m of a moved wall)"
+  },
+  {
+   "id": "k26scan_h24",
+   "track": "real:korea26_scan+duct+smooth+hose24",
+   "bank": "banks/exam3_on_hose24",
+   "bank_sha256": "7283502586a2b8d807f0d11cde9c13c0a8046d75b2ff5cdc5137e95ccc1acdd9",
+   "sessions": 128,
+   "role": "held-out variant 24, as 23 (2/192 boxes within 0.15 m of a wall)"
+  },
+  {
+   "id": "lab12x16",
+   "track": "real:map12x16+smooth",
+   "bank": "banks/labdev_map12x16",
+   "bank_sha256": "1aa021502acc11e5957598c60897a0303600f8781c4d5ec87b36aa08e85d5a65",
+   "sessions": 128,
+   "role": "real/lab12x16: the 12.3 x 16.4 m pre-competition loop (lap 36.1 m, median half-width 0.94 m); 64 layouts x 3 boxes by exam_line_bank.py (seed 20261128) on the smoothed centerline (no driven line exists there), judged passable (min-time line, 0.10 m clearance)"
+  },
+  {
+   "id": "lab16x07",
+   "track": "real:map16x07+smooth",
+   "bank": "banks/empty_map16x07",
+   "bank_sha256": "7594cda654cbf10a21d7f34aac4cf9eb556deff4afb09c77455d127580f26d27",
+   "sessions": 128,
+   "role": "real/lab16x07: the 15.5 x 7.0 m pre-competition hairpin loop (lap 33.3 m, median half-width 0.70 m, the narrowest real floor in the catalogue). NO BOXES: exam_line_bank.py's judge (3 boxes, min-time line 0.10 m clear of box and wall, curvature within the steering limit) passed 2 of 64 layouts after 350 judgements (11-28), so this floor is a box-free generalisation test until a box rule for a 1.4 m lane is agreed"
+  },
+  {
+   "id": "lab12x16_rev",
+   "track": "real:map12x16+smooth~rev",
+   "bank": "banks/labdev_map12x16_rev",
+   "bank_sha256": "7aa81f98661b7ac730c32f5abc25f60f12abd52cd3ea2ef2e5ba12639e62f79f",
+   "sessions": 128,
+   "role": "variant: lab12x16 driven the other way round (same floor, every corner mirrored in order); lab12x16's layouts at the same coordinates",
+   "check_only": true,
+   "scoring_defect": "NOT SCOREABLE (11-28): plan_reward.GoalField -- the walls-only distance-to-go every progress / lap number is read from -- builds a 1.01 m 'lap' on real:map12x16+smooth~rev and is NaN on 70 % of the driven decisions, so laps, distance, DNF and streaks cannot be scored on reversed floors until GoalField is fixed (the policy's driving does not read it)"
+  },
+  {
+   "id": "lab12x16_h3",
+   "track": "real:map12x16+duct+smooth+hose3",
+   "bank": "banks/labdev_map12x16_h3",
+   "bank_sha256": "3cbc14cd395703c8ae5dda33a6648084d3558ca2b61840db9e40d8d17e763552",
+   "sessions": 128,
+   "role": "variant: lab12x16 with its duct hoses re-laid (Track.with_hoses variant 3: 1-4 m sections moved 8-25 cm, as measured between competition bags); lab12x16's layouts at the same coordinates"
+  },
+  {
+   "id": "lab16x07_rev",
+   "track": "real:map16x07+smooth~rev",
+   "bank": "banks/empty_map16x07r",
+   "bank_sha256": "5aa04071cc3aefe6903f85e129da36302013eafbbc277b7ca6f86048cd4b363f",
+   "sessions": 128,
+   "role": "variant: lab16x07 the other way round, box-free as lab16x07",
+   "check_only": true,
+   "scoring_defect": "NOT SCOREABLE (11-28): plan_reward.GoalField -- the walls-only distance-to-go every progress / lap number is read from -- builds a 1.01 m 'lap' on real:map12x16+smooth~rev and is NaN on 70 % of the driven decisions, so laps, distance, DNF and streaks cannot be scored on reversed floors until GoalField is fixed (the policy's driving does not read it)"
+  },
+  {
+   "id": "k26scan_stair",
+   "track": "real:korea26_scan+duct",
+   "bank": "banks/exam3_k26scan",
+   "bank_sha256": "80eb5f5950719f7d186d5709d23624bedc313df2fc6e342e9c5314b6073f9c11",
+   "sessions": 128,
+   "check_only": true,
+   "role": "CHECK ONLY (not pooled): the main Korea map on its raw 5 cm grid (wall staircases), the same exam3 layouts -- the stairs-vs-smooth line of the bridge table"
+  }
+ ],
+ "qual": {
+  "secs": 120,
+  "remove_at": 60,
+  "boxes_per_session": 3,
+  "every_session_boxed": true,
+  "start": "the exam's own spawn (one car, rolling start); laps counted from the first start-line crossing"
+ },
+ "race": {
+  "secs": 120,
+  "remove_at": 60,
+  "M": 10,
+  "map": "k26scan",
+  "matches": 128,
+  "rule": "first to M laps (own laps from own start when half a lap apart; one common line = the leading car's otherwise) within the time limit wins; if neither, the one further along wins (ties within 0.5 m = half a win)",
+  "starts": {
+   "half_lap": "REPRESENTATIVE (preset roboracer-korea-1v1): opposite sides of the lap, both standing, own laps from own line, no yield duty",
+   "side_by_side": "auxiliary: RoboRacer 2025 rule grid, same line, 30 cm apart, both standing"
+  },
+  "opponents": [
+   {
+    "id": "selfcopy",
+    "kind": "race4",
+    "ref": "~/f1sim_runs/exam4_ref/plan_u500.pt",
+    "paces": [
+     0.7,
+     0.8,
+     0.9,
+     0.95
+    ],
+    "note": "a frozen copy of scan31b u500 at 0.70-0.95 of its pace; exam_record's race4 runs the copy on IDEAL execution whatever the condition (a known bias: ~9 % faster than the same pace under MAP), its starts are half a lap or 5 m behind (no side-by-side), half the matches boxed"
+   },
+   {
+    "id": "ftg_k26comp",
+    "kind": "slot",
+    "slot": {
+     "kind": "ftg"
+    },
+    "settings_from": "baseline_settings korea_2026_competition race",
+    "options": {
+     "max_speed": 7.210195504919446,
+     "safety_radius": 17,
+     "max_lidar_dist": 8.086843513821734,
+     "track_width": 1.691335212526323,
+     "radius_mode": "stopping_passable",
+     "r_min": 0.7126292306388392,
+     "r_max": 4.532010673481452,
+     "t_react": 0.39939999594014036,
+     "a_brake": 7.091946230811433,
+     "scan_quantile": 0.6041039357596871,
+     "scan_gain": 0.4625910516959505,
+     "gap_margin": 0.23808984327171676,
+     "target": "middle"
+    },
+    "note": "Follow-the-Gap tuned on the neighbouring map (audit C's opponent)"
+   },
+   {
+    "id": "forzaeth_default",
+    "kind": "slot",
+    "slot": {
+     "kind": "forzaeth"
+    },
+    "note": "the env's ForzaETH opponent (simplified spliner on the min-time line with limits 7 / 6.5 / 4, the other car's true state): an opponent slot takes no stack settings, so it cannot be the tuned modular stack (audit C's opponent)"
+   },
+   {
+    "id": "disparity_k26comp",
+    "kind": "slot",
+    "slot": {
+     "kind": "disparity"
+    },
+    "options": {
+     "top_speed": 6.453021953060854,
+     "tolerance": 0.29687918259014723,
+     "disparity_threshold": 0.46406729689975434,
+     "side_margin": 0.21676999577629208,
+     "d_near": 0.5594246213552496,
+     "d_mid": 2.2376984854209985,
+     "d_far": 6.713095456262995,
+     "v_min": 0.8937097468575695
+    },
+    "note": "Disparity Extender, korea_2026_competition solo setting; only if it qualifies"
+   }
+  ],
+  "not_runnable": "the October v2 policy as an opponent: opponent_pool._observation_of refuses it in this world's env (it emits 8 action dimensions, the env's cars take 10) -- past checkpoints race only as race4 copies (plan_steps2)",
+  "maps": [
+   "k26scan",
+   "lab12x16"
+  ],
+  "preset": {
+   "name": "roboracer-korea-1v1",
+   "start": "half_lap",
+   "laps_from": "each car's own start line",
+   "yield": "none (the caught car has no duty to yield)",
+   "win": "first to M laps within the time limit, else the further along",
+   "note": "the representative rule (PM 11-28); side_by_side (30 cm, same line) is auxiliary"
+  },
+  "catch_up": "a car catches the other when it first comes within 3 m behind it along the track; after that: contacts, time lost against its own pace before the catch, passes, and the result",
+  "opponents_rule": "1v1 tables use the self-copy and only the opponents that pass the qualification table (python -m f1sim.compbench qualify); the old opponents are not tuned further (PM 11-28: rebuilding them is a separate task)"
+ },
+ "conditions": {
+  "ideal": {
+   "mode": "ideal",
+   "profile": "real-2026-11",
+   "note": "the plan driven exactly (kinematic, no delay / servo lag / tyre forces): the training condition, reference only; meaningless for baselines (they publish commands) and for v2 policies"
+  },
+  "real": {
+   "mode": "map",
+   "profile": "real-2026-11",
+   "note": "REPRESENTATIVE: MAP follows the plan, full dynamics, the default randomisation"
+  },
+  "stress": {
+   "mode": "map",
+   "profile": "stress-2026-11",
+   "note": "real + pessimistic friction / delay / servo / LiDAR noise"
+  }
+ },
+ "scoring": {
+  "bootstrap": 2000,
+  "cluster": "box layout (session index mod the bank's layout count) within a map",
+  "ci": 0.95,
+  "same_rule": "two drivers are called equal on a metric when the 95 % interval of their paired (same-session) difference contains 0",
+  "dnf": "restarted by the env, or < 1 m along the track for 10 s at a stretch, or >= 5 m driven backwards",
+  "hard_contact": "a contact onset above the env's contact_severity_min (1.5 m/s closing speed)"
+ },
+ "place_note": "the place, the course and the physics profile are arguments: maps[] names the floor (track) and its box bank, conditions[] the execution and the physics profile file; the world json only supplies the car / box / contact model the November checkpoints were built with"
+}

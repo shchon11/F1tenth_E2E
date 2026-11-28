@@ -1,0 +1,7 @@
+{
+  "name": "real-2026-11",
+  "version": "1.0.0",
+  "description": "The car as the training / exam worlds randomise it today (params.py defaults + state_rl's friction pin): friction 1.0489 x 1.0 (front 0.92), command delay 0.02-0.05 s, servo 0.025-0.07 s, LiDAR noise 0.005-0.011 m, steering bias +-0.03 rad, motor a_max 3-6 m/s^2. Nothing is overridden: this profile is the code's own default, recorded so a later re-identified car model can replace it by name.",
+  "ranges": {},
+  "cfg": {}
+}

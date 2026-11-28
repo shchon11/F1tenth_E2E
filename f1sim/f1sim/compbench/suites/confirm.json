@@ -1,0 +1,112 @@
+{
+ "name": "confirm",
+ "version": "1.0.0",
+ "purpose": "CONFIRMATION suite: final verdicts only. Fresh layouts and a fresh seed nobody selected on, the same floors as dev (smoothed walls). Every run is appended to /data/compbench/ledger.jsonl and the tool prints the use count; once a confirm result has been used to choose, it is no longer a confirmation.",
+ "world": "f1sim/f1sim/learn/configs/plan_world_korea26scan_qual.json",
+ "host_ckpt": "~/f1sim_runs/pick_scan31b_u475/state_latest.pt",
+ "seed": 20261205,
+ "noise_seeds": [],
+ "maps": [
+  {
+   "id": "k26scan",
+   "track": "real:korea26_scan+duct+smooth",
+   "bank": "banks/confirm_k26scan",
+   "bank_sha256": "0165a2ff93e984228f4a53d8a6cf6c0d04bc0fb0e57999bb300abdbfd2721f88",
+   "sessions": 128,
+   "role": "main map, 64 NEW layouts: exam_line_bank.py on the exam3 reference line with seed 20261205 (exam3 used 20261118)"
+  },
+  {
+   "id": "k26scan_h25",
+   "track": "real:korea26_scan+duct+smooth+hose25",
+   "bank": "banks/confirm_on_hose25",
+   "bank_sha256": "c039be9ad74380638477c2c2bc6c7bb57ef04817f7fa58fc0d8c8d4e105243a5",
+   "sessions": 128,
+   "role": "held-out hose variant 25 with the confirm layouts"
+  },
+  {
+   "id": "lab12x16",
+   "track": "real:map12x16+smooth",
+   "bank": "banks/labconf_map12x16",
+   "bank_sha256": "1663428726215278d21fde99dedfb8579c0973d77fd9c8ac2cfd88584a299df5",
+   "sessions": 128,
+   "role": "real/lab12x16: the 12.3 x 16.4 m pre-competition loop (lap 36.1 m, median half-width 0.94 m); 64 layouts x 3 boxes by exam_line_bank.py (seed 20261210) on the smoothed centerline (no driven line exists there), judged passable (min-time line, 0.10 m clearance)"
+  },
+  {
+   "id": "lab16x07",
+   "track": "real:map16x07+smooth",
+   "bank": "banks/empty_map16x07",
+   "bank_sha256": "7594cda654cbf10a21d7f34aac4cf9eb556deff4afb09c77455d127580f26d27",
+   "sessions": 128,
+   "role": "real/lab16x07: the 15.5 x 7.0 m pre-competition hairpin loop (lap 33.3 m, median half-width 0.70 m, the narrowest real floor in the catalogue). NO BOXES: exam_line_bank.py's judge (3 boxes, min-time line 0.10 m clear of box and wall, curvature within the steering limit) passed 2 of 64 layouts after 350 judgements (11-28), so this floor is a box-free generalisation test until a box rule for a 1.4 m lane is agreed"
+  },
+  {
+   "id": "lab12x16_rev",
+   "track": "real:map12x16+smooth~rev",
+   "bank": "banks/labconf_map12x16_rev",
+   "bank_sha256": "13b4e042143f0966c4c35bec0bfedef3844ab9f81934cf49690177dec9ce34ea",
+   "sessions": 128,
+   "role": "variant: lab12x16 driven the other way round (same floor, every corner mirrored in order); lab12x16's layouts at the same coordinates",
+   "check_only": true,
+   "scoring_defect": "NOT SCOREABLE (11-28): plan_reward.GoalField -- the walls-only distance-to-go every progress / lap number is read from -- builds a 1.01 m 'lap' on real:map12x16+smooth~rev and is NaN on 70 % of the driven decisions, so laps, distance, DNF and streaks cannot be scored on reversed floors until GoalField is fixed (the policy's driving does not read it)"
+  }
+ ],
+ "qual": {
+  "secs": 120,
+  "remove_at": 60,
+  "boxes_per_session": 3,
+  "every_session_boxed": true
+ },
+ "race": {
+  "secs": 120,
+  "remove_at": 60,
+  "M": 10,
+  "map": "k26scan",
+  "matches": 128,
+  "starts": {
+   "half_lap": "opponent half a lap away, both standing",
+   "side_by_side": "30 cm apart, both standing"
+  },
+  "opponents": [
+   {
+    "id": "selfcopy",
+    "kind": "race4",
+    "ref": "~/f1sim_runs/exam4_ref/plan_u500.pt",
+    "paces": [
+     0.7,
+     0.8,
+     0.9,
+     0.95
+    ],
+    "note": "a frozen copy of scan31b u500 at 0.70-0.95 of its pace; exam_record's race4 runs the copy on IDEAL execution whatever the condition (a known bias: ~9 % faster than the same pace under MAP), its starts are half a lap or 5 m behind (no side-by-side), half the matches boxed"
+   }
+  ],
+  "preset": {
+   "name": "roboracer-korea-1v1",
+   "start": "half_lap",
+   "laps_from": "each car's own start line",
+   "yield": "none (the caught car has no duty to yield)",
+   "win": "first to M laps within the time limit, else the further along",
+   "note": "the representative rule (PM 11-28); side_by_side (30 cm, same line) is auxiliary"
+  }
+ },
+ "conditions": {
+  "ideal": {
+   "mode": "ideal",
+   "profile": "real-2026-11"
+  },
+  "real": {
+   "mode": "map",
+   "profile": "real-2026-11"
+  },
+  "stress": {
+   "mode": "map",
+   "profile": "stress-2026-11"
+  }
+ },
+ "scoring": {
+  "bootstrap": 2000,
+  "cluster": "box layout",
+  "ci": 0.95,
+  "same_rule": "equal when the 95 % interval of the paired difference contains 0"
+ }
+}

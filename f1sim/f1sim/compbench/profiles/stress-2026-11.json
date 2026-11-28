@@ -1,0 +1,12 @@
+{
+  "name": "stress-2026-11",
+  "version": "1.0.0",
+  "description": "real-2026-11 with pessimistic ranges for what is not measured on the car (audit C, 11-28): friction x 0.80-1.05 (0.84-1.10 absolute), command delay 0.04-0.08 s (inference latency on the Orin not measured), servo 0.04-0.09 s, LiDAR noise 0.008-0.015 m.",
+  "ranges": {
+    "vehicle.mu": [0.80, 1.05],
+    "actuator.cmd_delay": [0.04, 0.08],
+    "actuator.servo_tau": [0.04, 0.09],
+    "lidar.noise_std": [0.008, 0.015]
+  },
+  "cfg": {}
+}
