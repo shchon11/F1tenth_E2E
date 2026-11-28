@@ -3473,7 +3473,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "randomize": bool(self.chk_dr.isChecked()),
             "collision_soft": bool(self.chk_soft.isChecked()),
             "stochastic": bool(self.chk_stoch.isChecked()),
-            "plan_follower": str(self.combo_follower.currentData() or "map"),
+            # (11-28) a new key: "mpc" saved before the follower choice reached plan_rl checkpoints meant nothing for them;
+            # restored under the old key it switched the lab console to the slow MPC follower without anyone choosing it
+            "plan_follower_v2": str(self.combo_follower.currentData() or "map"),
             "plan_speed_scale": float(self.spin_speed_scale.value()),
             "opponent_speed_limit": bool(self.chk_opp_limit.isChecked()),
             "obstacle_speed_limit": bool(self.chk_obs_limit.isChecked()),
@@ -3556,7 +3558,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
         attempt(lambda v: self.chk_soft.setChecked(bool(v)), "collision_soft")
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
-        attempt(combo_data(self.combo_follower), "plan_follower")
+        attempt(combo_data(self.combo_follower), "plan_follower_v2")
         attempt(lambda v: self.spin_speed_scale.setValue(float(v)), "plan_speed_scale")
         attempt(lambda v: self.chk_opp_limit.setChecked(bool(v)), "opponent_speed_limit")
         attempt(lambda v: self.chk_obs_limit.setChecked(bool(v)), "obstacle_speed_limit")
