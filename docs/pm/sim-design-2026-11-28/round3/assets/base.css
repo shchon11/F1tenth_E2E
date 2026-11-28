@@ -1,0 +1,125 @@
+/* TENTH round 3 — one grammar for every screen (A안). 1920x1200 stage, one family, no accent colour.
+   Tokens mirror SPEC.md §2; change them there first. */
+@font-face{font-family:"Pretendard";src:url(../fonts/PretendardVariable.woff2) format("woff2");font-weight:100 900}
+:root{
+  --ink:#0e0f11;            /* stage behind the scene */
+  --white:#f4f4f1;          /* text, focus fill, main button */
+  --on-white:#101114;       /* text on a white fill */
+  --t2:rgba(244,244,241,.60);   /* labels, unfocused menu words */
+  --t3:rgba(244,244,241,.50);   /* secondary words (back, settings) */
+  --t4:rgba(244,244,241,.30);   /* disabled */
+  --band:rgba(244,244,241,.16); /* focused value row */
+  --film:9,10,12;           /* the one dark film under text */
+  --r:10px;
+  --col-x:60px; --col-w:636px; --inset:36px;   /* the one column: 60..696, text starts at 96 */
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1920px;height:1200px;overflow:hidden}
+body{font-family:"Pretendard",sans-serif;font-weight:500;font-size:24px;line-height:1.2;position:relative;
+  background:var(--ink);color:var(--white);-webkit-font-smoothing:antialiased;word-break:keep-all;
+  font-variant-ligatures:none}   /* ligatures off: Pretendard would turn the x in map12x16 into a multiplication sign */
+img{display:block}
+.num{font-feature-settings:"liga" 0,"clig" 0,"calt" 0,"rlig" 0,"tnum" 1}
+.abs{position:absolute}
+.bg{position:absolute;inset:0;width:1920px;height:1200px}
+svg.ov{position:absolute;inset:0;width:1920px;height:1200px}
+
+/* films: left column, top strip, bottom strip, whole screen (pause) */
+.film-l{position:absolute;inset:0;background:linear-gradient(90deg,rgba(var(--film),.88) 0,rgba(var(--film),.6) 30%,rgba(var(--film),0) 56%)}
+.film-t{position:absolute;left:0;right:0;top:0;height:300px;background:linear-gradient(180deg,rgba(var(--film),.72) 0,rgba(var(--film),0) 100%)}
+.film-b{position:absolute;left:0;right:0;bottom:0;height:300px;background:linear-gradient(0deg,rgba(var(--film),.72) 0,rgba(var(--film),0) 100%)}
+.film-all{position:absolute;inset:0;background:rgba(var(--film),.58)}
+.film-r{position:absolute;inset:0;background:linear-gradient(270deg,rgba(var(--film),.80) 0,rgba(var(--film),.62) 45%,rgba(var(--film),0) 66%)}
+
+/* identity and titles */
+.mark{position:absolute;left:96px;top:72px;font-size:30px;font-weight:800;letter-spacing:.06em}
+.title{position:absolute;left:96px;top:150px;font-size:64px;font-weight:800;white-space:nowrap}
+
+/* word list — L: up to five words, M: six to eight */
+.menu{position:absolute;left:60px;top:286px}
+.menu>div{height:108px;padding:0 36px;display:flex;align-items:center;justify-content:space-between;font-size:62px;font-weight:700;color:var(--t2);border-radius:var(--r);white-space:nowrap}
+.menu>div.on{background:var(--white);color:var(--on-white)}
+.menu.m>div{height:92px;font-size:52px}
+.menu>div>i{font-style:normal;font-size:28px;font-weight:600;font-feature-settings:"liga" 0,"clig" 0,"calt" 0,"rlig" 0,"tnum" 1}
+.menu>div.dim{color:var(--t4)}
+
+/* value rows */
+.rows{position:absolute;left:60px;top:280px;width:636px}
+.row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:0 36px;border-radius:var(--r);margin-bottom:6px}
+.row>label,.row>b,.row>em{height:92px;display:flex;align-items:center;white-space:nowrap}
+.row>label{font-size:28px;font-weight:500;color:var(--t2)}
+.row>b{font-size:34px;font-weight:700}
+.row.on{background:var(--band);box-shadow:inset 0 0 0 3px var(--white)}
+.row.on>label{color:var(--white)}
+.row.on.lr>b{display:flex;align-items:center;gap:22px}
+.row.on.lr>b:before,.row.on.lr>b:after{content:"";width:13px;height:13px;border:solid var(--white);border-width:0 0 4px 4px}
+.row.on.lr>b:before{transform:rotate(45deg)}
+.row.on.lr>b:after{transform:rotate(-135deg)}
+.row.s{margin-bottom:4px}
+.row.s>label,.row.s>b,.row.s>em{height:72px}
+.row.s>label{font-size:26px}
+.row.s>b{font-size:30px}
+.row>em{font-style:normal;font-size:26px;font-weight:500;color:var(--t2);margin-left:auto;margin-right:40px}
+.row>em.l{margin-left:28px;margin-right:auto;font-size:28px;font-weight:600;color:var(--white)}
+.row>label.w{width:164px}
+/* what a focused row adds: error and source, or a lap's contacts */
+.more{flex-basis:100%;display:flex;gap:56px;padding:0 0 22px;margin-top:-6px}
+.more dt{font-size:22px;font-weight:500;color:var(--t2);margin-bottom:4px}
+.more dd{font-size:28px;font-weight:700}
+
+/* the one main button, and the secondary words under it */
+.go{position:absolute;left:60px;width:636px;height:112px;border-radius:var(--r);background:var(--white);color:var(--on-white);font-size:44px;font-weight:800;display:flex;align-items:center;justify-content:center}
+.go.focus{box-shadow:0 0 0 6px var(--ink),0 0 0 10px var(--white)}
+.go.off{background:none;color:var(--t4);box-shadow:inset 0 0 0 3px var(--t4)}
+.sub{position:absolute;left:96px;font-size:28px;font-weight:600;color:var(--t3);display:flex;gap:44px;white-space:nowrap}
+
+/* what is chosen now: top right, label small, value large, no box */
+.now{position:absolute;right:96px;top:62px;display:flex;gap:64px}
+.now dt{font-size:22px;font-weight:500;color:var(--t2);margin-bottom:6px}
+.now dd{font-size:30px;font-weight:700;white-space:nowrap}
+
+/* big scores (result) */
+.score{position:absolute;left:96px;display:flex;gap:88px}
+.score dt{font-size:28px;font-weight:500;color:var(--t2);margin-bottom:2px}
+.score dd{font-size:132px;font-weight:800;line-height:1;letter-spacing:-.01em}
+.score dd small{font-size:34px;font-weight:700;margin-left:10px;letter-spacing:0}
+
+/* driving HUD */
+.hud dt{font-size:22px;font-weight:600;color:rgba(244,244,241,.72);margin-bottom:2px;white-space:nowrap}
+.hud dd{font-weight:700;font-feature-settings:"liga" 0,"clig" 0,"calt" 0,"rlig" 0,"tnum" 1;white-space:nowrap}
+.hud-tl{position:absolute;left:96px;top:56px;display:flex;gap:60px}
+.hud-tl dd{font-size:60px;line-height:1.05}
+.hud-tc{position:absolute;left:760px;width:400px;top:56px;text-align:center}
+.hud-tc dd{font-size:76px;line-height:1.02}
+.line{position:relative;height:4px;margin:16px 20px 0;background:rgba(244,244,241,.30);border-radius:2px}
+.line>i{position:absolute;left:0;top:0;height:4px;background:var(--white);border-radius:2px}
+.line>u{position:absolute;top:-7px;width:4px;height:18px;margin-left:-2px;background:var(--white);text-decoration:none}
+.line>span{position:absolute;top:20px;transform:translateX(-50%);font-size:22px;font-weight:600;color:rgba(244,244,241,.72);white-space:nowrap}
+.hud-bc{position:absolute;left:760px;width:400px;bottom:58px;text-align:center}
+.hud-bc dd{font-size:108px;line-height:1}
+.hud-bc dd small{font-size:28px;font-weight:600;color:rgba(244,244,241,.72);margin-left:10px}
+.hud-msg{position:absolute;left:0;right:0;top:318px;text-align:center;font-size:62px;font-weight:700}
+.hud-laps{position:absolute;left:96px;top:196px}
+.hud-laps div{display:flex;gap:28px;font-size:26px;font-weight:600;line-height:38px;font-feature-settings:"liga" 0,"clig" 0,"calt" 0,"rlig" 0,"tnum" 1}
+.hud-laps div>span:first-child{width:22px;color:rgba(244,244,241,.72)}
+.hud-laps div>span:nth-child(2){width:88px}
+.hud-laps div>span:nth-child(3){color:rgba(244,244,241,.72)}
+.hud-map{position:absolute;right:96px;top:56px;width:400px;height:150px}
+.hud-bar{position:absolute;bottom:76px;width:300px}
+.hud-bar .line{margin:14px 0 0;height:6px}
+.hud-bar .line>i{height:6px;border-radius:0}
+.hud-bar .line>u{top:-6px;height:18px;width:3px}
+.faded{opacity:.38}
+
+/* the column: everything you operate sits in x 60..696, stacked */
+.col{position:absolute;left:60px;top:280px;width:636px}
+.col .rows,.col .menu{position:static}
+.col .go{position:static;margin-top:38px}
+.col .rows+.sub,.col .menu+.sub{margin-top:38px}
+.col .sub{position:static;margin:42px 0 0 36px}
+.col .menu.fit{display:inline-block}
+.col .menu.fit>div{min-width:330px}
+.col .pairs{display:flex;gap:64px;margin:6px 0 0 36px}
+.col .pairs dt{font-size:28px;font-weight:500;color:var(--t2);margin-bottom:4px}
+.col .pairs dd{font-size:44px;font-weight:700;white-space:nowrap}
+.menu-open .hud-tl,.menu-open .hud-laps{display:none}

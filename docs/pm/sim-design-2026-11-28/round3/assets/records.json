@@ -1,0 +1,128 @@
+[
+ {
+  "id": "20261129-002321-scan31b-u475",
+  "when": "11-29 00:23",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261129-001923-scan31b-u475",
+  "when": "11-29 00:19",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261129-000708-quali-a-1124",
+  "when": "11-29 00:07",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261129-000529-ftg",
+  "when": "11-29 00:05",
+  "course": "map12x16",
+  "driver": "Follow-the-Gap",
+  "streak": 1,
+  "best": 10.74149086978427,
+  "dur": 30.0
+ },
+ {
+  "id": "20261129-000458-quali-b-1128",
+  "when": "11-29 00:04",
+  "course": "IFAC 2026",
+  "driver": "hs43b u900",
+  "streak": 4,
+  "best": 7.095292189146175,
+  "dur": 30.0
+ },
+ {
+  "id": "20261129-000239-quali-a-1124",
+  "when": "11-29 00:02",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-235829-quali-a-1124",
+  "when": "11-28 23:58",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.687961648987454,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-235624-quali-a-1124",
+  "when": "11-28 23:56",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-234303-ftg",
+  "when": "11-28 23:43",
+  "course": "IFAC 2026",
+  "driver": "Follow-the-Gap",
+  "streak": 1,
+  "best": 12.97091673284233,
+  "dur": 20.0
+ },
+ {
+  "id": "20261128-233646-quali-a-1124",
+  "when": "11-28 23:36",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.512286097763997,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-233252-quali-a-1124",
+  "when": "11-28 23:32",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 2,
+  "best": 7.724718334017275,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-232926-quali-a-1124",
+  "when": "11-28 23:29",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 3,
+  "best": 7.700505592489833,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-232654-quali-a-1124",
+  "when": "11-28 23:26",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 3,
+  "best": 7.700330006355387,
+  "dur": 60.0
+ },
+ {
+  "id": "20261128-232358-quali-a-1124",
+  "when": "11-28 23:23",
+  "course": "IFAC 2026",
+  "driver": "scan31b u475",
+  "streak": 5,
+  "best": 7.53683498428596,
+  "dur": 60.0
+ }
+]
