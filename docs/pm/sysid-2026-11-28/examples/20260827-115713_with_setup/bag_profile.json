@@ -1,0 +1,863 @@
+{
+ "bag": "real_data/01_competition_0826-0827_map08x23/20260827-115713_map08x23_v9.2_161s_fastest-longest",
+ "name": "20260827-115713",
+ "duration_s": 161.015685888,
+ "roles": {
+  "servo_cmd": "/commands/servo/position",
+  "servo_applied": "/sensors/servo_position_command",
+  "erpm_cmd": "/commands/motor/speed",
+  "ackermann": "/ackermann_cmd",
+  "vesc": "/sensors/core",
+  "imu": "/sensors/imu/raw",
+  "wheel_odom": "/odom",
+  "pose": "/pf/pose/odom",
+  "scan": "/scan",
+  "map": "/map",
+  "tf_static": "/tf_static"
+ },
+ "missing": {},
+ "counts": {
+  "/commands/servo/position": 5218,
+  "/sensors/servo_position_command": 5228,
+  "/commands/motor/speed": 5218,
+  "/ackermann_cmd": 5218,
+  "/sensors/core": 8046,
+  "/sensors/imu/raw": 8047,
+  "/odom": 8027,
+  "/pf/pose/odom": 8017,
+  "/scan": 6411,
+  "/map": 1,
+  "/tf_static": 1
+ },
+ "calib": {
+  "servo_g": 0.6300000000000017,
+  "servo_o": 0.3952999999999991,
+  "servo_fit_n": 3347,
+  "servo_fit_inlier": 0.9997012249775918,
+  "servo_fit_resid": 2.6980147455628605e-16,
+  "servo_src": "fit: /ackermann_cmd vs /commands/servo/position",
+  "clamp_lo_servo": 0.235,
+  "clamp_hi_servo": 0.655,
+  "clamp_frac": 0.07878056142469061,
+  "clamp_seen_lo": true,
+  "clamp_seen_hi": true,
+  "clamp_n_lo": 115,
+  "clamp_n_hi": 63,
+  "erpm_gain": 4204.0,
+  "erpm_gain_odom": 4204.034305431693,
+  "erpm_pairs": 2573,
+  "erpm_quantum_mps": 0.00023786869647990372,
+  "gyro_scale": 1.0,
+  "gyro_unit": "rad/s",
+  "gyro_evidence": {
+   "vs_pose_heading_rate": {
+    "slope": 1.0056415793855242,
+    "corr": 0.9876149975532021,
+    "n": 10782
+   },
+   "vs_kinematic_rate": {
+    "slope": 0.4239962789597703,
+    "corr": 0.7228980113782421,
+    "n": 10177
+   },
+   "p99_abs_raw": 2.826511011084401
+  },
+  "accel_scale": 9.80665,
+  "accel_unit": "g",
+  "gyro_by_magnitude": false,
+  "imu_axes": {
+   "corr_ay_vr": 0.8332265692600933,
+   "corr_ax_dvdt": 0.807844788897935,
+   "corr_ax_vr": -0.021091823354351984,
+   "ax_sign": 1.0,
+   "ay_sign": 1.0
+  },
+  "bias": {
+   "gx": -5.4306042353141114e-05,
+   "gy": 0.0006118628318810103,
+   "gz": -0.00019557476516532553,
+   "ax": -0.13072420715513267,
+   "ay": -0.443644704451069
+  },
+  "pose_ok": true,
+  "pose_corr": 0.9876149975532021,
+  "notes": [],
+  "substitutions": []
+ },
+ "bag_files": 1,
+ "segments": [],
+ "segment_intervals": {},
+ "segment_warnings": [],
+ "segment_mode": "자동 인식 (표시 토픽 없음)",
+ "methods": {
+  "서보 창 양 끝": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "가속·제동 한계, 전류 한계": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "그립 하한, 미끄러진 사건": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "저속 정상 선회": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "코스트다운": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "조향 응답(처프)": "자동 인식 (bag 전체에서 규칙으로 찾음)",
+  "지연·트림·재생 맞춤·IMU 바이어스·LiDAR": "bag 전체 (구간 표시와 무관)"
+ },
+ "delay_xcorr": {
+  "value": 0.11299463273815424,
+  "ci": [
+   0.10590532607811041,
+   0.1265002635759503
+  ],
+  "n": 5,
+  "seconds": 102.81,
+  "how": "xcorr of v*tan(steer_applied)/L with gyro z (1 s high-pass), moving stretches >= 3 s"
+ },
+ "accel": {
+  "current_max_A": 60.8036187457202,
+  "current_min_A": -30.00870229496029,
+  "current_max_fit": {
+   "extreme": 60.8036187457202,
+   "runs": 9,
+   "seconds": 3.45,
+   "status": "measured",
+   "value": 59.89926659022984,
+   "err": 0.16035306305403402,
+   "how": "9 flat stretches (within 2 % of 60.8 A, >= 0.2 s each, >= 0.5 s apart), 3.5 s in all"
+  },
+  "current_min_fit": {
+   "extreme": -30.00870229496029,
+   "runs": 4,
+   "seconds": 1.1,
+   "status": "measured",
+   "value": -29.869902197820046,
+   "err": 0.1188159951948408,
+   "how": "4 flat stretches (within 2 % of -30.0 A, >= 0.2 s each, >= 0.5 s apart), 1.1 s in all"
+  },
+  "a_max": {
+   "value": 4.521257949080743,
+   "ci": [
+    4.049743233232335,
+    5.015376321856348
+   ],
+   "n": 646,
+   "stretches": 15,
+   "by_speed": [
+    {
+     "v": [
+      0.3,
+      3
+     ],
+     "median": 5.5947136055845395,
+     "n": 93,
+     "wheel": 5.42403210422282,
+     "imu": 5.715682314170952
+    },
+    {
+     "v": [
+      3,
+      5
+     ],
+     "median": 2.761494582850447,
+     "n": 137,
+     "wheel": 1.75948633055798,
+     "imu": 3.9632947883185223
+    },
+    {
+     "v": [
+      5,
+      7
+     ],
+     "median": 4.64023865244009,
+     "n": 173,
+     "wheel": 4.262600798921727,
+     "imu": 4.895614965447232
+    },
+    {
+     "v": [
+      7,
+      9
+     ],
+     "median": 4.159410329338973,
+     "n": 243,
+     "wheel": 3.96341574250482,
+     "imu": 4.486424628716835
+    }
+   ],
+   "seconds": 6.46,
+   "how": "median of IMU a_x and wheel dv/dt while current >= 90 % of its p99.9 (61 A)"
+  },
+  "a_brake": {
+   "value": 4.852741717325626,
+   "ci": [
+    4.500032673939947,
+    5.154308642090669
+   ],
+   "n": 111,
+   "stretches": 5,
+   "by_speed": [
+    {
+     "v": [
+      0.3,
+      3
+     ],
+     "median": 4.66588979315156,
+     "n": 77,
+     "wheel": 4.467022877248635,
+     "imu": 4.838578643225217
+    },
+    {
+     "v": [
+      3,
+      5
+     ],
+     "median": 5.177351866092344,
+     "n": 27,
+     "wheel": 5.2226052967895065,
+     "imu": 5.20783613922775
+    }
+   ],
+   "seconds": 1.11,
+   "how": "median of IMU a_x and wheel dv/dt while current <= 90 % of its p0.1 (-30 A)"
+  },
+  "a_max_vswitch_fit": {
+   "a_max": 4.322959735125301,
+   "v_switch": 7.75,
+   "rss": 4.157007036127259
+  }
+ },
+ "lat": {
+  "value": 7.907900966089641,
+  "t": 146.23078592,
+  "v_at": 5.061070378430595,
+  "vr_at": -9.835308101944516,
+  "top10": [
+   7.907900966089641,
+   7.777655424120909,
+   7.4457859191577676,
+   7.353311941731696,
+   7.193508868408306,
+   7.054727098832609,
+   6.9845025804067475,
+   6.933148734845783,
+   6.852957566425253,
+   6.500077155126073
+  ],
+  "mu_lower": 0.8063814825745429,
+  "slides_t": [
+   39.03078592
+  ],
+  "n_slide_s": 0.05,
+  "how": "max over the marked/auto stretches of |a_y| (IMU, 0.1 s mean) held >= 0.3 s with body-slip change < 5.0 deg"
+ },
+ "low_speed_turn": {
+  "seconds": 1.21,
+  "need_s": 10.0
+ },
+ "coastdown": {
+  "status": "not_identified",
+  "c0": null,
+  "c2": null,
+  "seconds": 0.0,
+  "segments": 0,
+  "v_span": 0.0,
+  "need": {
+   "seconds": 3.0,
+   "segments": 2,
+   "v_span": 2.0
+  },
+  "validated": false,
+  "caveat": "실차 미검증 (합성 신호로만 시험함)",
+  "lacking": [
+   "전류 0.5 A 이하로 1.0 s 이상 속도가 줄어든 구간이 없음 (후보 샘플 1.5 s, 구간 합계 필요 3.0 s)"
+  ],
+  "how": "식별 안 됨: 전류 0.5 A 이하로 1.0 s 이상 속도가 줄어든 구간이 없음 (후보 샘플 1.5 s, 구간 합계 필요 3.0 s)"
+ },
+ "steer_response": {
+  "status": "sum_only",
+  "seconds": 96.0,
+  "need_seconds": 10.0,
+  "validated": false,
+  "caveat": "실차 미검증 (합성 신호로만 시험함)",
+  "runs": 4,
+  "selection": "자동 인식",
+  "gain": 0.5699975482393684,
+  "bins": 7,
+  "coherence_mean": 0.8430369109014089,
+  "f_bw_hz": 1.953125,
+  "band_hz": [
+   0.5,
+   4.0
+  ],
+  "segments_spectra": 69,
+  "tau_sum": 0.10376684946637194,
+  "tau_d": 0.07704088199889475,
+  "tau_s": 0.026725967467477192,
+  "tau_d_ci": [
+   0.06702487485725697,
+   0.08814478434447162
+  ],
+  "tau_s_ci": [
+   0.015363185801266624,
+   0.03473224310078379
+  ],
+  "tau_sum_ci": [
+   0.09856123697849972,
+   0.11047951681500358
+  ],
+  "tau_d_ci_width": 0.02111990948721465,
+  "lacking": [
+   "입력 조향 성분이 1.95 Hz 까지만 있음 (필요 2.0 Hz)"
+  ],
+  "how": "분리 식별 안 됨, 합만 냄: 입력 조향 성분이 1.95 Hz 까지만 있음 (필요 2.0 Hz). 합 tau_d+tau_s = 0.104 s. 실차 미검증 (합성 신호로만 시험함)"
+ },
+ "standstill_s": 38.01,
+ "windows": 315,
+ "impact_excluded": 84,
+ "speed_fit": {
+  "p": {
+   "tau_m": 0.07235122412953941,
+   "tau_v": 0.18,
+   "a_a": 4.493839577422238,
+   "a_b": 4.2137057950192505,
+   "v_s": 10.0
+  },
+  "rmse": 0.17607380843209147
+ },
+ "lin_fit": {
+  "p": {
+   "k": 1.0504427767404607,
+   "tau": 0.1,
+   "b": -0.02196250631824258,
+   "kus": 0.016692944691854804
+  },
+  "rmse": 0.15833972251550663,
+  "tau_curve": [
+   [
+    0.0,
+    0.22305049442341307
+   ],
+   [
+    0.01,
+    0.191570110164113
+   ],
+   [
+    0.02,
+    0.1612256374186049
+   ],
+   [
+    0.03,
+    0.1326915520490561
+   ],
+   [
+    0.04,
+    0.10653967203452157
+   ],
+   [
+    0.05,
+    0.08331606178526556
+   ],
+   [
+    0.06,
+    0.0635240806095024
+   ],
+   [
+    0.07,
+    0.047532614464951876
+   ],
+   [
+    0.08,
+    0.03564636972297497
+   ],
+   [
+    0.09,
+    0.028094613399412036
+   ],
+   [
+    0.1,
+    0.025071467726287634
+   ],
+   [
+    0.11,
+    0.026804861516934703
+   ],
+   [
+    0.12,
+    0.03338164881161565
+   ],
+   [
+    0.13,
+    0.04471665170425776
+   ],
+   [
+    0.14,
+    0.06056499898113344
+   ],
+   [
+    0.15,
+    0.08053835948289917
+   ],
+   [
+    0.16,
+    0.10417109655989615
+   ],
+   [
+    0.17,
+    0.13101114402558492
+   ],
+   [
+    0.18,
+    0.1606873874660211
+   ],
+   [
+    0.19,
+    0.19275416572993384
+   ],
+   [
+    0.2,
+    0.2267394435619485
+   ],
+   [
+    0.21,
+    0.26216321531152753
+   ],
+   [
+    0.22,
+    0.2985472946346578
+   ],
+   [
+    0.23,
+    0.33544967753845284
+   ],
+   [
+    0.24,
+    0.3724657078184497
+   ],
+   [
+    0.25,
+    0.40920130793850784
+   ]
+  ],
+  "gain_5mps": 0.46400701844605713,
+  "blocks": 6
+ },
+ "trim": {
+  "value": 0.02211493972964735,
+  "ci": [
+   0.018444176962607316,
+   0.026392372906486727
+  ],
+  "trim_b": -0.023230478697058694,
+  "n": 1111,
+  "slope_per_rad": 0.832685536478977,
+  "how": "zero crossing of r/v vs applied steering command, |cmd| < 0.08 rad, v > 1.5 m/s"
+ },
+ "tf_static": [
+  [
+   "base_link",
+   "laser",
+   0.297,
+   0.0,
+   0.11,
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "place": {
+  "code": "map08x23",
+  "size_m": [
+   8.35,
+   22.55
+  ],
+  "res": 0.05000000074505806,
+  "grid_md5": "37668e1491",
+  "n_map_msgs": 1
+ },
+ "lidar": {
+  "beams": 1081,
+  "fov_deg": 270.00000068324533,
+  "rate_hz": 20.00168974274936,
+  "range_max_msg": 30.0,
+  "scans": 3206,
+  "valid_frac": 0.9700371008798835,
+  "invalid_value_mode": 65.53299713134766,
+  "dropout_by_range": [
+   {
+    "r": [
+     0,
+     2
+    ],
+    "miss_frac": 0.00016341875456941512,
+    "n": 2337553
+   },
+   {
+    "r": [
+     2,
+     4
+    ],
+    "miss_frac": 0.00016403316881900056,
+    "n": 762041
+   },
+   {
+    "r": [
+     4,
+     6
+    ],
+    "miss_frac": 0.000516606395920476,
+    "n": 180021
+   },
+   {
+    "r": [
+     6,
+     8
+    ],
+    "miss_frac": 0.0025485604077696653,
+    "n": 58072
+   },
+   {
+    "r": [
+     8,
+     10
+    ],
+    "miss_frac": 0.00832247067081119,
+    "n": 19946
+   },
+   {
+    "r": [
+     10,
+     30
+    ],
+    "miss_frac": 0.0297235895494131,
+    "n": 5282
+   }
+  ],
+  "still_seconds": 33.99712768000018,
+  "still_noise": [
+   {
+    "r": [
+     0,
+     2
+    ],
+    "sigma_mm": 3.706584684550762,
+    "beams": 24623
+   },
+   {
+    "r": [
+     2,
+     4
+    ],
+    "sigma_mm": 4.447830840945244,
+    "beams": 7921
+   },
+   {
+    "r": [
+     4,
+     6
+    ],
+    "sigma_mm": 7.413169369101524,
+    "beams": 1214
+   },
+   {
+    "r": [
+     6,
+     10
+    ],
+    "sigma_mm": 18.53257045149803,
+    "beams": 919
+   }
+  ]
+ },
+ "setup_check": [],
+ "setup_file": "docs/pm/sysid-2026-11-28/examples/setup_example_competition.yaml",
+ "setup_compare": [
+  {
+   "item": "ERPM 환산",
+   "setup": 4204.0,
+   "bag": 4204.0,
+   "unit": "ERPM/(m/s)",
+   "tol": 20.0,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  },
+  {
+   "item": "서보 이득",
+   "setup": 0.63,
+   "bag": 0.6300000000000017,
+   "unit": "서보/rad",
+   "tol": 0.02,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 1.6653345369377348e-15
+  },
+  {
+   "item": "서보 오프셋",
+   "setup": 0.395,
+   "bag": 0.3952999999999991,
+   "unit": "서보",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0002999999999990788
+  },
+  {
+   "item": "서보 창 servo_min",
+   "setup": 0.235,
+   "bag": 0.235,
+   "unit": "서보",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  },
+  {
+   "item": "서보 창 servo_max",
+   "setup": 0.655,
+   "bag": 0.655,
+   "unit": "서보",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  },
+  {
+   "item": "전류 한계 current_motor_max_A",
+   "setup": 60.0,
+   "bag": 59.89926659022984,
+   "unit": "A",
+   "tol": 3.0,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": -0.10073340977015732
+  },
+  {
+   "item": "전류 한계 current_regen_min_A",
+   "setup": -30.0,
+   "bag": -29.869902197820046,
+   "unit": "A",
+   "tol": 3.0,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.1300978021799537
+  },
+  {
+   "item": "자이로 단위",
+   "setup": "rad/s",
+   "bag": "rad/s",
+   "unit": "",
+   "tol": null,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": null
+  },
+  {
+   "item": "가속도 단위",
+   "setup": "g",
+   "bag": "g",
+   "unit": "",
+   "tol": null,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": null
+  },
+  {
+   "item": "LiDAR 프레임 이름",
+   "setup": "laser",
+   "bag": "laser",
+   "unit": "",
+   "tol": null,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": null
+  },
+  {
+   "item": "LiDAR tf x",
+   "setup": 0.297,
+   "bag": 0.297,
+   "unit": "m",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  },
+  {
+   "item": "LiDAR tf y",
+   "setup": 0.0,
+   "bag": 0.0,
+   "unit": "m",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  },
+  {
+   "item": "LiDAR tf z",
+   "setup": 0.11,
+   "bag": 0.11,
+   "unit": "m",
+   "tol": 0.01,
+   "note": "",
+   "verdict": "일치",
+   "ok": true,
+   "diff": 0.0
+  }
+ ],
+ "setup_manual": {},
+ "setup_ignored": [],
+ "seconds": 4.6,
+ "not_measured": {
+  "fixable": [
+   {
+    "item": "조향 이득 k 와 언더스티어 K 의 분리",
+    "why": "저속 정상 선회 1.2 s (10 s 필요)",
+    "test": "low_speed_circle"
+   },
+   {
+    "item": "구름·공기 저항",
+    "why": "전류 0.5 A 이하로 1.0 s 이상 속도가 줄어든 구간이 없음 (후보 샘플 1.5 s, 구간 합계 필요 3.0 s)",
+    "test": "coastdown"
+   },
+   {
+    "item": "순수 지연 대 서보 지연의 분리",
+    "why": "입력 조향 성분이 1.95 Hz 까지만 있음 (필요 2.0 Hz)",
+    "test": "steer_chirp"
+   }
+  ],
+  "not_from_driving": [
+   {
+    "item": "명령 조향각 -> 실제 바퀴 각",
+    "why": "bag 에 바퀴 각 측정이 없음 (k 는 타이어 강성과 맞바뀜)",
+    "how": "정지 상태에서 좌우 풀락과 중간 단계의 바퀴 각을 각도기·사진으로 재서 setup.yaml `hand_measured.wheel_angle_table` 에 적음",
+    "test": "steer_edges"
+   },
+   {
+    "item": "질량",
+    "why": "bag 으로 식별 불가 (힘이 질량당으로만 보임)",
+    "how": "저울로 재서 setup.yaml `hand_measured.mass_kg`",
+    "test": "scale"
+   },
+   {
+    "item": "무게중심 앞뒤 위치",
+    "why": "bag 으로 식별 불가",
+    "how": "바퀴별 저울 값으로 계산해 `hand_measured.cg_from_rear_axle_m` (뒤차축에서 무게중심까지)",
+    "test": "scale"
+   },
+   {
+    "item": "요 관성",
+    "why": "bag 으로 식별 불가",
+    "how": "이중 줄 매달기·진자로 재서 `hand_measured.yaw_inertia_kgm2`",
+    "test": "scale"
+   },
+   {
+    "item": "LiDAR 장착 위치 (실측)",
+    "why": "/tf_static 은 설정값이지 잰 값이 아님",
+    "how": "줄자로 base_link(뒤차축) 기준 x, y, z 를 재서 `hand_measured.lidar_mount_m: [x, y, z]`",
+    "test": null
+   },
+   {
+    "item": "한계에서 앞이 먼저 빠지는가 뒤인가",
+    "why": "주행 신호만으로는 안 갈림",
+    "how": "그립 램프(T6)를 영상으로 찍어 사람이 판정 (도구에 입력 경로 없음)",
+    "test": "grip_ramp"
+   }
+  ]
+ },
+ "thresholds": {
+  "SEGMENT_DEDUP_S": 2.0,
+  "SERVO_PAIR_TOL_S": 0.01,
+  "SERVO_FIT_MIN_PAIRS": 20,
+  "SERVO_FIT_MIN_STEER_STD": 0.02,
+  "SERVO_FIT_INLIER_TOL": 0.01,
+  "CLAMP_PAIR_TOL_S": 0.02,
+  "CLAMP_EDGE_MIN_CMDS": 3,
+  "CLAMP_EDGE_MARGIN": 0.001,
+  "ERPM_MIN_SPEED_CMD": 0.5,
+  "ERPM_MIN_PAIRS": 10,
+  "ERPM_ODOM_MIN_V": 1.0,
+  "ERPM_ODOM_MIN_SAMPLES": 50,
+  "STILL_V": 0.02,
+  "STILL_SECONDS": 1.0,
+  "UNIT_MIN_V": 1.0,
+  "UNIT_MIN_SAMPLES": 200,
+  "GYRO_DEG_P99": 15.0,
+  "DELAY_MIN_V": 1.5,
+  "DELAY_MIN_SEG_S": 3.0,
+  "DELAY_MAX_LAG_S": 0.4,
+  "TRIM_MAX_STEER": 0.08,
+  "TRIM_MIN_V": 1.5,
+  "TRIM_MAX_DR": 1.0,
+  "TRIM_MIN_SAMPLES": 200,
+  "CUR_LIMIT_FRAC": 0.9,
+  "ACCEL_MIN_RUN_S": 0.2,
+  "ACCEL_TRIM_S": 0.05,
+  "ACCEL_BIN_MIN_SAMPLES": 10,
+  "ACCEL_MIN_BINS": 3,
+  "CUR_PLATEAU_BAND": 0.02,
+  "CUR_PLATEAU_MIN_S": 0.2,
+  "CUR_PLATEAU_MIN_RUNS": 2,
+  "CUR_PLATEAU_SEP_S": 0.5,
+  "LAT_HOLD_S": 0.3,
+  "LAT_NOSLIP_DEG": 5.0,
+  "SLIDE_DEG": 30.0,
+  "SLIDE_WINDOW_S": 1.0,
+  "SLIDE_MIN_V": 2.0,
+  "IMPACT_ACC": 15.0,
+  "T2_V_MIN": 0.7,
+  "T2_V_MAX": 1.8,
+  "T2_MIN_STEER": 0.08,
+  "T2_MAX_DR": 0.5,
+  "T2_MIN_SECONDS": 10.0,
+  "LIDAR_STILL_V": 0.01,
+  "LIDAR_STILL_GYRO": 0.03,
+  "LIDAR_STILL_BLOCK_S": 1.0,
+  "LIDAR_GAP_BEAMS": 5,
+  "WIN_STRIDE_S": 0.25,
+  "WIN_MIN_V_START": 1.0,
+  "WIN_MIN_V_ALL": 0.3,
+  "WIN_MAX_CMD_GAP_S": 0.1,
+  "REPLAY_MIN_WINDOWS": 30,
+  "COAST_MAX_CURRENT": 0.5,
+  "COAST_MIN_V": 0.5,
+  "COAST_MIN_RUN_S": 1.0,
+  "COAST_MIN_TOTAL_S": 3.0,
+  "COAST_MIN_SEGMENTS": 2,
+  "COAST_MIN_V_SPAN": 2.0,
+  "CHIRP_MIN_V": 1.5,
+  "CHIRP_WIN_S": 5.0,
+  "CHIRP_HP_RMS": 0.02,
+  "CHIRP_MIN_TOTAL_S": 10.0,
+  "CHIRP_BAND_LO_HZ": 0.5,
+  "CHIRP_BAND_HI_HZ": 4.0,
+  "CHIRP_MIN_COHERENCE": 0.6,
+  "CHIRP_MIN_BINS": 6,
+  "CHIRP_BW_FRAC": 0.1,
+  "CHIRP_SEP_MAX_CI_S": 0.03,
+  "CHIRP_MIN_BANDWIDTH_HZ": 2.0,
+  "SETUP_TOL_ERPM": 20.0,
+  "SETUP_TOL_SERVO_GAIN": 0.02,
+  "SETUP_TOL_SERVO_OFFSET": 0.01,
+  "SETUP_TOL_SERVO_RANGE": 0.01,
+  "SETUP_TOL_CURRENT_A": 3.0,
+  "SETUP_TOL_TF_M": 0.01,
+  "FP_TOL_REGEN_A": 8.0,
+  "FP_TOL_DELAY_S": 0.03
+ },
+ "fingerprint": {
+  "servo map gain": 0.6300000000000017,
+  "servo map offset": 0.3952999999999991,
+  "ERPM gain": 4204.0,
+  "gyro unit": "rad/s",
+  "regen current min [A]": -30.00870229496029,
+  "total delay (a) [s]": 0.1,
+  "LiDAR mount x [m, base_link]": 0.297
+ }
+}

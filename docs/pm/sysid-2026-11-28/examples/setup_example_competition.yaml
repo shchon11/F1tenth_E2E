@@ -1,0 +1,15 @@
+# 예시 입력: 안내서 2.3 의 값(대회 차)을 그대로 옮긴 것이다. 실제 현장 setup.yaml 이 아니다.
+# 아래 hand_measured 는 일부러 비워 둠 (재지 않은 값을 지어내지 않음). 양식은 docs/bag_recording_guide.md 2.3.
+date: 2026-08-27
+place: 대회장 (map08x23)
+vesc:
+  speed_to_erpm_gain: 4204
+  servo_min: 0.235
+  servo_max: 0.655
+  steering_to_servo_gain: 0.630
+  steering_to_servo_offset: 0.395
+  current_motor_max_A: 60
+  current_regen_min_A: -30
+imu: {gyro_unit: rad/s, accel_unit: g}
+lidar: {tf_base_to_laser: [0.297, 0.0, 0.110], frame_name: laser}
+hand_measured: {}

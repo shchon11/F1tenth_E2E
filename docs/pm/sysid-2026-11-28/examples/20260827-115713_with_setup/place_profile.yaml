@@ -1,0 +1,97 @@
+# bag_profile 장소 프로필 (노면·벽·지도). 마찰은 레이스 bag 으로는 하한만 나옴.
+_meta:
+  kind: place_profile
+  bag: real_data/01_competition_0826-0827_map08x23/20260827-115713_map08x23_v9.2_161s_fastest-longest
+  made: '2026-11-28T23:50:19'
+  place:
+    code: map08x23
+    size_m:
+    - 8.35
+    - 22.55
+    res: 0.05000000074505806
+    grid_md5: 37668e1491
+    n_map_msgs: 1
+place:
+  ay_max_held:
+    value: 7.907901
+    unit: m/s^2
+    source: measured
+    status: lower_bound
+    source_label: 실측
+    how: max over the marked/auto stretches of |a_y| (IMU, 0.1 s mean) held >= 0.3 s with body-slip change < 5.0 deg
+    note: '실차가 이 횡가속을 잃지 않고 버팀: 그립의 하한'
+    at_t: 146.230786
+    at_v: 5.06107
+    top10:
+    - 7.907901
+    - 7.777655
+    - 7.445786
+    - 7.353312
+    - 7.193509
+    - 7.054727
+    - 6.984503
+    - 6.933149
+    - 6.852958
+    - 6.500077
+  mu_lower_from_ay:
+    value: 0.806381
+    unit: ''
+    source: measured
+    status: lower_bound
+    source_label: 실측
+    how: ay_max_held / g (no load transfer, no aero)
+  slides_seen:
+    value:
+    - 39.030786
+    unit: s
+    source: measured
+    status: measured
+    source_label: 실측
+    how: body-slip change > 30 deg within 1 s at v > 2 m/s (from a_y / v - r)
+    note: 미끄러진 사건이 있어야 그립의 상한이 생김
+  lidar_dropout_by_range:
+    value:
+    - r:
+      - 0
+      - 2
+      miss_frac: 0.00016341875456941512
+      n: 2337553
+    - r:
+      - 2
+      - 4
+      miss_frac: 0.00016403316881900056
+      n: 762041
+    - r:
+      - 4
+      - 6
+      miss_frac: 0.000516606395920476
+      n: 180021
+    - r:
+      - 6
+      - 8
+      miss_frac: 0.0025485604077696653
+      n: 58072
+    - r:
+      - 8
+      - 10
+      miss_frac: 0.00832247067081119
+      n: 19946
+    - r:
+      - 10
+      - 30
+      miss_frac: 0.0297235895494131
+      n: 5282
+    unit: ''
+    source: measured
+    status: measured
+    source_label: 실측
+    how: short gaps (<= 5 beams) between agreeing returns, binned by their range
+    note: 시뮬은 거리와 무관한 누락만 있음 (적용 안 함)
+    apply: false
+  lidar_valid_frac:
+    value: 0.970037
+    unit: ''
+    source: measured
+    status: measured
+    source_label: 실측
+    how: all beams, all scans read

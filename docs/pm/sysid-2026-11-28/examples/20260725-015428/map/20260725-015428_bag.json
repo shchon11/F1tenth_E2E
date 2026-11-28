@@ -1,0 +1,43 @@
+{
+ "bag": "/home/shchon11/F1tenth_E2E/real_data/02_pre-competition/20260725-015428_map12x16_v4.5_79s_GYRO-BAD_96pct-moving",
+ "bag_seconds": 79.352230797,
+ "bags_in_folder": 1,
+ "topics": {
+  "scan": "/scan",
+  "odom": "/odom",
+  "pose": "/pf/pose/odom"
+ },
+ "read_light_s": 0.6,
+ "window": {
+  "start_s": 1.55,
+  "end_s": 79.17
+ },
+ "read_scans_s": 0.1,
+ "scans": 3097,
+ "laser": "/tf_static base_link -> laser: (0.270, 0.000) m, 0.0 deg",
+ "bagmap": {
+  "size_m": [
+   12.250000182539225,
+   16.400000244379044
+  ],
+  "res": 0.05000000074505806,
+  "free_cells": 28681,
+  "unknown_cells": 0
+ },
+ "bagmap_scale": {
+  "scale": 0.9978128617041433,
+  "scale_iqr": 0.02270442506010828,
+  "scans_used": 150,
+  "inliers_median": 0.9750692520775623,
+  "seconds": 0.5
+ },
+ "source": "map",
+ "direction": "cw",
+ "seed_xy": [
+  26.36891505902159,
+  1.185563262976089
+ ],
+ "path_csv": "/home/shchon11/F1tenth_E2E/docs/pm/sysid-2026-11-28/examples/20260725-015428/map/20260725-015428_path.csv",
+ "yaml": "/home/shchon11/F1tenth_E2E/docs/pm/sysid-2026-11-28/examples/20260725-015428/map/20260725-015428.yaml",
+ "seconds": 1.2
+}

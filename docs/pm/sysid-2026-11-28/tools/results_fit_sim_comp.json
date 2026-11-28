@@ -1,0 +1,25 @@
+{
+ "over": {
+  "steer_gain": 0.9925,
+  "steer_bias": -0.022,
+  "servo_tau": 0.0278,
+  "B_f": 1.985,
+  "C_f": 2.1925,
+  "B_r": 38.3372,
+  "C_r": 1.981,
+  "mu": 2.4324,
+  "mu_f_scale": 0.7714,
+  "cmd_delay": 0.047,
+  "E_f": 0.0,
+  "E_r": 0.0,
+  "motor_tau": 0.0892,
+  "motor_delay": 0.0781,
+  "a_max": 5.0461,
+  "a_brake": 2.4242,
+  "c_roll": 0.1,
+  "mu_ref": 2.4324
+ },
+ "J": 0.04538,
+ "Jv": 0.06507,
+ "note": "stopped after the first cmd_delay point (degenerate: B_r -> 38, mu 2.4); values as logged"
+}

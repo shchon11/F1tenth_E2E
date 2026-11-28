@@ -1,0 +1,141 @@
+# bag_profile 장소 프로필 (노면·벽·지도). 마찰은 레이스 bag 으로는 하한만 나옴.
+_meta:
+  kind: place_profile
+  bag: real_data/02_pre-competition/20260725-015428_map12x16_v4.5_79s_GYRO-BAD_96pct-moving
+  made: '2026-11-28T23:50:14'
+  place:
+    code: map12x16
+    size_m:
+    - 12.25
+    - 16.4
+    res: 0.05000000074505806
+    grid_md5: 85f382d643
+    n_map_msgs: 405
+place:
+  ay_max_held:
+    value: 7.59161
+    unit: m/s^2
+    source: measured
+    status: lower_bound
+    source_label: 실측
+    how: max over the marked/auto stretches of |a_y| (IMU, 0.1 s mean) held >= 0.3 s with body-slip change < 5.0 deg
+    note: '실차가 이 횡가속을 잃지 않고 버팀: 그립의 하한'
+    at_t: 48.076191
+    at_v: 3.879569
+    top10:
+    - 7.59161
+    - 7.347722
+    - 7.273676
+    - 7.130776
+    - 6.689356
+    - 6.468838
+    - 5.238822
+    - 3.589003
+    - 3.453171
+    - 3.420623
+  mu_lower_from_ay:
+    value: 0.774129
+    unit: ''
+    source: measured
+    status: lower_bound
+    source_label: 실측
+    how: ay_max_held / g (no load transfer, no aero)
+  slides_seen:
+    value: []
+    unit: s
+    source: measured
+    status: measured
+    source_label: 실측
+    how: body-slip change > 30 deg within 1 s at v > 2 m/s (from a_y / v - r)
+    note: 미끄러진 사건이 있어야 그립의 상한이 생김
+  mu_tyre_fit:
+    value: 1.2
+    unit: ''
+    source: estimated
+    status: lower_bound
+    source_label: 추정
+    err:
+    - 1.2
+    - 2.2
+    how: profile of the shared peak friction of the (b) single-track model, block-paired test
+    verdict: lower_bound
+  stiffness_sf:
+    value: 1.543863
+    unit: 1/rad per unit load
+    source: estimated
+    status: not_identified
+    source_label: 추정
+    err:
+    - 1.5
+    - 1.5
+    how: (b) per-axle slope of F/Fz, profile with block-paired test
+    note: 타이어와 노면의 조합 + 조향 컴플라이언스(앞)
+    verdict: upper_bound
+  stiffness_sr:
+    value: 2.027639
+    unit: 1/rad per unit load
+    source: estimated
+    status: measured
+    source_label: 추정
+    err:
+    - 2.027639
+    - 2.027639
+    how: (b) per-axle slope of F/Fz, profile with block-paired test
+    note: 타이어와 노면의 조합 + 조향 컴플라이언스(앞)
+    verdict: measured
+  lidar_dropout_by_range:
+    value:
+    - r:
+      - 0
+      - 2
+      miss_frac: 0.0
+      n: 1122077
+    - r:
+      - 2
+      - 4
+      miss_frac: 0.0
+      n: 456804
+    - r:
+      - 4
+      - 6
+      miss_frac: 6.228201295465869e-05
+      n: 80280
+    - r:
+      - 6
+      - 8
+      miss_frac: 0.001534302622926865
+      n: 27374
+    - r:
+      - 8
+      - 10
+      miss_frac: 0.0031785272823591734
+      n: 5663
+    - r:
+      - 10
+      - 30
+      miss_frac: 0.025423728813559324
+      n: 236
+    unit: ''
+    source: measured
+    status: measured
+    source_label: 실측
+    how: short gaps (<= 5 beams) between agreeing returns, binned by their range
+    note: 시뮬은 거리와 무관한 누락만 있음 (적용 안 함)
+    apply: false
+  lidar_valid_frac:
+    value: 0.995899
+    unit: ''
+    source: measured
+    status: measured
+    source_label: 실측
+    how: all beams, all scans read
+  map:
+    value: /home/shchon11/F1tenth_E2E/docs/pm/sysid-2026-11-28/examples/20260725-015428/map/20260725-015428.yaml
+    unit: ''
+    source: measured
+    status: measured
+    source_label: 실측
+    how: bag_map source=map
+    note: '축척 검사: 1 에서 3 % 넘게 벗어나면 bag /map 대신 스캔 지도'
+    scale: 0.997813
+    scale_iqr: 0.022704

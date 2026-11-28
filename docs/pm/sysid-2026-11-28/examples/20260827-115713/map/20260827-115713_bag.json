@@ -1,0 +1,43 @@
+{
+ "bag": "/home/shchon11/F1tenth_E2E/real_data/01_competition_0826-0827_map08x23/20260827-115713_map08x23_v9.2_161s_fastest-longest",
+ "bag_seconds": 161.015685888,
+ "bags_in_folder": 1,
+ "topics": {
+  "scan": "/scan",
+  "odom": "/odom",
+  "pose": "/pf/pose/odom"
+ },
+ "read_light_s": 1.0,
+ "window": {
+  "start_s": 1.42,
+  "end_s": 151.42
+ },
+ "read_scans_s": 0.3,
+ "scans": 5989,
+ "laser": "/tf_static base_link -> laser: (0.297, 0.000) m, 0.0 deg",
+ "bagmap": {
+  "size_m": [
+   8.350000124424696,
+   22.550000336021185
+  ],
+  "res": 0.05000000074505806,
+  "free_cells": 39402,
+  "unknown_cells": 0
+ },
+ "bagmap_scale": {
+  "scale": 0.9960317908252988,
+  "scale_iqr": 0.017224288823114553,
+  "scans_used": 149,
+  "inliers_median": 0.9449275362318841,
+  "seconds": 0.5
+ },
+ "source": "map",
+ "direction": "ccw",
+ "seed_xy": [
+  0.16035262656663285,
+  18.183105980212137
+ ],
+ "path_csv": "/home/shchon11/F1tenth_E2E/docs/pm/sysid-2026-11-28/examples/20260827-115713/map/20260827-115713_path.csv",
+ "yaml": "/home/shchon11/F1tenth_E2E/docs/pm/sysid-2026-11-28/examples/20260827-115713/map/20260827-115713.yaml",
+ "seconds": 1.8
+}

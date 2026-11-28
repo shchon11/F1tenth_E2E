@@ -1,0 +1,404 @@
+# 대회 차 × 대회장 map08x23 (기본값 아님)
+# 만든 곳: docs/pm/sysid-2026-11-28 (REPORT.md). 기본값(params.py)은 바꾸지 않음; f1sim.profiles.loader 로 얹음.
+# source: measured=실측 estimated=추정 spec=규격 assumed=가정 | status: measured=측정됨 lower_bound=하한만 not_identified=식별 안 됨 not_applied=시뮬에 없음 | tier: car=차 설정 place=장소 structure=구조 geometry=제원
+# apply: false 인 값은 기록만 하고 Config 에 넣지 않음.
+_meta:
+  name: comp_car_map08x23
+  default_candidate: false
+  note: '대회장(다시 갈 일 없음): 구조 선택·검증용. 기본값으로 쓰지 말 것'
+  bags:
+  - 20260826-025918
+  - 20260826-173704
+  - 20260826-174255
+  - 20260826-192819
+  - 20260826-193250
+  - 20260826-193532
+  - 20260826-193737
+  - 20260826-194050
+  - 20260826-194519
+  - 20260826-194702
+  - 20260827-111616
+  - 20260827-115713
+  structure: (c2*)
+  final_check: 'REPORT.md section 2: 1 s yaw 0.136 vs (a) 0.147, 2 s position 0.45 vs 0.46 m, spin 0 % vs nominal 13 %'
+vehicle:
+  mu:
+    value: 1.35
+    unit: '-'
+    source: estimated
+    status: measured
+    err:
+    - 1.1
+    - 1.7
+    tier: place
+    how: peak friction of the rear axle (front = mu_f_scale x mu); see REPORT.md section 4 / 6
+    note: '뒤 최대 마찰: profile 1.1~1.7 (C 1.3 모양 가정 아래); 공통 μ 하한 1.15'
+  mu_ref:
+    value: 1.35
+    unit: '-'
+    source: estimated
+    status: measured
+    tier: place
+    how: = mu, so B is the raw stiffness factor and randomising mu moves only the peak (mu_stiffness_exp 0)
+  mu_f_scale:
+    value: 1.04
+    unit: '-'
+    source: estimated
+    status: lower_bound
+    tier: place
+    how: front peak 1.4 = lower bound of its profile (C 1.3), rear 1.35 inside 1.1-1.7
+    note: 앞 최대 마찰은 하한(1.4)만 나옴; 비율 1.04 = 앞이 아주 조금 늦게 포화
+  B_f:
+    value: 2.085833
+    unit: 1/rad
+    source: estimated
+    status: measured
+    err:
+    - 1.753568
+    - 2.454995
+    tier: place
+    how: 'front slope mu*scale*B*C = 3.81/rad from the competition (c2*) fit, kept; interval: (b'') sf profile ratio'
+    note: 앞 강성(조향 컴플라이언스 포함). 사전 장소 bag으로는 대회장 값과 구분 안 됨
+  B_r:
+    value: 4.039074
+    unit: 1/rad
+    source: estimated
+    status: measured
+    err:
+    - 3.287308
+    - 5.259693
+    tier: place
+    how: 'rear slope mu*B*C = 7.09/rad from the competition (c2*) fit, kept; interval: (b'') sr profile ratio'
+  h:
+    value: 0.0
+    unit: m
+    source: estimated
+    status: measured
+    tier: structure
+    how: (d) and (c1) (longitudinal load transfer with linear-in-load tyres) predicted WORSE than (b)/(c2) on val and final
+    note: 실제 무게중심 높이(0.074)가 아니라 '종방향 하중 이동을 끄는' 실효값. 시뮬에서 h는 하중 이동·IMU 레버암·접촉 모멘트에만 쓰임
+  contact_z_end:
+    value: -0.043
+    unit: m
+    source: assumed
+    status: measured
+    tier: structure
+    how: shifted with h so the contact pitch moment (h - contact_z_end) is unchanged
+    note: 접촉 모멘트 보존용 이동
+  contact_z_side:
+    value: -0.014
+    unit: m
+    source: assumed
+    status: measured
+    tier: structure
+    how: shifted with h so the contact roll moment (h - contact_z_side) is unchanged
+    note: 접촉 모멘트 보존용 이동
+  C_f:
+    value: 1.3
+    unit: '-'
+    source: assumed
+    status: not_identified
+    tier: structure
+    how: C 1.0 / 1.3 / free(1.0-2.2) fit equally on val and final
+    note: 교과서 횡방향 값. 모양은 레이스 bag으로 구분 안 됨
+  C_r:
+    value: 1.3
+    unit: '-'
+    source: assumed
+    status: not_identified
+    tier: structure
+    how: same
+  E_f:
+    value: 0.0
+    unit: '-'
+    source: assumed
+    status: not_identified
+    tier: structure
+  E_r:
+    value: 0.0
+    unit: '-'
+    source: assumed
+    status: not_identified
+    tier: structure
+  a_max:
+    value: 5.604184
+    unit: m/s^2
+    source: estimated
+    status: measured
+    tier: car
+    how: (c2) speed-replay fit with v_switch 7.0
+    note: 전류 한계 구간 직접 측정 중앙값 4.67 (bag 8개)
+  a_brake:
+    value: 5.0
+    unit: m/s^2
+    source: measured
+    status: measured
+    err:
+    - 4.59774
+    - 5.007417
+    tier: car
+    how: 'regen-limited braking (current <= 90 % of -30 A), bag_profile per bag: median 4.85 over 7 bags'
+    note: 시뮬 기본값 5.0 유지(11-09 최강 200 ms 측정); bag별 중앙값은 5.0보다 낮음 -> err 범위로 표시
+  m:
+    value: 3.74
+    unit: kg
+    source: spec
+    status: not_identified
+    tier: geometry
+    how: f1tenth_gym default; the bags see forces per unit mass only
+    note: 저울로 잴 것 (필요할 때 잴 목록)
+    apply: false
+  Iz:
+    value: 0.04712
+    unit: kg m^2
+    source: spec
+    status: not_identified
+    err:
+    - 0.028272
+    - 0.07068
+    tier: geometry
+    how: 'Iz/m x0.6: train error +8.7 %, x1.5: -6.0 % (servo_tau absorbs it)'
+    note: 데이터는 1.5배 쪽을 약간 선호하나 서보 지연과 맞바뀜
+    apply: false
+  lf:
+    value: 0.15875
+    unit: m
+    source: spec
+    status: not_identified
+    tier: geometry
+    how: lr +-0.02 m changes the train error by < 0.3 %
+    note: '무게중심 앞뒤 위치: 바퀴별 저울로 잴 것'
+    apply: false
+  lr:
+    value: 0.17145
+    unit: m
+    source: spec
+    status: not_identified
+    tier: geometry
+    how: same
+    apply: false
+  c_roll:
+    value: 0.1
+    unit: m/s^2
+    source: assumed
+    status: not_identified
+    tier: place
+    how: no coast-down in any bag
+    note: 코스트다운 T4로 잴 것
+    apply: false
+  c_drag:
+    value: 0.01
+    unit: 1/m
+    source: assumed
+    status: not_identified
+    tier: place
+    how: same
+    apply: false
+actuator:
+  steer_gain:
+    value: 1.035331
+    unit: '-'
+    source: estimated
+    status: measured
+    err:
+    - 1.013444
+    - 1.105575
+    tier: car
+    how: '(c2*) simulator refit, competition TRAIN bags, 1 s yaw-rate error; interval: (b'') profile ratio'
+    note: 명령 조향각 대비 바퀴 각 이득. 타이어 강성과 일부 맞바뀜(저속 원선회 T2로 확정)
+  steer_bias:
+    value: -0.022877
+    unit: rad
+    source: estimated
+    status: measured
+    err:
+    - -0.03
+    - -0.02
+    tier: car
+    how: '(c2*) refit; interval: (b'') profile'
+    note: '세션마다 바뀔 수 있음: 새 세션 직진 10 s로 다시 맞춤'
+  cmd_delay:
+    value: 0.043
+    unit: s
+    source: estimated
+    status: measured
+    err:
+    - 0.04
+    - 0.05
+    tier: car
+    how: (b') profile picked 0.043 (0.04-0.05); the simulator rounds it to 1 ms
+    note: 순수 지연. 차 설정(스택·VESC)에 붙음
+  servo_tau:
+    value: 0.029818
+    unit: s
+    source: estimated
+    status: measured
+    err:
+    - 0.025
+    - 0.035
+    tier: car
+    how: '(c2*) refit; interval: (b'') profile'
+    note: 요 관성 Iz와 맞바뀜 (Iz/m ×1.5 이면 0.020)
+  motor_tau:
+    value: 0.052656
+    unit: s
+    source: estimated
+    status: measured
+    tier: car
+    how: (c2) longitudinal refit on the speed error (sim P loop)
+    note: 시뮬 속도 루프 구조(P만)에 맞춘 실효값; 1차+지연 모델보다 속도 오차 1.2배
+  motor_delay:
+    value: 0.143776
+    unit: s
+    source: estimated
+    status: measured
+    tier: car
+    how: same fit
+    note: 속도 채널 추가 지연 (cmd_delay 위에)
+lidar:
+  mount_x:
+    value: 0.12555
+    unit: m (ahead of CoG)
+    source: measured
+    status: measured
+    tier: car
+    how: /tf_static base_link->laser x 0.297 minus lr 0.17145
+  mount_z:
+    value: 0.11
+    unit: m
+    source: measured
+    status: measured
+    tier: car
+    how: /tf_static z
+  noise_std:
+    value: 0.004448
+    unit: m
+    source: measured
+    status: measured
+    err:
+    - 0.004077
+    - 0.004818
+    tier: car
+    how: 1.4826 MAD per beam over genuinely still 1 s blocks, 0-4 m, bag_profile per bag
+car:
+  servo_map_gain:
+    value: 0.63
+    unit: servo/rad
+    source: measured
+    status: measured
+    err:
+    - 0.63
+    - 0.630019
+    tier: car
+    how: /ackermann_cmd vs /commands/servo/position
+  servo_map_offset:
+    value: 0.3953
+    unit: servo
+    source: measured
+    status: measured
+    err:
+    - 0.395298
+    - 0.3953
+    tier: car
+    how: same
+  steer_window:
+    value:
+    - -0.2544
+    - 0.4122
+    unit: rad (command)
+    source: measured
+    status: not_applied
+    tier: car
+    how: 'VESC clamp: /sensors/servo_position_command range, both edges hit in every race bag'
+    note: 시뮬 s_max는 좌우 대칭(±0.4189)이라 넣을 수 없음. 오른쪽 −0.254에서 잘림
+  erpm_gain:
+    value: 4204.0
+    unit: ERPM/(m/s)
+    source: measured
+    status: measured
+    tier: car
+    how: /commands/motor/speed / speed
+  gyro_unit:
+    value: rad/s
+    unit: ''
+    source: measured
+    status: measured
+    tier: car
+    how: slope vs localisation heading rate 0.9-1.0
+  regen_current_min:
+    value: -29.986765
+    unit: A
+    source: measured
+    status: measured
+    err:
+    - -30.094941
+    - -21.323928
+    tier: car
+    how: p0.1 of current_motor
+  drive_current_max:
+    value: 60.899385
+    unit: A
+    source: measured
+    status: measured
+    err:
+    - 56.17401
+    - 62.307119
+    tier: car
+    how: p99.9 of current_motor
+model_b:
+  k:
+    value: 1.123757
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  b:
+    value: -0.024428
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  tau_d:
+    value: 0.043037
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  tau_s:
+    value: 0.037125
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  sf:
+    value: 2.973699
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  sr:
+    value: 6.143436
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  mr:
+    value: 1.351004
+    unit: ''
+    source: estimated
+    status: measured
+    how: (b') competition TRAIN fit
+  mf:
+    value: 1.4
+    unit: ''
+    source: estimated
+    status: lower_bound
+    how: '(b'') front peak: lower bound of the profile (best 2.25)'
+fingerprint:
+  servo map gain: 0.63
+  servo map offset: 0.3953
+  ERPM gain: 4204.0
+  gyro unit: rad/s
+  regen current min [A]: -30.0
+  total delay (a) [s]: 0.1
+  LiDAR mount x [m, base_link]: 0.297
