@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>훈련소 — 피트 월 목업</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="base.css">
+<style>
+  #head { position: absolute; left: 0; top: 56px; width: 1920px; height: 64px; display: flex; align-items: center; padding: 0 32px; gap: 28px; border-bottom: 1px solid var(--c-line); }
+  #head h1 { font: var(--t-title-l); }
+  #head .sub { display: flex; height: 100%; }
+  #head .sub a { display: flex; align-items: center; padding: 0 18px; font: 500 14px/1 var(--font-ui); color: var(--c-text-3); position: relative; gap: 8px; }
+  #head .sub a.on { color: var(--c-text); font-weight: 700; }
+  #head .sub a.on::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 3px; background: var(--c-accent); transform: skewX(-28deg); }
+  #head .sub a .num { font-size: 12px; color: var(--c-text-4); }
+  #head .sum { margin-left: auto; display: flex; gap: 24px; font: var(--t-body-s); color: var(--c-text-3); align-items: center; }
+  #head .sum b { font: 600 20px/1 var(--font-display); color: var(--c-text); margin-right: 5px; }
+
+  /* ---------- 레시피 ---------- */
+  #recipes { left: 32px; top: 136px; width: 388px; height: 1012px; }
+  .rc { display: grid; grid-template-columns: 46px 1fr auto; align-items: center; padding: 10px 16px 10px 0; border-bottom: 1px solid var(--c-line); }
+  .rc .no { font: 600 22px/1 var(--font-display); color: var(--c-text-4); text-align: center; }
+  .rc b { font: 600 15px/22px var(--font-ui); display: block; }
+  .rc span { font: var(--t-body-s); color: var(--c-text-3); }
+  .rc .t { font: var(--t-data-s); color: var(--c-text-3); text-align: right; white-space: nowrap; }
+  .rc.on { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); border-bottom-color: transparent; }
+  .rc.on .no { color: var(--c-accent); }
+  #setup { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); padding: 2px 16px 16px 16px; border-bottom: 1px solid var(--c-accent-line); }
+  #setup .teach { font: var(--t-body-s); color: var(--c-text-2); padding: 0 0 10px 30px; }
+  .f { display: grid; grid-template-columns: 84px 1fr; align-items: center; min-height: 40px; border-top: 1px solid var(--c-line); column-gap: 8px; }
+  .f > span { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  .f .val { font: 500 13px/18px var(--font-ui); color: var(--c-text); padding: 6px 0; }
+  .f .val small { display: block; font: 400 12px/16px var(--font-ui); color: var(--c-text-3); }
+  .seg2 { display: inline-flex; border: 1px solid var(--c-line-strong); border-radius: 2px; }
+  .seg2 i { font: 600 12px/26px var(--font-ui); font-style: normal; padding: 0 11px; color: var(--c-text-3); white-space: nowrap; }
+  .seg2 i.on { background: var(--c-text); color: var(--c-bg-void); }
+  .steps { display: flex; gap: 3px; align-items: center; }
+  .steps i { width: 26px; height: 8px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); }
+  .steps i.on { background: var(--c-text-2); border-color: var(--c-text-2); }
+  .steps span { font: 500 12px/1 var(--font-ui); color: var(--c-text-2); margin-left: 8px; white-space: nowrap; }
+  #setup .go-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  #setup .go-row .btn.go { flex: 1; }
+  #setup .est { font: var(--t-body-s); color: var(--c-text-3); margin-top: 10px; }
+  #setup .est b { color: var(--c-text); font-weight: 600; }
+
+  /* ---------- 대기열 ---------- */
+  #queue { left: 436px; top: 136px; width: 1012px; height: 232px; }
+  #queue svg { position: absolute; left: 0; top: 45px; }
+  .lane-l { position: absolute; left: 16px; font: 600 13px/18px var(--font-ui); white-space: nowrap; }
+  .lane-l small { display: block; font: 400 12px/16px var(--font-ui); color: var(--c-text-3); }
+
+  /* ---------- 곡선 ---------- */
+  #curves { left: 436px; top: 384px; width: 1012px; height: 500px; }
+  #legend { display: flex; align-items: center; gap: 8px; height: 46px; padding: 0 16px; border-bottom: 1px solid var(--c-line); }
+  .lg { display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px; border: 1px solid var(--c-line-strong); border-radius: 2px; font: 600 12px/1 var(--font-ui); white-space: nowrap; }
+  .lg i { width: 18px; height: 0; border-top: 3px solid var(--sw); }
+  .lg.dash i { border-top: 2px dashed var(--sw); }
+  .lg.off { color: var(--c-text-4); border-style: dashed; }
+  #legend .r { margin-left: auto; display: flex; gap: 10px; align-items: center; font: var(--t-body-s); color: var(--c-text-3); }
+  .ch { position: absolute; top: 91px; height: 409px; }
+  .ch + .ch { border-left: 1px solid var(--c-line); }
+  .ch .hd { padding: 12px 16px 0; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+  .ch .hd b { font: 600 14px/20px var(--font-ui); }
+  .ch .hd span { font: 500 12px/1 var(--font-ui); color: var(--c-text-4); }
+  .ch .now { padding: 4px 16px 0; display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+  .ch .now .v { font: var(--t-readout-l); }
+  .ch .now .d { font: 500 13px/1 var(--font-data); }
+  .ch .now .u { font: var(--t-body-s); color: var(--c-text-3); }
+
+  /* ---------- 저장 지점 ---------- */
+  #ckpt { left: 436px; top: 900px; width: 1012px; height: 248px; }
+  #ckpt td.n b { font: 600 18px/1 var(--font-display); }
+  #ckpt td { height: 32px; }
+  #ckpt .pill { display: inline-block; width: 9px; height: 9px; transform: rotate(45deg); margin-right: 8px; }
+  #ckpt .pill.up { background: var(--c-time-own); } #ckpt .pill.eq { border: 1.5px solid var(--c-text-3); } #ckpt .pill.dn { background: var(--c-warn); }
+
+  /* ---------- 성적표 ---------- */
+  #card { left: 1464px; top: 136px; width: 424px; height: 1012px; }
+  #card .hd { padding: 12px 16px 12px; border-bottom: 2px solid var(--c-line-ink); }
+  #card .hd small { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); display: block; }
+  #card .hd h2 { font: var(--t-title-m); display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  #card .hd p { font: var(--t-body-s); color: var(--c-text-3); margin-top: 2px; }
+  #card .tally { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--c-line-strong); }
+  #card .tally div { padding: 10px 16px 11px; font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #card .tally div + div { border-left: 1px solid var(--c-line); }
+  #card .tally b { display: block; font: var(--t-readout-m); margin-top: 6px; color: var(--c-text); }
+  .ex { display: grid; grid-template-columns: 26px 1fr 96px; padding: 10px 16px 9px 12px; border-bottom: 1px solid var(--c-line); align-items: start; }
+  .ex .mk { width: 11px; height: 11px; transform: rotate(45deg); margin: 6px 0 0 4px; }
+  .ex .mk.up { background: var(--c-time-own); } .ex .mk.eq { border: 1.5px solid var(--c-text-3); } .ex .mk.dn { background: var(--c-warn); }
+  .ex b { font: 600 14px/20px var(--font-ui); display: block; white-space: nowrap; }
+  .ex small { font: 400 12px/16px var(--font-ui); color: var(--c-text-3); display: block; white-space: nowrap; }
+  .ex .v { text-align: right; font: 600 22px/22px var(--font-display); white-space: nowrap; }
+  .ex .v small { font: 500 11px/16px var(--font-data); color: var(--c-text-3); }
+  .dl { grid-column: 2 / 4; position: relative; height: 18px; margin-top: 6px; }
+  .dl .ax { position: absolute; left: 0; right: 0; top: 8px; height: 1px; background: var(--c-line-strong); }
+  .dl .z { position: absolute; left: 50%; top: 1px; bottom: 1px; width: 1px; background: var(--c-text-3); }
+  .dl .w { position: absolute; top: 8px; height: 1px; background: var(--col); }
+  .dl .w::before, .dl .w::after { content: ""; position: absolute; top: -4px; width: 1px; height: 9px; background: var(--col); }
+  .dl .w::before { left: 0; } .dl .w::after { right: 0; }
+  .dl .p { position: absolute; top: 4px; width: 9px; height: 9px; background: var(--col); transform: translateX(-50%) rotate(45deg); }
+  .dl .t { position: absolute; right: 0; top: -1px; font: 500 11px/1 var(--font-ui); color: var(--c-text-4); background: var(--c-bg-panel); padding-left: 6px; }
+  .dl .tl { position: absolute; left: 0; top: -1px; font: 500 11px/1 var(--font-ui); color: var(--c-text-4); background: var(--c-bg-panel); padding-right: 6px; }
+  #promote { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 16px 16px; border-top: 1px solid var(--c-line-strong); background: var(--c-bg-void); }
+  #promote .nm { display: grid; grid-template-columns: 84px 1fr; align-items: center; margin-bottom: 12px; }
+  #promote .nm span { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #promote .nm div { height: 36px; border: 1px solid var(--c-line-strong); background: var(--c-bg-well); display: flex; align-items: center; padding: 0 12px; font: 600 15px/1 var(--font-ui); border-radius: 2px; }
+  #promote .nm div i { width: 1px; height: 18px; background: var(--c-accent); margin-left: 2px; }
+  #promote p { font: var(--t-body-s); color: var(--c-text-3); margin-top: 10px; }
+  #promote .btn.go { width: 100%; }
+</style>
+</head>
+<body>
+  <div id="head">
+    <h1>훈련소</h1>
+    <nav class="sub"><a class="on">훈련 <span class="num">2 진행 · 1 대기</span></a><a>드라이버 명단 <span class="num">4</span></a><a>시험 세트 <span class="num">3</span></a><a>지난 훈련 <span class="num">46</span></a></nav>
+    <div class="sum"><span><b>미르 43</b>지금 기준 드라이버</span><span><b>2 / 3</b>그래픽카드 훈련 중</span><span><b>21:54</b>가장 빨리 끝나는 훈련</span></div>
+  </div>
+
+  <!-- 레시피로 시작 -->
+  <aside class="panel" id="recipes">
+    <div class="sec-h"><span class="idx">01</span><h2>새 훈련</h2><span class="en">레시피를 고르면 바로 시작할 수 있습니다</span></div>
+    <div class="rc on"><span class="no">A</span><div><b>예선 기본기</b></div><span class="t">약 9시간</span></div>
+    <div id="setup">
+      <p class="teach">빈 코스를 빠르게 달린 다음, 놓였다가 치워지는 상자를 닿지 않고 지나가는 법을 익힙니다.</p>
+      <div class="f"><span>어디서부터</span><div class="val"><span class="seg2"><i class="on">미르 43에서 이어서</i><i>처음부터</i></span></div></div>
+      <div class="f"><span>차</span><div class="val">실차 2호 · AGX Orin<small>추정·가정 값 13개는 오차 범위 안에서 매번 다르게</small></div></div>
+      <div class="f"><span>장소</span><div class="val">2026 한국 대회장 + 닮은 코스 16개<small>폭 1.7–2.4 m · 헤어핀 2–4개로 자동 생성</small></div></div>
+      <div class="f"><span>상자</span><div class="val"><div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><span>0–3개 · 절반은 도중에 치움</span></div></div></div>
+      <div class="f"><span>상대 차</span><div class="val"><div class="steps"><i></i><i></i><i></i><i></i><span>없음</span></div></div></div>
+      <div class="f"><span>길이</span><div class="val"><div class="steps"><i class="on"></i><i class="on"></i><i></i><i></i><span>보통 · 9시간쯤</span></div></div></div>
+      <div class="f"><span>장비</span><div class="val"><span class="seg2"><i>연구실 PC</i><i class="on">먼저 비는 곳</i><i>학습 서버</i></span></div></div>
+      <div class="f" style="border-bottom:1px solid var(--c-line)"><span>이름</span><div class="val">누리 47 <small>번호는 자동 · 이름은 바꿀 수 있음</small></div></div>
+      <div class="go-row"><button class="btn go">훈련 시작 <span class="k">Enter</span></button><button class="btn">세부 설정 24개</button></div>
+      <p class="est">지금 시작하면 <b>연구실 PC 카드 1</b>에서 <b>23:54</b>에 시작해 <b>내일 08:50</b>쯤 끝납니다.</p>
+    </div>
+    <div class="rc"><span class="no">B</span><div><b>1대1 본선</b><span>상대 차 1–2대 사이에서 안전하게 앞지르기</span></div><span class="t">약 14시간</span></div>
+    <div class="rc"><span class="no">C</span><div><b>새 장소 적응</b><span>고른 드라이버를 새 지도와 노면에 맞춤</span></div><span class="t">약 2시간</span></div>
+    <div class="rc"><span class="no">D</span><div><b>실차로 옮기기 전 다지기</b><span>지연·그립을 넓게 흔들어 버티는 힘 기르기</span></div><span class="t">약 4시간</span></div>
+    <div class="rc" style="border-bottom:0"><span class="no dim2">+</span><div><b class="dim">내 레시피 만들기</b><span>지금 설정을 이름 붙여 저장</span></div><span class="t"></span></div>
+  </aside>
+
+  <!-- 장비별 대기열 -->
+  <section class="panel" id="queue">
+    <div class="sec-h"><span class="idx">02</span><h2>장비별 일정</h2><span class="en">지금 20:14</span><span class="more">막대를 끌어 순서를 바꿉니다 · <span class="key" style="margin:0 2px 0 6px">Del</span> 멈추기</span></div>
+    <svg id="lanes" width="1010" height="186"></svg>
+    <div class="lane-l" style="top:76px">연구실 PC · 카드 1</div>
+    <div class="lane-l" style="top:122px">연구실 PC · 카드 2<small></small></div>
+    <div class="lane-l" style="top:168px">학습 서버 · 카드 3</div>
+  </section>
+
+  <!-- 실시간 곡선 -->
+  <section class="panel" id="curves">
+    <div class="sec-h"><span class="idx">03</span><h2>훈련 곡선</h2><span class="en">시험 세트로 5%마다 잼 · 띠는 시험 오차</span><span class="more">가로축 <span class="seg2" style="margin-left:8px;vertical-align:middle"><i class="on">진행률</i><i>걸린 시간</i></span></span></div>
+    <div id="legend">
+      <span class="lg" style="--sw:var(--c-series-1)"><i></i>가람 45 · 진행 82%</span>
+      <span class="lg dash" style="--sw:var(--c-series-2)"><i></i>미르 43 · 기준 드라이버</span>
+      <span class="lg" style="--sw:var(--c-series-3)"><i></i>한울 46 · 진행 31%</span>
+      <span class="lg off"><i style="border-color:var(--c-text-4)"></i>+ 지난 훈련 겹쳐 보기</span>
+      <div class="r">세로 점선 = 지금 · 마름모 = 고른 저장 지점</div>
+    </div>
+    <div class="ch" style="left:0;width:337px"><div class="hd"><b>시험 랩</b><span>초 · 낮을수록 좋음</span></div><div class="now"><span class="v disp">9.16</span><span class="d own">−0.05</span><span class="u">미르 43 대비</span></div><svg id="c1" width="337" height="310"></svg></div>
+    <div class="ch" style="left:337px;width:337px"><div class="hd"><b>접촉</b><span>바퀴당 횟수 · 낮을수록 좋음</span></div><div class="now"><span class="v disp">0.07</span><span class="d dim">같음</span><span class="u">오차 안</span></div><svg id="c2" width="337" height="310"></svg></div>
+    <div class="ch" style="left:674px;width:336px"><div class="hd"><b>무충돌 연속</b><span>바퀴 · 높을수록 좋음</span></div><div class="now"><span class="v disp">7.8</span><span class="d own">+0.4</span><span class="u">미르 43 대비</span></div><svg id="c3" width="336" height="310"></svg></div>
+  </section>
+
+  <!-- 저장 지점 -->
+  <section class="panel" id="ckpt">
+    <div class="sec-h"><span class="idx">04</span><h2>저장 지점</h2><span class="en">가람 45 · 17개 중 최근 5개</span><span class="more">고른 지점의 성적표가 오른쪽에 나옵니다</span></div>
+    <table class="tbl">
+      <tr><th style="width:110px">진행</th><th>기준과 비교</th><th class="n">시험 랩</th><th class="n">접촉 / 바퀴</th><th class="n">무충돌 연속</th><th class="n">1대1 승률</th><th style="width:230px"></th></tr>
+      <tr class="sel"><td class="num">80% <span class="dim2">· 19:52</span></td><td><i class="pill up"></i>좋아짐 3 · 같음 4</td><td class="n"><b class="own">9.16</b></td><td class="n"><b>0.07</b></td><td class="n"><b class="own">7.8</b></td><td class="n"><b>58%</b></td><td style="text-align:right"><button class="btn" style="height:24px">이 지점으로 달려 보기</button></td></tr>
+      <tr><td class="num">75% <span class="dim2">· 19:18</span></td><td><i class="pill up"></i>좋아짐 2 · 같음 5</td><td class="n"><b class="own">9.17</b></td><td class="n"><b>0.08</b></td><td class="n"><b>7.5</b></td><td class="n"><b>57%</b></td><td></td></tr>
+      <tr><td class="num">70% <span class="dim2">· 18:44</span></td><td><i class="pill eq"></i>같음 6 · 나빠짐 1</td><td class="n"><b>9.20</b></td><td class="n"><b class="slower">0.12</b></td><td class="n"><b>7.1</b></td><td class="n"><b>55%</b></td><td></td></tr>
+      <tr><td class="num">65% <span class="dim2">· 18:10</span></td><td><i class="pill up"></i>좋아짐 1 · 같음 6</td><td class="n"><b class="own">9.18</b></td><td class="n"><b>0.08</b></td><td class="n"><b>7.3</b></td><td class="n"><b>56%</b></td><td></td></tr>
+      <tr><td class="num">60% <span class="dim2">· 17:36</span></td><td><i class="pill eq"></i>같음 7</td><td class="n"><b>9.22</b></td><td class="n"><b>0.09</b></td><td class="n"><b>7.0</b></td><td class="n"><b>54%</b></td><td></td></tr>
+    </table>
+  </section>
+
+  <!-- 성적표 -->
+  <section class="panel ticks" id="card">
+    <div class="hd"><small>성적표 · 고정 시험 세트 「2026 예선 + 본선」 7종목</small><h2>가람 45 <span class="tag">80% 지점</span></h2><p>같은 코스·같은 상자 배치·같은 출발 조건으로 미르 43과 나란히 잰 결과</p></div>
+    <div class="tally">
+      <div>좋아짐<b class="own">3</b></div><div>차이 없음<b>4</b></div><div>나빠짐<b>0</b></div>
+    </div>
+    <div class="ex"><i class="mk up"></i><div><b>빈 코스 최고 랩</b><small>2026 한국 대회장 · 20바퀴</small></div><div class="v own">9.12<small> 초 · 기준 9.19</small></div>
+      <div class="dl" style="--col:var(--c-time-own)"><div class="ax"></div><div class="z"></div><div class="w" style="left:64%;width:22%"></div><div class="p" style="left:75%"></div><span class="tl">느림</span><span class="t">빠름</span></div></div>
+    <div class="ex"><i class="mk up"></i><div><b>예선 · 무충돌 연속</b><small>상자 3개, 50초에 치움 · 12판</small></div><div class="v own">7.8<small> 바퀴 · 기준 7.4</small></div>
+      <div class="dl" style="--col:var(--c-time-own)"><div class="ax"></div><div class="z"></div><div class="w" style="left:53%;width:27%"></div><div class="p" style="left:66%"></div><span class="tl">적음</span><span class="t">많음</span></div></div>
+    <div class="ex"><i class="mk up"></i><div><b>예선 · 최고 랩</b><small>상자 3개, 50초에 치움 · 12판</small></div><div class="v own">9.16<small> 초 · 기준 9.21</small></div>
+      <div class="dl" style="--col:var(--c-time-own)"><div class="ax"></div><div class="z"></div><div class="w" style="left:55%;width:22%"></div><div class="p" style="left:66%"></div><span class="tl">느림</span><span class="t">빠름</span></div></div>
+    <div class="ex"><i class="mk eq"></i><div><b>예선 · 접촉</b><small>바퀴당 · 약한 접촉 포함</small></div><div class="v">0.07<small> 회 · 기준 0.07</small></div>
+      <div class="dl" style="--col:var(--c-text-3)"><div class="ax"></div><div class="z"></div><div class="w" style="left:36%;width:28%"></div><div class="p" style="left:50%"></div><span class="tl">많음</span><span class="t">적음</span></div></div>
+    <div class="ex"><i class="mk eq"></i><div><b>처음 보는 코스 4곳</b><small>훈련에 없던 지도 · 완주와 랩 차이</small></div><div class="v">4 / 4<small> 완주 · 기준 4 / 4</small></div>
+      <div class="dl" style="--col:var(--c-text-3)"><div class="ax"></div><div class="z"></div><div class="w" style="left:38%;width:21%"></div><div class="p" style="left:48%"></div><span class="tl">느림</span><span class="t">빠름</span></div></div>
+    <div class="ex"><i class="mk eq"></i><div><b>1대1 · 5바퀴 먼저</b><small>상대: 지도 기반 추종 · 40판</small></div><div class="v">58%<small> 승 · 기준 61%</small></div>
+      <div class="dl" style="--col:var(--c-text-3)"><div class="ax"></div><div class="z"></div><div class="w" style="left:27%;width:36%"></div><div class="p" style="left:44%"></div><span class="tl">짐</span><span class="t">이김</span></div></div>
+    <div class="ex"><i class="mk eq"></i><div><b>판단 시간</b><small>AGX Orin 기준 · 예산 25 ms</small></div><div class="v">6.4<small> ms · 기준 6.2</small></div>
+      <div class="dl" style="--col:var(--c-text-3)"><div class="ax"></div><div class="z"></div><div class="w" style="left:42%;width:12%"></div><div class="p" style="left:48%"></div><span class="tl">느림</span><span class="t">빠름</span></div></div>
+    <p class="dim" style="font:var(--t-body-s);padding:10px 16px 0">막대 = 기준과의 차이와 그 오차 범위. 가운데 선(차이 0)에 걸치면 <b style="color:var(--c-text-2);font-weight:500">차이 없음</b>으로 셉니다.</p>
+    <div id="promote">
+      <div class="nm"><span>드라이버 이름</span><div>가람 45<i></i></div></div>
+      <button class="btn go">이 지점을 드라이버로 올리기 <span class="k">P</span></button>
+      <p>올리면 차고와 레이스에서 고를 수 있습니다. 훈련은 계속 이어집니다.</p>
+    </div>
+  </section>
+
+<script src="scene.js"></script>
+<script src="chrome.js"></script>
+<script>
+pwChrome('camp', [['↑ ↓', '저장 지점 고르기'], ['Enter', '고른 지점으로 달려 보기'], ['C', '훈련 겹쳐 보기'], ['P', '드라이버로 올리기'], ['N', '새 훈련'], ['Del', '훈련 멈추기'], ['?', '모든 단축키']], '훈련 소식 4초 전 · 학습 서버 42초 전');
+(function () {
+  const P = PW;
+  // ---------- 장비별 일정 ----------
+  const X0 = 196, X1 = 990, t0 = 16, t1 = 34, X = (h) => X0 + (X1 - X0) * (h - t0) / (t1 - t0), now = 20 + 14 / 60;
+  let s = `<defs><pattern id="busy" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="rgba(242,244,241,.12)" stroke-width="1.5"/></pattern></defs>`;
+  for (let h = 16; h <= 34; h += 2) { s += `<line x1="${X(h)}" y1="22" x2="${X(h)}" y2="170" stroke="var(--c-chart-grid)"/><text x="${X(h)}" y="14" text-anchor="middle" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="11">${String(h % 24).padStart(2, '0')}:00</text>`; }
+  s += `<text x="${X(24) + 6}" y="182" fill="var(--c-text-4)" font-family="IBM Plex Sans KR" font-size="11">내일</text><line x1="${X(24)}" y1="22" x2="${X(24)}" y2="186" stroke="var(--c-line-strong)"/>`;
+  const lane = (k) => 28 + k * 46;
+  for (let k = 0; k < 3; k++) s += `<rect x="${X0}" y="${lane(k)}" width="${X1 - X0}" height="34" fill="var(--c-bg-well)" stroke="var(--c-line)"/>`;
+  // 카드 1: 가람 45 (11:50 시작 → 21:54 끝, 82%), 그 뒤 대기 2건
+  const blk = (k, a, b, fill, stroke, label, sub, opts) => { opts = opts || {}; const x = Math.max(X(a), X0), w = X(b) - x; let r = `<rect x="${x}" y="${lane(k)}" width="${w}" height="34" fill="${fill}" stroke="${stroke}" ${opts.dash ? 'stroke-dasharray="4 3"' : ''}/>`; if (opts.done !== undefined) r += `<rect x="${x}" y="${lane(k)}" width="${Math.max(0, X(opts.done) - x)}" height="34" fill="${opts.doneFill}"/>`; r += `<text x="${x + 10}" y="${lane(k) + 15}" fill="${opts.tc || 'var(--c-text)'}" font-family="IBM Plex Sans KR" font-weight="600" font-size="12">${label}</text><text x="${x + 10}" y="${lane(k) + 28}" fill="${opts.sc || 'var(--c-text-3)'}" font-family="IBM Plex Sans KR" font-size="11">${sub}</text>`; return r; };
+  s += blk(0, 11.83, 21.9, 'rgba(198,241,53,.10)', 'var(--c-accent)', '가람 45 · 예선 기본기', '82% · 21:54 끝', { done: now, doneFill: 'rgba(198,241,53,.22)' });
+  s += blk(0, 21.9, 23.9, 'transparent', 'var(--c-text-3)', '새 장소 적응', '대기 · 2시간', { dash: true });
+  s += blk(0, 23.9, 32.83, 'transparent', 'var(--c-accent)', '누리 47 · 예선 기본기', '지금 시작하면 여기 · 내일 08:50 끝', { dash: true, tc: 'var(--c-accent)' });
+  s += `<rect x="${X0}" y="${lane(1)}" width="${X1 - X0}" height="34" fill="url(#busy)"/><text x="${X0 + 10}" y="${lane(1) + 21}" fill="var(--c-text-3)" font-family="IBM Plex Sans KR" font-size="12">화면과 시뮬이 쓰는 중 — 훈련을 받지 않음</text>`;
+  s += blk(2, 17.4, 26.43, 'rgba(180,108,255,.10)', 'var(--c-series-3)', '한울 46 · 1대1 본선', '31% · 내일 02:26 끝', { done: now, doneFill: 'rgba(180,108,255,.22)' });
+  s += `<line x1="${X(now)}" y1="18" x2="${X(now)}" y2="172" stroke="var(--c-text)" stroke-width="1.5"/><path d="M${X(now) - 5} 18 h10 l-5 7Z" fill="var(--c-text)"/>`;
+  document.getElementById('lanes').innerHTML = s;
+
+  // ---------- 곡선 ----------
+  function chart(id, W, o) {
+    const H = 310, L = 46, R = 16, T = 14, B = 34, pw = W - L - R, ph = H - T - B, Xp = (p) => L + pw * p, Y = (v) => T + ph * (o.hi - v) / (o.hi - o.lo);
+    let g = '';
+    for (const v of o.ticks) g += `<line x1="${L}" y1="${Y(v)}" x2="${W - R}" y2="${Y(v)}" stroke="var(--c-chart-grid)"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="11">${v.toFixed(o.dp)}</text>`;
+    for (const p of [0, 0.25, 0.5, 0.75, 1]) g += `<line x1="${Xp(p)}" y1="${T + ph}" x2="${Xp(p)}" y2="${T + ph + 5}" stroke="var(--c-text-4)"/><text x="${Xp(p)}" y="${T + ph + 20}" text-anchor="middle" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="11">${p * 100}%</text>`;
+    g += `<line x1="${L}" y1="${T + ph}" x2="${W - R}" y2="${T + ph}" stroke="var(--c-line-strong)"/>`;
+    // 기준(미르 43의 최종 값): 가로 점선
+    g += `<line x1="${L}" y1="${Y(o.base)}" x2="${W - R}" y2="${Y(o.base)}" stroke="var(--c-series-2)" stroke-dasharray="5 4" stroke-width="1.2"/><text x="${L + 6}" y="${Y(o.base) + (o.baseBelow ? 14 : -6)}" fill="var(--c-text-3)" font-family="IBM Plex Mono" font-size="10">기준 ${o.base.toFixed(o.bdp)}</text>`;
+    const draw = (f, done, seed, col, wd, band) => {
+      const n = Math.round(20 * done) + 1, v = P.series(n, (t) => f(t * done), seed, o.noise);
+      const pts = v.map((y, i) => [Xp(done * i / (n - 1)), Y(P.clamp(y, o.lo, o.hi))]);
+      if (band) { const up = v.map((y, i) => `${i ? 'L' : 'M'}${pts[i][0].toFixed(1)} ${Y(P.clamp(y + band, o.lo, o.hi)).toFixed(1)}`).join(''), dn = v.map((y, i) => `L${pts[n - 1 - i][0].toFixed(1)} ${Y(P.clamp(v[n - 1 - i] - band, o.lo, o.hi)).toFixed(1)}`).join(''); g += `<path d="${up}${dn}Z" fill="var(--c-chart-band)"/>`; }
+      g += `<path d="${pts.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1)).join('')}" fill="none" stroke="${col}" stroke-width="${wd}" stroke-linejoin="round"/>`;
+      pts.forEach((q, i) => { if (i % 2 === 0) g += `<circle cx="${q[0]}" cy="${q[1]}" r="${wd > 1.6 ? 2.2 : 1.6}" fill="${col}"/>`; });
+      return pts;
+    };
+    draw(o.f3, 0.31, o.seed + 20, 'var(--c-series-3)', 1.4);
+    const pts = draw(o.f1, 0.82, o.seed, 'var(--c-series-1)', 2.2, o.band);
+    g += `<line x1="${Xp(0.82)}" y1="${T}" x2="${Xp(0.82)}" y2="${T + ph}" stroke="var(--c-text-2)" stroke-dasharray="2 3"/>`;
+    const sel = pts[pts.length - 2 < 0 ? 0 : 16]; if (sel) g += `<rect x="${sel[0] - 5.5}" y="${sel[1] - 5.5}" width="11" height="11" transform="rotate(45 ${sel[0]} ${sel[1]})" fill="var(--c-bg-void)" stroke="var(--c-accent)" stroke-width="2"/>`;
+    document.getElementById(id).innerHTML = g;
+  }
+  chart('c1', 337, { lo: 9.0, hi: 10.2, ticks: [9.0, 9.3, 9.6, 9.9, 10.2], dp: 1, bdp: 2, base: 9.21, noise: 0.018, seed: 3, band: 0.035, baseBelow: true,
+    f1: t => 9.21 + 0.34 * Math.exp(-t * 9) - 0.065 * t, f3: t => 9.63 + 1.9 * Math.exp(-t * 14) - 0.2 * t });
+  chart('c2', 337, { lo: 0, hi: 0.6, ticks: [0, 0.15, 0.3, 0.45, 0.6], dp: 2, bdp: 2, base: 0.07, noise: 0.012, seed: 8, band: 0.025, baseBelow: false,
+    f1: t => 0.07 + 0.2 * Math.exp(-t * 8) + 0.02 * Math.exp(-Math.pow((t - 0.7) / 0.03, 2)) * 2, f3: t => 0.28 + 0.6 * Math.exp(-t * 12) });
+  chart('c3', 336, { lo: 2, hi: 9, ticks: [2, 4, 6, 8], dp: 0, bdp: 1, base: 7.4, noise: 0.14, seed: 14, band: 0.32, baseBelow: false,
+    f1: t => 7.4 - 2.6 * Math.exp(-t * 7) + 0.45 * t, f3: t => 5.1 - 3.2 * Math.exp(-t * 10) + 1.2 * t });
+})();
+</script>
+</body>
+</html>

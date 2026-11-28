@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>차고 · 센서 구성 — 피트 월 목업</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="base.css">
+<style>
+
+  /* 빌드 머리 */
+  #head { position: absolute; left: 0; top: 56px; width: 1920px; height: 76px; display: flex; align-items: center; padding: 0 32px; gap: 20px; border-bottom: 1px solid var(--c-line); }
+  #head .ttl small { display: block; font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #head .ttl h1 { font: var(--t-title-l); display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+  #trust { margin-left: 16px; padding-left: 20px; border-left: 1px solid var(--c-line); }
+  #trust .lbl { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #trust .seg { display: flex; width: 380px; height: 10px; margin: 7px 0 6px; gap: 2px; }
+  #trust .seg i { display: block; height: 100%; }
+  #trust .seg .m { background: var(--c-src-measured); flex: 27; }
+  #trust .seg .e { flex: 9; background: repeating-linear-gradient(90deg, var(--c-src-estimated) 0 3px, transparent 3px 6px); border: 1px solid var(--c-text-2); }
+  #trust .seg .s { flex: 6; border: 1px solid var(--c-text-2); background: radial-gradient(circle, var(--c-text-2) 0 1.5px, transparent 2px) 0 0/8px 8px; }
+  #trust .seg .a { flex: 4; border: 1px dashed var(--c-src-assumed); }
+  #trust .key2 { display: flex; gap: 16px; font: var(--t-data-s); color: var(--c-text-3); }
+  #head .acts { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+  /* 빌드 탭 */
+  #tabs { position: absolute; left: 32px; top: 132px; width: 1856px; height: 44px; display: flex; border-bottom: 1px solid var(--c-line-strong); }
+  #tabs a { position: relative; display: flex; align-items: center; gap: 10px; padding: 0 22px 0 18px; font: 500 14px/1 var(--font-ui); color: var(--c-text-3); border-right: 1px solid var(--c-line); white-space: nowrap; }
+  #tabs a .n { font: 600 11px/1 var(--font-label); color: var(--c-text-4); }
+  #tabs a .mini { display: flex; gap: 1px; width: 30px; height: 4px; }
+  #tabs a .mini i { height: 100%; background: var(--c-text-3); } #tabs a .mini i.a { background: var(--c-warn); }
+  #tabs a.on { color: var(--c-text); font-weight: 700; background: var(--c-bg-panel); }
+  #tabs a.on::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--c-accent); }
+  #tabs a.on .n { color: var(--c-accent); }
+
+  /* 왼쪽: 부품 트리 */
+  #tree { left: 32px; top: 192px; width: 344px; height: 956px; }
+  .slot { border-bottom: 1px solid var(--c-line); padding: 11px 14px 12px 16px; position: relative; }
+  .slot .k { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); display: flex; justify-content: space-between; }
+  .slot .p { font: 600 15px/22px var(--font-ui); margin-top: 3px; display: flex; align-items: center; gap: 8px; }
+  .slot .m { font: var(--t-data-s); color: var(--c-text-3); margin-top: 2px; }
+  .slot.on { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); }
+  .slot .sub { margin: 8px 0 0 0; border-left: 1px solid var(--c-line-strong); }
+  .slot .sub li { padding: 5px 0 5px 12px; font: var(--t-body-s); color: var(--c-text-2); display: flex; justify-content: space-between; }
+  .slot .sub li.on { color: var(--c-accent); font-weight: 600; border-left: 2px solid var(--c-accent); margin-left: -1px; }
+  .slot.empty .p { color: var(--c-text-3); font-weight: 500; }
+  .slot.empty { background: repeating-linear-gradient(-60deg, transparent 0 9px, rgba(242,244,241,.025) 9px 10px); }
+  .blk { padding: 12px 16px 14px; border-bottom: 1px solid var(--c-line); }
+  .blk h3 { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .stack { display: flex; height: 12px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); position: relative; }
+  .stack i { display: block; height: 100%; border-right: 1px solid var(--c-bg-void); }
+  .stackkey { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; margin-top: 8px; font: var(--t-body-s); color: var(--c-text-2); }
+  .stackkey span:nth-child(even) { font: var(--t-data-s); text-align: right; color: var(--c-text-3); line-height: 20px; }
+  .stackkey b { display: inline-block; width: 8px; height: 8px; margin-right: 8px; }
+  .compat li { display: grid; grid-template-columns: 18px 1fr auto; align-items: center; height: 30px; font: var(--t-body-s); border-top: 1px solid var(--c-line); }
+  .compat li:first-child { border-top: 0; }
+  .compat .y { color: var(--c-ok); font-weight: 700; } .compat .x { color: var(--c-danger); font-weight: 700; }
+  .compat li span:last-child { font: 500 12px/1 var(--font-ui); color: var(--c-text-3); }
+
+  /* 가운데: 3D */
+  #view { left: 392px; top: 192px; width: 976px; height: 632px; overflow: visible; }
+  #view canvas { position: absolute; left: 0; top: 0; }
+  .seg-ctl { position: absolute; display: flex; background: var(--c-bg-overlay); border: 1px solid var(--c-line-strong); }
+  .seg-ctl span { height: 30px; padding: 0 12px; display: flex; align-items: center; gap: 6px; font: 600 12px/1 var(--font-ui); color: var(--c-text-3); border-right: 1px solid var(--c-line); white-space: nowrap; }
+  .seg-ctl span:last-child { border-right: 0; }
+  .seg-ctl span.on { color: var(--c-text-on-accent); background: var(--c-accent); }
+  .call { position: absolute; transform: translate(-50%, -50%); white-space: nowrap; font: 600 12px/1.25 var(--font-ui); pointer-events: none; }
+  .call .bx { background: var(--c-bg-overlay); border: 1px solid var(--c-line-strong); padding: 5px 8px 4px; display: inline-block; }
+  .call .bx b { font: 600 13px/1 var(--font-data); }
+  .call.lime .bx { border-color: var(--c-accent-line); color: var(--c-accent); }
+  .call.warn .bx { border-color: rgba(255,184,31,.5); color: var(--c-warn); }
+  .call small { display: block; font: 500 11px/1.3 var(--font-ui); color: var(--c-text-3); margin-top: 1px; }
+  #vscale { position: absolute; left: 14px; bottom: 12px; font: var(--t-data-s); color: var(--c-text-3); }
+  #vover { position: absolute; left: 0; top: 0; pointer-events: none; }
+
+  /* 가운데 아래: 높이 단면 */
+  #side { left: 392px; top: 840px; width: 976px; height: 308px; }
+
+  /* 오른쪽: 설정 시트 */
+  #sheet { left: 1384px; top: 192px; width: 504px; height: 956px; }
+  #sheet .hd { padding: 12px 16px 10px; border-bottom: 2px solid var(--c-line-ink); display: flex; align-items: flex-end; gap: 12px; }
+  #sheet .hd small { display: block; font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #sheet .hd h2 { font: var(--t-title-m); white-space: nowrap; }
+  #sheet .hd .btn { margin-left: auto; height: 28px; }
+  .cols, .row { display: grid; grid-template-columns: 1fr 86px 62px 66px 62px; align-items: center; padding: 0 16px; column-gap: 6px; }
+  .cols { height: 26px; font: var(--t-micro); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); border-bottom: 1px solid var(--c-line); }
+  .cols span:nth-child(n+2) { text-align: right; } .cols span:nth-child(4) { text-align: left; padding-left: 4px; }
+  .grp { height: 28px; padding: 0 16px; display: flex; align-items: center; gap: 8px; background: var(--c-bg-raised); border-bottom: 1px solid var(--c-line); font: 600 12px/1 var(--font-ui); color: var(--c-text-2); }
+  .grp .i { font: 700 11px/1 var(--font-display); color: var(--c-text-4); }
+  .row { height: var(--row-h); border-bottom: 1px solid var(--c-line); font: var(--t-body-s); }
+  .row .nm { white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+  .row .v { text-align: right; font: 600 15px/1 var(--font-data); white-space: nowrap; }
+  .row .v .unit { font-size: 11px; }
+  .row .pm { text-align: right; font: var(--t-data-s); color: var(--c-text-3); white-space: nowrap; }
+  .row .d { text-align: right; font: var(--t-data-s); color: var(--c-text-4); white-space: nowrap; }
+  .row .d.ch { color: var(--c-text); }
+  .row .src { padding-left: 4px; }
+  .lock { display: inline-block; width: 11px; height: 12px; position: relative; flex: none; }
+  .lock::before { content: ""; position: absolute; left: 2px; top: 0; width: 7px; height: 7px; border: 1.5px solid var(--c-text-3); border-bottom: 0; border-radius: 4px 4px 0 0; }
+  .lock::after { content: ""; position: absolute; left: 0; top: 5px; width: 11px; height: 7px; background: var(--c-text-3); }
+  .row.sel { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); border-bottom-color: transparent; }
+  .edit { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); padding: 4px 16px 14px; border-bottom: 1px solid var(--c-accent-line); }
+  .sl { position: relative; height: 34px; margin: 0 4px; }
+  .sl .trk { position: absolute; left: 0; right: 0; top: 13px; height: 4px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); }
+  .sl .band { position: absolute; top: 9px; height: 12px; left: 31.25%; width: 47.9%; border: 1px dashed var(--c-warn); background: var(--c-warn-tint); }
+  .sl .knob { position: absolute; top: 3px; left: calc(55.2% - 7px); width: 14px; height: 24px; background: var(--c-accent); clip-path: polygon(0 0, 100% 0, 100% 70%, 50% 100%, 0 70%); }
+  .sl .tk { position: absolute; top: 24px; font: var(--t-micro); color: var(--c-text-4); transform: translateX(-50%); }
+  .why { display: grid; grid-template-columns: 76px 1fr; gap: 6px 10px; margin-top: 12px; font: var(--t-body-s); color: var(--c-text-2); }
+  .why dt { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); padding-top: 2px; }
+  .why dd b { color: var(--c-warn); font-weight: 600; }
+  .edit .btn { height: 28px; margin-top: 10px; }
+  #sheet .ft { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 16px; border-top: 1px solid var(--c-line-strong); display: flex; gap: 18px; font: 500 12px/1 var(--font-ui); color: var(--c-text-3); align-items: center; }
+</style>
+</head>
+<body>
+  <div id="head">
+    <div class="ttl"><small>차고 · 내 차 3대 중</small><h1>실차 2호 <span class="tag">AGX Orin</span><span class="tag warn">저장 안 한 변경 2개</span></h1></div>
+    <div id="trust">
+      <span class="lbl">이 차의 값 46개가 어디서 왔나</span>
+      <div class="seg"><i class="m"></i><i class="e"></i><i class="s"></i><i class="a"></i></div>
+      <div class="key2"><span class="src m"><i></i>실측 27</span><span class="src e"><i></i>추정 9</span><span class="src s"><i></i>규격 6</span><span class="src a"><i></i>가정 4</span></div>
+    </div>
+    <div class="acts">
+      <button class="btn">비교 기준 · 대회 기본 차 ▾</button>
+      <button class="btn">다른 이름으로 저장</button>
+      <button class="btn sel">저장 <span class="key" style="margin:0 0 0 4px">Ctrl S</span></button>
+      <button class="btn go" style="margin-left:10px">이 차로 달리기 <span class="k">Enter</span></button>
+    </div>
+  </div>
+
+  <nav id="tabs">
+    <a><span class="n">01</span>한눈에</a>
+    <a><span class="n">02</span>섀시 · 질량<span class="mini"><i style="flex:7"></i></span></a>
+    <a><span class="n">03</span>타이어<span class="mini"><i style="flex:3"></i><i class="a" style="flex:2"></i></span></a>
+    <a><span class="n">04</span>구동계<span class="mini"><i style="flex:8"></i></span></a>
+    <a><span class="n">05</span>조향<span class="mini"><i style="flex:5"></i></span></a>
+    <a class="on"><span class="n">06</span>센서<span class="mini"><i style="flex:12"></i><i class="a" style="flex:2"></i></span></a>
+    <a><span class="n">07</span>컴퓨터<span class="mini"><i style="flex:6"></i></span></a>
+    <a><span class="n">08</span>외관</a>
+  </nav>
+
+  <!-- 왼쪽: 달린 센서 -->
+  <aside class="panel" id="tree">
+    <div class="sec-h"><span class="idx">06</span><h2>달린 센서</h2><span class="more">자리 5 · 장착 3</span></div>
+    <div class="slot on">
+      <div class="k"><span>거리 센서 (LiDAR)</span><span class="src m"><i></i>대부분 실측</span></div>
+      <div class="p">Hokuyo UST-10LX</div>
+      <div class="m">270° · 1081줄 · 10 m · 40 Hz</div>
+      <ul class="sub"><li>기종 값<span class="num dim2">4</span></li><li class="on">장착 위치 · 각도<span class="num">6</span></li><li>신호 · 잡음<span class="num dim2">4</span></li></ul>
+    </div>
+    <div class="slot">
+      <div class="k"><span>관성 센서 (IMU)</span><span class="src e"><i></i>추정</span></div>
+      <div class="p">모터 제어기 내장형</div>
+      <div class="m">가속도 · 각속도 · 50 Hz · 중심에서 뒤로 0.11 m</div>
+    </div>
+    <div class="slot">
+      <div class="k"><span>바퀴 속도</span><span class="src m"><i></i>실측</span></div>
+      <div class="p">모터 회전수에서 계산</div>
+      <div class="m">50 Hz · 미끄러지면 실제보다 크게 나옴</div>
+    </div>
+    <div class="slot empty">
+      <div class="k"><span>카메라</span><span>선택 사항</span></div>
+      <div class="p">빈 자리 <button class="btn" style="height:24px;margin-left:auto">+ 달기</button></div>
+    </div>
+    <div class="slot empty">
+      <div class="k"><span>위치 추정</span><span>선택 사항</span></div>
+      <div class="p">쓰지 않음 <span class="dim2" style="font:var(--t-body-s);margin-left:auto">드라이버가 지도 없이 달림</span></div>
+    </div>
+    <div class="blk">
+      <h3><span>한 번 판단하는 데 드는 시간</span><span class="num" style="color:var(--c-text)">8.6 / 25 ms</span></h3>
+      <div class="stack"><i style="width:4.4%;background:var(--c-ent-lidar)"></i><i style="width:3.6%;background:var(--c-text-3)"></i><i style="width:24.8%;background:var(--c-accent)"></i><i style="width:1.6%;background:var(--c-text-2)"></i></div>
+      <div class="stackkey">
+        <span><b style="background:var(--c-ent-lidar)"></b>스캔 받기</span><span>1.1 ms</span>
+        <span><b style="background:var(--c-text-3)"></b>스캔 다듬기</span><span>0.9 ms</span>
+        <span><b style="background:var(--c-accent)"></b>드라이버 판단 · 미르 43</span><span>6.2 ms</span>
+        <span><b style="background:var(--c-text-2)"></b>궤적 따라가기</span><span>0.4 ms</span>
+      </div>
+      <p class="dim" style="font:var(--t-body-s);margin-top:8px">Orin Nano로 바꾸면 <b class="num warn" style="font-weight:500">19.4 ms</b> <span class="src e" style="margin-left:4px"><i></i>추정</span></p>
+    </div>
+    <div class="blk" style="border-bottom:0">
+      <h3><span>이 센서 구성으로 달릴 수 있는 드라이버</span><span>4명 중 3명</span></h3>
+      <ul class="compat">
+        <li><span class="y">✓</span><span>미르 43</span><span>같은 구성으로 훈련함</span></li>
+        <li><span class="y">✓</span><span>가람 45</span><span>같은 구성으로 훈련함</span></li>
+        <li><span class="y">✓</span><span>벽 간격 따라가기 <span class="dim2">기준선</span></span><span>줄 수 상관없음</span></li>
+        <li><span class="x">✕</span><span>솔 38</span><span class="danger">20 Hz로 훈련함 · 다시 훈련</span></li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- 가운데: 3D -->
+  <section class="panel ticks" id="view">
+    <canvas id="g3d" width="976" height="632"></canvas>
+    <svg id="vover" width="976" height="632"></svg>
+    <div class="seg-ctl" style="left:14px;top:14px"><span class="on">시야</span><span>안 보이는 곳</span><span>실제 스캔 겹치기</span><span>부품만</span></div>
+    <div class="seg-ctl" style="right:14px;top:14px"><span class="on">앞 비스듬히</span><span>위</span><span>옆</span><span>자유 <span class="key" style="margin:0">V</span></span></div>
+    <div id="vscale">바닥 눈금 0.1 m · 굵은 선 0.5 m · 거리 고리 1 m</div>
+    <div id="vscale" style="left:auto;right:14px;color:var(--c-accent)">시야 270° — 그림은 2.6 m까지만, 실제는 10 m</div>
+    <div id="calls"></div>
+  </section>
+
+  <!-- 가운데 아래: 높이 단면 -->
+  <section class="panel" id="side">
+    <div class="sec-h"><h2>옆에서 본 스캔 높이</h2><span class="en">세로 4배 확대</span><span class="more">앞뒤 기울기 <b class="num" style="color:var(--c-text)">+0.4°</b> <span class="src a" style="margin-left:6px"><i></i>가정 ±1.15°</span></span></div>
+    <svg id="elev" width="974" height="262"></svg>
+  </section>
+
+  <!-- 오른쪽: 설정 시트 -->
+  <section class="panel" id="sheet">
+    <div class="hd"><div><small>거리 센서 · 값 14개</small><h2>Hokuyo UST-10LX</h2></div><button class="btn">기종 바꾸기 ▾</button></div>
+    <div class="cols"><span>항목</span><span>값</span><span>오차</span><span>출처</span><span>기준과 차이</span></div>
+
+    <div class="grp"><span class="i">A</span>기종 값</div>
+    <div class="row"><span class="nm">시야</span><span class="v">270<span class="unit">°</span></span><span class="pm">—</span><span class="src s"><i></i>규격</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm"><i class="lock" title="드라이버 훈련에 묶인 값"></i>줄 수 <span class="dim2">0.25° 간격</span></span><span class="v">1081</span><span class="pm">—</span><span class="src s"><i></i>규격</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm">최대 거리</span><span class="v">10.0<span class="unit">m</span></span><span class="pm">—</span><span class="src s"><i></i>규격</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm"><i class="lock"></i>초당 스캔 수</span><span class="v">40.0<span class="unit">Hz</span></span><span class="pm">±0.1</span><span class="src m"><i></i>실측</span><span class="d">같음</span></div>
+
+    <div class="grp"><span class="i">B</span>장착 위치 · 각도 <span class="dim2" style="font-weight:500;margin-left:auto">뒤축 가운데 바닥이 기준점</span></div>
+    <div class="row"><span class="nm">앞뒤 위치</span><span class="v">0.297<span class="unit">m</span></span><span class="pm">±0.003</span><span class="src m"><i></i>실측</span><span class="d ch">+0.022</span></div>
+    <div class="row"><span class="nm">좌우 위치</span><span class="v">0.000<span class="unit">m</span></span><span class="pm">±0.002</span><span class="src m"><i></i>실측</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm">높이</span><span class="v">0.171<span class="unit">m</span></span><span class="pm">±0.004</span><span class="src m"><i></i>실측</span><span class="d ch">+0.016</span></div>
+    <div class="row sel"><span class="nm" style="font-weight:600">앞뒤 기울기</span><span class="v lime">+0.4<span class="unit">°</span></span><span class="pm warn">±1.15</span><span class="src a"><i></i>가정</span><span class="d ch">+0.4</span></div>
+    <div class="edit">
+      <div class="sl"><div class="trk"></div><div class="band"></div><div class="knob"></div>
+        <span class="tk" style="left:0">−3°</span><span class="tk" style="left:50%">0</span><span class="tk" style="left:100%">+3°</span></div>
+      <dl class="why">
+        <dt>왜 중요한가</dt><dd>범위 위쪽 끝(+1.55°)이면 <b>4.8 m보다 먼 덕트 호스 위로 스캔이 지나갑니다.</b> 아래 단면 그림에 표시했습니다.</dd>
+        <dt>실측하려면</dt><dd>평평한 바닥에서 벽을 2 m, 6 m 앞에 두고 10초씩 멈춰 기록한 bag 1개. 약 5분.</dd>
+      </dl>
+      <button class="btn">측정 안내 열기</button> <button class="btn ghost">범위만 좁히기</button>
+    </div>
+    <div class="row"><span class="nm">좌우 기울기</span><span class="v">0.0<span class="unit">°</span></span><span class="pm warn">±0.5</span><span class="src a"><i></i>가정</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm">돌아간 각도</span><span class="v">0.0<span class="unit">°</span></span><span class="pm">±0.3</span><span class="src e"><i></i>추정</span><span class="d">같음</span></div>
+
+    <div class="grp"><span class="i">C</span>신호 · 잡음</div>
+    <div class="row"><span class="nm">거리 잡음 <span class="dim2">표준편차</span></span><span class="v">12<span class="unit">mm</span></span><span class="pm">±3</span><span class="src e"><i></i>추정</span><span class="d ch">−8</span></div>
+    <div class="row"><span class="nm">빠지는 줄</span><span class="v">0.4<span class="unit">%</span></span><span class="pm">±0.2</span><span class="src e"><i></i>추정</span><span class="d">같음</span></div>
+    <div class="row"><span class="nm">도착까지 걸리는 시간</span><span class="v">11<span class="unit">ms</span></span><span class="pm">±4</span><span class="src e"><i></i>추정</span><span class="d ch">+6</span></div>
+    <div class="row"><span class="nm">달리며 찍혀 생기는 일그러짐</span><span class="v" style="font:600 13px/1 var(--font-ui)">반영함</span><span class="pm">—</span><span class="src s"><i></i>규격</span><span class="d">같음</span></div>
+    <div class="ft"><span><i class="lock" style="margin-right:6px;vertical-align:-1px"></i>바꾸면 드라이버를 다시 훈련해야 하는 값</span><span style="margin-left:auto" class="num">기준 · 대회 기본 차</span></div>
+  </section>
+
+<script src="scene.js"></script>
+<script src="chrome.js"></script>
+<script>
+pwChrome('garage', [['↑ ↓', '항목 이동'], ['← →', '값 조절'], ['Shift', '잘게 조절'], ['Tab', '다음 묶음'], ['Z', '되돌리기'], ['D', '기준 값으로'], ['M', '측정 안내'], ['V', '보는 각도']], '차 · 실차 2호 · 마지막 저장 11월 27일 16:42');
+(function () {
+  const P = PW, cv = document.getElementById('g3d');
+  const DUCT = [[1.86, 0.42], [0.86, 1.42]], LB = [1.12, 0.2, 0.5];
+  const g = P.garage(cv, { az: -61, el: 29, dist: 2.62, fov: 30, target: [0.62, 0.34, 0.05], fanR: 2.6, oy: 14, duct: DUCT, lowbox: LB });
+  const S = g.S, LX = g.LX, LZ = g.LZ, pj = (p) => S.proj(p);
+  // 치수선: 뒤축 → 센서(앞뒤 위치), 바닥 → 센서(높이)
+  const Y = -0.3;
+  S.line([0, Y, 0], [LX, Y, 0], [242, 244, 241], { lw: 1.4, nofog: true }); S.line([0, 0, 0], [0, Y - 0.04, 0], [242, 244, 241], { a: .5, nofog: true, dash: [3, 3] }); S.line([LX, 0, 0], [LX, Y - 0.04, 0], [242, 244, 241], { a: .5, nofog: true, dash: [3, 3] });
+  S.line([LX, 0.26, 0], [LX, 0.26, LZ], [242, 244, 241], { lw: 1.4, nofog: true }); S.line([LX, 0, LZ], [LX, 0.3, LZ], [242, 244, 241], { a: .5, nofog: true, dash: [3, 3] }); S.line([LX, 0, 0], [LX, 0.3, 0], [242, 244, 241], { a: .35, nofog: true, dash: [3, 3] });
+  S.flush();
+  const C = [];
+  const call = (p, cls, html, dx, dy) => { const q = pj(p); if (q) C.push(`<div class="call ${cls}" style="left:${q[0] + (dx || 0)}px;top:${q[1] + (dy || 0)}px"><span class="bx">${html}</span></div>`); return q; };
+  call([LX / 2, Y, 0], '', '앞뒤 위치 <b>0.297 m</b>', -52, 22);
+  call([LX, 0.26, LZ / 2], '', '높이 <b>0.171 m</b>', 62, 0);
+  call([LX - 0.62, 0.0, LZ], 'warn', '뒤 90°는 안 보임', 34, -8);
+  call([LX + Math.cos(-0.2), Math.sin(-0.2), LZ], 'lime', '1 m', 0, 0);
+  call([(DUCT[0][0] + DUCT[1][0]) / 2, (DUCT[0][1] + DUCT[1][1]) / 2, 0.32], '', '덕트 호스 · 지름 0.30 m<small>스캔 높이에 걸림 → 보임</small>', 0, -30);
+  call([LB[0], LB[1], 0.13], 'warn', '높이 0.12 m 상자<small>스캔 아래 → 못 봄</small>', 0, -30);
+  call([0.055, 0.03 + 0.16, 0.152], '', '관성 센서 축', -38, -14);
+  document.getElementById('calls').innerHTML = C.join('');
+  // 스캔이 덕트에 닿는 선
+  const ov = document.getElementById('vover'); let h = '';
+  const dd = [DUCT[1][0] - DUCT[0][0], DUCT[1][1] - DUCT[0][1]], dl = Math.hypot(dd[0], dd[1]), dn = [-dd[1] / dl, dd[0] / dl], off = -0.149;
+  const a = pj([DUCT[0][0] + dn[0] * off, DUCT[0][1] + dn[1] * off, LZ]), b = pj([DUCT[1][0] + dn[0] * off, DUCT[1][1] + dn[1] * off, LZ]);
+  if (a && b) h += `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="var(--c-ent-lidar)" stroke-width="3" stroke-dasharray="1 6" stroke-linecap="round"/>`;
+  ov.innerHTML = h;
+
+  // ---------- 옆에서 본 스캔 높이 ----------
+  const W = 974, H = 262, x0 = 92, x1 = 944, yF = 214, sx = (x1 - x0) / 10, sy = sx * 4;   // 세로 4배
+  const X = (m) => x0 + m * sx, Yh = (m) => yF - m * sy, tan = (d) => Math.tan(d * Math.PI / 180), z0 = 0.171;
+  let e = `<defs><pattern id="hz" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="rgba(255,184,31,.55)" stroke-width="1"/></pattern></defs>`;
+  for (let m = 0; m <= 10; m++) e += `<line x1="${X(m)}" y1="${yF}" x2="${X(m)}" y2="${yF + (m % 2 ? 4 : 7)}" stroke="var(--c-text-4)"/>` + (m % 2 === 0 ? `<text x="${X(m)}" y="${yF + 22}" text-anchor="middle" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="11">${m} m</text>` : '');
+  for (const hh of [0.1, 0.2, 0.3, 0.4]) e += `<line x1="${x0 - 62}" y1="${Yh(hh)}" x2="${x1}" y2="${Yh(hh)}" stroke="var(--c-chart-grid)"/><text x="${x0 - 66}" y="${Yh(hh) + 4}" text-anchor="end" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="11">${hh.toFixed(1)}</text>`;
+  e += `<line x1="${x0 - 62}" y1="${yF}" x2="${x1}" y2="${yF}" stroke="var(--c-text-2)" stroke-width="1.5"/>`;
+  // 가정 범위 쐐기(−0.75° ~ +1.55°)
+  const lo = z0 + 10 * tan(-0.75), hi = z0 + 10 * tan(1.55), mid = z0 + 10 * tan(0.4);
+  e += `<path d="M${X(0)} ${Yh(z0)} L${X(10)} ${Yh(hi)} L${X(10)} ${Yh(lo)}Z" fill="var(--c-warn-tint)" stroke="var(--c-warn)" stroke-dasharray="4 4" stroke-width="1"/>`;
+  e += `<line x1="${X(0)}" y1="${Yh(z0)}" x2="${X(10)}" y2="${Yh(mid)}" stroke="var(--c-accent)" stroke-width="2"/>`;
+  // 덕트(지름 0.30) 2 m, 7 m / 낮은 상자 3.6 m
+  const duct = (m, seen) => `<ellipse cx="${X(m)}" cy="${Yh(0.15)}" rx="${0.15 * sx}" ry="${0.15 * sy}" fill="rgba(195,200,203,.16)" stroke="var(--c-ent-duct)" stroke-width="1.5"/>`;
+  e += duct(2) + duct(7);
+  e += `<rect x="${X(3.6) - 0.11 * sx}" y="${Yh(0.12)}" width="${0.22 * sx}" height="${0.12 * sy}" fill="rgba(201,162,107,.25)" stroke="var(--c-warn)"/>`;
+  // 위쪽 끝이 덕트 위를 넘는 지점 4.8 m
+  const dOver = (0.30 - z0) / tan(1.55);
+  e += `<line x1="${X(dOver)}" y1="${Yh(0.30) - 46}" x2="${X(dOver)}" y2="${yF}" stroke="var(--c-warn)" stroke-dasharray="2 3"/>`;
+  e += `<rect x="${X(dOver)}" y="${Yh(0.30)}" width="${X(10) - X(dOver)}" height="${Yh(0) - Yh(0.30)}" fill="url(#hz)" opacity=".5"/>`;
+  e += `<text x="${X(dOver) + 8}" y="${Yh(0.30) - 34}" fill="var(--c-warn)" font-family="IBM Plex Sans KR" font-weight="600" font-size="12">4.8 m부터: 기울기가 범위 위쪽 끝이면 덕트 위로 지나감</text>`;
+  e += `<text x="${X(2)}" y="${Yh(0.30) - 8}" text-anchor="middle" fill="var(--c-text-2)" font-family="IBM Plex Sans KR" font-size="12">덕트 0.30 m · 보임</text>`;
+  e += `<text x="${X(3.6)}" y="${Yh(0.12) - 8}" text-anchor="middle" fill="var(--c-warn)" font-family="IBM Plex Sans KR" font-size="12">상자 0.12 m · 못 봄</text>`;
+  e += `<text x="${X(9.9)}" y="${Yh(mid) - 7}" text-anchor="end" fill="var(--c-accent)" font-family="IBM Plex Sans KR" font-weight="600" font-size="12">지금 값 +0.4°</text>`;
+  // 차 옆모습
+  const cx = X(0) - 0.297 * sx, w = (r) => `<ellipse cx="${r}" cy="${Yh(0.055)}" rx="${0.055 * sx}" ry="${0.055 * sy}" fill="#2c2f32" stroke="var(--c-text-3)"/>`;
+  e += w(cx) + w(cx + 0.33 * sx) + `<rect x="${cx - 0.1 * sx}" y="${Yh(0.056)}" width="${0.56 * sx}" height="${0.016 * sy}" fill="var(--c-text-3)"/><rect x="${cx + 0.01 * sx}" y="${Yh(0.125)}" width="${0.36 * sx}" height="${0.008 * sy}" fill="var(--c-text-2)"/><rect x="${X(0) - 0.025 * sx}" y="${Yh(0.2)}" width="${0.05 * sx}" height="${0.075 * sy}" fill="var(--c-accent)"/>`;
+  e += `<circle cx="${X(0)}" cy="${Yh(z0)}" r="3.5" fill="var(--c-bg-void)" stroke="var(--c-accent)" stroke-width="2"/>`;
+  e += `<text x="14" y="${Yh(0.4) - 14}" fill="var(--c-text-4)" font-family="IBM Plex Sans KR" font-size="11">높이 m</text>`;
+  document.getElementById('elev').innerHTML = e;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>허브 — 피트 월 목업</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="base.css">
+<style>
+
+  /* ---------- 오늘의 조합 ---------- */
+  #combo { left: 32px; top: 80px; width: 1216px; height: 604px; overflow: hidden; }
+  #combo .col { position: absolute; top: 45px; height: 466px; }
+  #combo .col .tagrow { position: absolute; left: 20px; top: 16px; display: flex; gap: 10px; align-items: center; z-index: 2; }
+  #combo .col .swap { position: absolute; right: 20px; top: 12px; z-index: 2; }
+  #combo .name { position: absolute; left: 20px; right: 20px; bottom: 126px; z-index: 2; }
+  #combo .name h3 { font: 700 30px/38px var(--font-ui); letter-spacing: -0.01em; white-space: nowrap; }
+  #combo .name p { font: var(--t-body-s); color: var(--c-text-3); margin-top: 2px; white-space: nowrap; }
+  #combo .stats { position: absolute; left: 20px; right: 20px; bottom: 16px; display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--c-line-strong); z-index: 2; }
+  #combo .stats > div { padding: 10px 10px 0 0; }
+  #combo .stats > div + div { padding-left: 12px; border-left: 1px solid var(--c-line); }
+  #combo .stats .l { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); white-space: nowrap; }
+  #combo .stats .v { font: var(--t-readout-m); margin: 7px 0 7px; white-space: nowrap; }
+  #combo .stats .v small { font: 500 12px/1 var(--font-ui); color: var(--c-text-3); margin-left: 3px; }
+  #cA { left: 0; width: 430px; } #cB { left: 430px; width: 398px; } #cC { left: 828px; width: 388px; }
+  #cA canvas { position: absolute; left: 0; top: 0; -webkit-mask-image: linear-gradient(#000 62%, transparent 98%); mask-image: linear-gradient(#000 62%, transparent 98%); }
+  #combo .divs { position: absolute; left: 0; top: 45px; pointer-events: none; z-index: 1; }
+  #ready { position: absolute; left: 0; right: 0; bottom: 0; height: 92px; border-top: 1px solid var(--c-line-strong); background: var(--c-bg-void); display: flex; align-items: center; padding: 0 20px; gap: 26px; }
+  #ready .chk { display: flex; flex-direction: column; gap: 7px; font: var(--t-body-s); color: var(--c-text-2); }
+  #ready .chk span { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  #ready .chk b { font-weight: 700; width: 12px; text-align: center; }
+  #ready .cta { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  #ready .cta .btn.go { height: 56px; font-size: 19px; padding: 0 30px 0 26px; }
+  #ready .fmt { text-align: right; font: var(--t-body-s); color: var(--c-text-3); line-height: 18px; white-space: nowrap; }
+  #ready .fmt b { color: var(--c-text); font-weight: 600; }
+
+  /* ---------- 다음 할 일 ---------- */
+  #todo { left: 1272px; top: 80px; width: 616px; height: 604px; }
+  #todo li { display: grid; grid-template-columns: 58px 1fr; border-bottom: 1px solid var(--c-line); padding: 11px 16px 12px 0; position: relative; }
+  #todo li .no { font: 600 34px/1 var(--font-display); color: var(--c-text-4); text-align: center; padding-top: 2px; }
+  #todo li.first { background: var(--c-accent-tint); box-shadow: inset 3px 0 0 var(--c-accent); }
+  #todo li.first .no { color: var(--c-accent); }
+  #todo .where { display: flex; gap: 8px; align-items: center; font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #todo h3 { font: 600 17px/24px var(--font-ui); margin-top: 3px; }
+  #todo p { font: var(--t-body-s); color: var(--c-text-3); margin-top: 2px; max-width: 520px; }
+  #todo p b { color: var(--c-text-2); font-weight: 500; }
+  #todo .act { display: flex; align-items: center; gap: 12px; margin-top: 8px; font: 500 12px/1 var(--font-ui); color: var(--c-text-3); }
+  #todo .act .btn { height: 28px; }
+  #todo .foot { position: absolute; left: 16px; right: 16px; bottom: 9px; font: 500 12px/18px var(--font-ui); color: var(--c-text-4); }
+
+  /* ---------- 진행 중인 훈련 ---------- */
+  #train { left: 32px; top: 708px; width: 744px; height: 440px; }
+  .run { display: grid; grid-template-columns: 1fr 268px; border-bottom: 1px solid var(--c-line); padding: 20px 16px 20px; column-gap: 18px; }
+  .run h3 { font: 600 17px/24px var(--font-ui); display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  .run .meta { font: var(--t-body-s); color: var(--c-text-3); margin-top: 1px; white-space: nowrap; }
+  .run .prog { display: flex; align-items: center; gap: 12px; margin-top: 12px; font: var(--t-data-s); color: var(--c-text-3); white-space: nowrap; }
+  .run .prog .bar { flex: 1; height: 8px; }
+  .run .prog b { font: 600 20px/1 var(--font-display); color: var(--c-text); }
+  .run .kv { display: flex; gap: 22px; margin-top: 12px; }
+  .run .kv div { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); white-space: nowrap; }
+  .run .kv b { display: block; font: var(--t-readout-s); color: var(--c-text); margin-top: 6px; letter-spacing: 0; }
+  .run .kv b small { font: 500 12px/1 var(--font-data); color: var(--c-text-3); margin-left: 6px; }
+  .run svg { background: var(--c-bg-well); border: 1px solid var(--c-line); }
+  .queue { padding: 11px 16px; display: flex; align-items: center; gap: 12px; font: var(--t-body-s); color: var(--c-text-3); white-space: nowrap; }
+
+  /* ---------- 최근 결과 ---------- */
+  #recent { left: 800px; top: 708px; width: 704px; height: 440px; }
+  #recent td { height: 62px; }
+  #recent td .t1 { font: 600 14px/20px var(--font-ui); display: block; }
+  #recent td .t2 { font: 400 12px/16px var(--font-ui); color: var(--c-text-3); display: block; }
+  #recent td.n b { font: 600 22px/1 var(--font-display); }
+  #recent .fm { display: inline-block; padding: 4px 10px 3px; font: 700 11px/1 var(--font-ui); background: var(--c-bg-hover); color: var(--c-text-2); clip-path: polygon(6px 0, 100% 0, calc(100% - 6px) 100%, 0 100%); }
+  #recent .fm.q { background: var(--c-text); color: var(--c-bg-void); }
+  #recent .fm.r { background: var(--c-ent-rival); color: #2a0716; }
+
+  /* ---------- 장비 ---------- */
+  #rig { left: 1528px; top: 708px; width: 360px; height: 440px; }
+  .pc { padding: 12px 16px 13px; border-bottom: 1px solid var(--c-line); }
+  .pc h3 { font: 600 15px/22px var(--font-ui); display: flex; align-items: center; gap: 8px; }
+  .pc h3 span { margin-left: auto; font: 500 12px/1 var(--font-ui); color: var(--c-text-3); }
+  .pc .g { display: grid; grid-template-columns: 62px 1fr 44px; align-items: center; gap: 10px; margin-top: 8px; font: var(--t-body-s); color: var(--c-text-2); white-space: nowrap; }
+  .pc .g .num { text-align: right; color: var(--c-text-3); font-size: 12px; }
+  .pc .note { font: 400 12px/16px var(--font-ui); color: var(--c-text-3); margin-top: 6px; }
+</style>
+</head>
+<body>
+  <!-- 오늘의 조합: 차 · 장소 · 드라이버 -->
+  <section class="panel ticks" id="combo">
+    <div class="sec-h"><span class="idx">01</span><h2>지금 고른 조합</h2><span class="en">차 · 장소 · 드라이버</span><span class="more">조합을 바꾸면 위 띠와 모든 화면이 함께 바뀝니다</span></div>
+    <svg class="divs" width="1216" height="466"><line x1="446" y1="0" x2="414" y2="466" stroke="var(--c-line-strong)"/><line x1="844" y1="0" x2="812" y2="466" stroke="var(--c-line-strong)"/></svg>
+
+    <div class="col" id="cA">
+      <canvas id="car" width="430" height="300"></canvas>
+      <div class="tagrow"><span class="slanttag">차</span><span class="src m"><i></i>실측 27 / 46</span></div>
+      <button class="btn swap">바꾸기</button>
+      <div class="name"><h3>실차 2호</h3><p>AGX Orin · 거리 센서 1 · 카메라 없음</p></div>
+      <div class="stats">
+        <div><span class="l">질량</span><div class="v disp">3.74<small>kg</small></div><span class="src m"><i></i>실측</span></div>
+        <div><span class="l">조향 응답</span><div class="v disp">40<small>ms</small></div><span class="src m"><i></i>실측</span></div>
+        <div><span class="l">명령 지연</span><div class="v disp">30<small>ms</small></div><span class="src m"><i></i>실측</span></div>
+      </div>
+    </div>
+
+    <div class="col" id="cB">
+      <svg id="venue" width="398" height="466" style="position:absolute;left:0;top:0"></svg>
+      <div class="tagrow" style="left:34px"><span class="slanttag">장소</span><span class="src e"><i></i>bag 3개로 만듦</span></div>
+      <button class="btn swap">바꾸기</button>
+      <div class="name" style="left:26px"><h3>2026 한국 대회장</h3><p>코스 46.7 m · 폭 1.76–2.32 m · 덕트 호스 벽</p></div>
+      <div class="stats" style="left:26px">
+        <div><span class="l">그립</span><div class="v disp">0.86<small>±0.06</small></div><span class="src e"><i></i>추정</span></div>
+        <div><span class="l">제동 한계</span><div class="v disp warn">≥6.1<small>m/s²</small></div><span class="src l"><i></i>하한만</span></div>
+        <div><span class="l">미끄러운 구역</span><div class="v disp">1<small>곳</small></div><span class="src e"><i></i>추정</span></div>
+      </div>
+    </div>
+
+    <div class="col" id="cC">
+      <svg id="sig" width="388" height="466" style="position:absolute;left:0;top:0"></svg>
+      <div class="tagrow" style="left:30px"><span class="slanttag lime">드라이버</span><span class="tag">학습됨</span></div>
+      <button class="btn swap">바꾸기</button>
+      <div class="name" style="left:22px"><h3>미르 43</h3><p>43번째 훈련에서 승격 · 11월 26일 · 예선 기본기</p></div>
+      <div class="stats" style="left:22px">
+        <div><span class="l">이 장소 최고 랩</span><div class="v disp best">9.214<small>초</small></div><span class="dim2" style="font:500 11px/1 var(--font-ui)">오늘 14:12</span></div>
+        <div><span class="l">무충돌 연속</span><div class="v disp">7.4<small>바퀴</small></div><span class="dim2" style="font:500 11px/1 var(--font-ui)">시험 12회 평균</span></div>
+        <div><span class="l">접촉</span><div class="v disp">0.07<small>/바퀴</small></div><span class="dim2" style="font:500 11px/1 var(--font-ui)">시험 12회 평균</span></div>
+      </div>
+    </div>
+
+    <div id="ready">
+      <div class="chk">
+        <span><b class="ok">✓</b>드라이버가 이 차의 센서 구성으로 훈련됨</span>
+        <span><b class="ok">✓</b>판단 시간 8.6 ms — 예산 25 ms 안</span>
+      </div>
+      <div class="chk">
+        <span><b class="warn">△</b>이 장소의 제동 한계는 하한만 잼 — 시뮬은 6.1 m/s²로 달림</span>
+        <span><b class="warn">△</b>거리 센서 앞뒤 기울기가 가정 값(±1.15°)</span>
+      </div>
+      <div class="cta">
+        <div class="fmt"><b>예선 형식</b> · 90초 한 번<br>무충돌 연속 바퀴 → 최고 랩 순</div>
+        <button class="btn">세션 바꾸기</button>
+        <button class="btn go">이 조합으로 달리기 <span class="k">Enter</span></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 다음 할 일 -->
+  <section class="panel" id="todo">
+    <div class="sec-h"><span class="idx">02</span><h2>다음 할 일</h2><span class="en">값이 빈 곳과 방금 끝난 작업에서 자동으로 생깁니다</span><span class="more">끝낸 일 12건</span></div>
+    <ol>
+      <li class="first"><div class="no">1</div><div>
+        <div class="where"><span>장소 · 2026 한국 대회장</span><span class="tag warn">달리기 결과에 영향 큼</span></div>
+        <h3>제동 한계를 마저 재기</h3>
+        <p>지금은 <b>6.1 m/s² 이상</b>이라는 것만 압니다. 직선에서 끝까지 밟는 제동 3번이 담긴 bag이면 정해집니다.</p>
+        <div class="act"><button class="btn sel">주행 시험 안내 열기</button><span>실차 주행 약 10분</span></div>
+      </div></li>
+      <li><div class="no">2</div><div>
+        <div class="where"><span>차고 · 실차 2호</span></div>
+        <h3>거리 센서 앞뒤 기울기를 실측으로 바꾸기</h3>
+        <p>가정 값이라 범위 위쪽 끝에서는 <b>4.8 m보다 먼 덕트 호스를 놓칩니다.</b></p>
+        <div class="act"><button class="btn">차고에서 열기</button><span>정지 기록 bag 1개 · 약 5분</span></div>
+      </div></li>
+      <li><div class="no">3</div><div>
+        <div class="where"><span>훈련소 · 가람 45</span><span class="tag lime">1시간 40분 뒤 끝남</span></div>
+        <h3>끝나면 드라이버로 올릴지 정하기</h3>
+        <p>지금까지 시험에서 미르 43보다 랩 <b class="own">−0.05초</b>, 접촉은 같습니다.</p>
+        <div class="act"><button class="btn">성적표 보기</button><span>끝나면 알림</span></div>
+      </div></li>
+      <li><div class="no">4</div><div>
+        <div class="where"><span>분석 · 오늘 13:40 1대1</span></div>
+        <h3>상대 차와 닿은 장면 1건 보기</h3>
+        <p>구간 2 헤어핀 들머리, 상대가 안쪽에 있을 때 닿았습니다.</p>
+        <div class="act"><button class="btn">장면 열기</button><span>12초짜리 다시 보기</span></div>
+      </div></li>
+    </ol>
+  </section>
+
+  <!-- 진행 중인 훈련 -->
+  <section class="panel" id="train">
+    <div class="sec-h"><span class="idx">03</span><h2>진행 중인 훈련</h2><span class="en">2개 · 대기 1개</span><span class="more">훈련소 열기 <span class="key" style="margin:0 0 0 6px">6</span></span></div>
+    <div class="run">
+      <div>
+        <h3><i class="dot lime"></i>가람 45 <span class="tag">예선 기본기</span></h3>
+        <div class="meta">연구실 PC · 그래픽카드 1 · 미르 43에서 이어서 훈련</div>
+        <div class="prog"><b>82%</b><div class="bar lime"><i style="width:82%"></i></div><span>1시간 40분 남음</span></div>
+        <div class="kv">
+          <div>시험 랩<b>9.16<small class="own">−0.05</small></b></div>
+          <div>접촉 / 바퀴<b>0.07<small>같음</small></b></div>
+          <div>무충돌 연속<b>7.8<small class="own">+0.4</small></b></div>
+        </div>
+      </div>
+      <svg id="sp1" width="268" height="132"></svg>
+    </div>
+    <div class="run">
+      <div>
+        <h3><i class="dot lime"></i>한울 46 <span class="tag">1대1 본선</span></h3>
+        <div class="meta">학습 서버 · 그래픽카드 3 · 처음부터 훈련</div>
+        <div class="prog"><b>31%</b><div class="bar lime"><i style="width:31%"></i></div><span>6시간 12분 남음</span></div>
+        <div class="kv">
+          <div>시험 랩<b>9.71<small class="slower">+0.50</small></b></div>
+          <div>접촉 / 바퀴<b>0.31<small class="slower">+0.24</small></b></div>
+          <div>1대1 승률<b>38<small>% · 기준 61</small></b></div>
+        </div>
+      </div>
+      <svg id="sp2" width="268" height="132"></svg>
+    </div>
+    <div class="queue"><i class="dot off"></i><b style="color:var(--c-text-2);font-weight:600">대기 1</b> 새 장소 적응 · 연구실 복도 — 연구실 PC 그래픽카드 1이 비면 시작<span style="margin-left:auto" class="dim2">차이는 모두 미르 43 대비</span></div>
+  </section>
+
+  <!-- 최근 결과 -->
+  <section class="panel" id="recent">
+    <div class="sec-h"><span class="idx">04</span><h2>최근 결과</h2><span class="en">대회 채점 방식</span><span class="more">전체 기록</span></div>
+    <table class="tbl">
+      <tr><th style="width:92px">언제</th><th>형식 · 드라이버</th><th class="n">무충돌 연속</th><th class="n">최고 랩</th><th class="n" style="width:64px">접촉</th></tr>
+      <tr class="sel"><td class="num dim" style="font-size:12px">오늘 14:12</td><td><span class="t1"><span class="fm q">예선</span>&nbsp; 미르 43</span><span class="t2">2026 한국 대회장 · 상자 3개, 50초에 치움</span></td><td class="n"><b>8</b></td><td class="n"><b class="best">9.214</b></td><td class="n">0</td></tr>
+      <tr><td class="num dim" style="font-size:12px">오늘 13:40</td><td><span class="t1"><span class="fm r">1대1</span>&nbsp; 미르 43 <span class="dim2">대</span> 지도 기반 추종</span><span class="t2">5바퀴 먼저 · <b class="ok" style="font-weight:600">이김</b> 1.8초 차</span></td><td class="n dim2">—</td><td class="n"><b>9.388</b></td><td class="n warn">1</td></tr>
+      <tr><td class="num dim" style="font-size:12px">오늘 11:05</td><td><span class="t1"><span class="fm q">예선</span>&nbsp; 가람 45 <span class="dim2">훈련 중 61%</span></span><span class="t2">2026 한국 대회장 · 상자 3개, 50초에 치움</span></td><td class="n"><b>3</b></td><td class="n"><b>9.268</b></td><td class="n warn">1</td></tr>
+      <tr><td class="num dim" style="font-size:12px">어제 17:30</td><td><span class="t1"><span class="fm">직접 몰기</span>&nbsp; 사람 · 키보드</span><span class="t2">연구실 복도 · 장애물 없음</span></td><td class="n dim2">—</td><td class="n"><b>14.820</b></td><td class="n danger">4</td></tr>
+      <tr><td class="num dim" style="font-size:12px">어제 16:02</td><td><span class="t1"><span class="fm q">예선</span>&nbsp; 벽 간격 따라가기 <span class="dim2">기준선</span></span><span class="t2">2026 한국 대회장 · 상자 3개, 50초에 치움</span></td><td class="n"><b>2</b></td><td class="n"><b>11.946</b></td><td class="n danger">3</td></tr>
+    </table>
+    <div class="queue" style="border-top:0"><span class="best">■</span> 보라색 = 이 장소 역대 최고 <span style="margin-left:auto" class="dim2">행을 누르면 결과지와 다시 보기</span></div>
+  </section>
+
+  <!-- 장비 -->
+  <section class="panel" id="rig">
+    <div class="sec-h"><span class="idx">05</span><h2>장비</h2><span class="more">3대</span></div>
+    <div class="pc">
+      <h3><i class="dot"></i>연구실 PC<span>이 화면이 붙은 곳</span></h3>
+      <div class="g"><span>카드 1</span><div class="bar lime"><i style="width:78%"></i></div><span class="num">78%</span></div>
+      <div class="g"><span>카드 2</span><div class="bar"><i style="width:22%"></i></div><span class="num">22%</span></div>
+      <div class="g"><span>메모리</span><div class="bar"><i style="width:66%"></i></div><span class="num">9.2 G</span></div>
+      <div class="g"><span>저장 공간</span><div class="bar"><i style="width:81%;background:var(--c-warn)"></i></div><span class="num warn">162 G</span></div>
+      <p class="note">카드 1 가람 45 훈련 · 카드 2 화면과 시뮬 · 저장 공간 200 G 중 38 G 남음</p>
+    </div>
+    <div class="pc">
+      <h3><i class="dot"></i>학습 서버<span>원격</span></h3>
+      <div class="g"><span>카드 3</span><div class="bar lime"><i style="width:94%"></i></div><span class="num">94%</span></div>
+      <p class="note">한울 46 훈련 · 마지막 소식 42초 전</p>
+    </div>
+    <div class="pc" style="border-bottom:0">
+      <h3><i class="dot off"></i>실차 2호<span>꺼져 있음</span></h3>
+      <p class="note">마지막 연결 11월 27일 18:20 · bag 2개 가져오지 않음</p>
+      <button class="btn" style="height:28px;margin-top:10px">bag 가져오기</button>
+    </div>
+  </section>
+
+<script src="scene.js"></script>
+<script src="chrome.js"></script>
+<script>
+pwChrome('hub', [['1–7', '화면 이동'], ['Enter', '이 조합으로 달리기'], ['G', '차 바꾸기'], ['P', '장소 바꾸기'], ['D', '드라이버 바꾸기'], ['/', '찾기'], ['?', '모든 단축키']], '11월 28일 토 20:14 · 시뮬 서버 연결됨');
+(function () {
+  const P = PW;
+  // 차
+  P.garage(document.getElementById('car'), { az: -38, el: 19, dist: 1.5, fov: 26, target: [0.17, 0.0, 0.07], fan: false, dims: false, hi: null, oy: 34, ox: -4 });
+  // 장소 지도
+  const m = P.mapPaths(40, 52, 318, 212, 4); let h = '';
+  h += `<defs><pattern id="slip" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="7" stroke="var(--c-warn)" stroke-width="1.2" opacity=".7"/></pattern></defs>`;
+  h += `<path d="${m.left}${m.right}" fill="rgba(242,244,241,0.06)" fill-rule="evenodd"/>`;
+  // 미끄러운 구역(그립 0.71)
+  { const seg = []; for (let f = 0.5; f <= 0.6; f += 0.005) { const a = P.at(f), n = P.track.nor[a.i], hw = P.track.hw[a.i]; seg.push([[a.x + n[0] * hw, a.y + n[1] * hw], [a.x - n[0] * hw, a.y - n[1] * hw]]); }
+    const pts = seg.map(s => s[0]).concat(seg.map(s => s[1]).reverse()); h += `<path d="${m.path(pts)}" fill="url(#slip)"/>`;
+    const c = m.T(seg[10][0]); const c2 = m.T(seg[10][1]); h += `<polyline points="${c2[0]},${c2[1]} 376,${c2[1] + 6} 376,262" fill="none" stroke="var(--c-warn)"/><text x="382" y="278" text-anchor="end" fill="var(--c-warn)" font-family="IBM Plex Sans KR" font-weight="600" font-size="12">미끄러운 구역 · 그립 0.71</text>`; }
+  h += `<path d="${m.left}" fill="none" stroke="var(--c-ent-duct)" stroke-width="2.4" stroke-linejoin="round"/><path d="${m.right}" fill="none" stroke="var(--c-ent-duct)" stroke-width="2.4" stroke-linejoin="round"/>`;
+  const lp = []; for (let i = 0; i < P.track.N; i++) lp.push(P.linePoint(i)); h += `<path d="${m.path(lp)}" fill="none" stroke="var(--c-ent-plan)" stroke-width="1.6" opacity=".9"/>`;
+  { const a = P.at(0.02), n = P.track.nor[a.i], hw = P.track.hw[a.i], p0 = m.T([a.x + n[0] * hw, a.y + n[1] * hw]), p1 = m.T([a.x - n[0] * hw, a.y - n[1] * hw]); h += `<line x1="${p0[0]}" y1="${p0[1]}" x2="${p1[0]}" y2="${p1[1]}" stroke="var(--c-text)" stroke-width="3"/>`; }
+  P.boxes.forEach(b => { const c = m.T([b.x, b.y]); h += `<rect x="${c[0] - 4}" y="${c[1] - 4}" width="8" height="8" fill="var(--c-ent-box)"/>`; });
+  // 축척
+  const s0 = m.T([0, 0]), s1 = m.T([2, 0]); h += `<line x1="330" y1="70" x2="${330 + (s1[0] - s0[0])}" y2="70" stroke="var(--c-text-3)"/><line x1="330" y1="66" x2="330" y2="74" stroke="var(--c-text-3)"/><line x1="${330 + (s1[0] - s0[0])}" y1="66" x2="${330 + (s1[0] - s0[0])}" y2="74" stroke="var(--c-text-3)"/><text x="${330 + (s1[0] - s0[0]) / 2}" y="88" text-anchor="middle" fill="var(--c-text-3)" font-family="IBM Plex Mono" font-size="11">2 m</text>`;
+  document.getElementById('venue').innerHTML = h;
+
+  // 드라이버: 한 바퀴 속도(이 장소 최고 랩)
+  const sp = []; for (let i = 0; i < P.track.N; i += 2) sp.push(P.speedAt(i));
+  const sm = sp.map((v, i) => { let a = 0; for (let d = -4; d <= 4; d++) a += sp[(i + d + sp.length) % sp.length]; return a / 9; });
+  const X0 = 34, Y0 = 86, W = 322, H = 158; let g = '';
+  let lab = ''; for (const v of [3, 5, 7]) { const y = Y0 + H - H * (v - 2.5) / 5.5; g += `<line x1="${X0}" y1="${y}" x2="${X0 + W}" y2="${y}" stroke="var(--c-chart-grid)"/>`; lab += `<text x="${X0 + 4}" y="${y - 4}" fill="var(--c-text-3)" font-family="IBM Plex Mono" font-size="10">${v} m/s</text>`; }
+  [0.34, 0.70].forEach((f, k) => { const x = X0 + W * f; g += `<line x1="${x}" y1="${Y0 + 6}" x2="${x}" y2="${Y0 + H}" stroke="var(--c-line-strong)" stroke-dasharray="2 4"/>`; });
+  ['구간 1', '구간 2', '구간 3'].forEach((t, k) => { g += `<text x="${X0 + W * [0.17, 0.52, 0.85][k]}" y="${Y0 + H + 16}" text-anchor="middle" fill="var(--c-text-4)" font-family="IBM Plex Sans KR" font-size="11">${t}</text>`; });
+  const d = P.linePath(sm, X0, Y0, W, H, 2.5, 8);
+  g += `<path d="${d}L${X0 + W} ${Y0 + H}L${X0} ${Y0 + H}Z" fill="var(--c-accent-tint)"/><path d="${d}" fill="none" stroke="var(--c-accent)" stroke-width="2" stroke-linejoin="round"/>`;
+  g += lab + `<text x="${X0}" y="${Y0 - 6}" fill="var(--c-text-3)" font-family="IBM Plex Sans KR" font-size="12">이 드라이버가 한 바퀴를 달리는 속도</text>`;
+  document.getElementById('sig').innerHTML = g;
+
+  // 훈련 곡선: 시험 랩(초), 기준선은 미르 43
+  function spark(id, f, seed, base, lo, hi, done) {
+    const n = Math.round(60 * done), v = P.series(n, f, seed, 0.035), Wd = 268, Hd = 132, px = 10, py = 22;
+    const yb = py + (Hd - py - 16) * (hi - base) / (hi - lo);
+    let s = `<text x="${px}" y="15" fill="var(--c-text-4)" font-family="IBM Plex Sans KR" font-size="11">시험 랩 (초) — 낮을수록 좋음</text>`;
+    s += `<line x1="${px}" y1="${yb}" x2="${Wd - px}" y2="${yb}" stroke="var(--c-series-2)" stroke-dasharray="4 4"/><text x="${Wd - px}" y="${yb - 5}" text-anchor="end" fill="var(--c-text-3)" font-family="IBM Plex Mono" font-size="10">미르 43 · ${base.toFixed(2)}</text>`;
+    const w = (Wd - 2 * px) * done, dd = v.map((x, i) => (i ? 'L' : 'M') + (px + w * i / (n - 1)).toFixed(1) + ' ' + (py + (Hd - py - 16) * (hi - x) / (hi - lo)).toFixed(1)).join('');
+    s += `<path d="${dd}" fill="none" stroke="var(--c-series-1)" stroke-width="1.8" stroke-linejoin="round"/>`;
+    const lx = px + w, ly = py + (Hd - py - 16) * (hi - v[n - 1]) / (hi - lo); s += `<circle cx="${lx}" cy="${ly}" r="3.5" fill="var(--c-series-1)"/><line x1="${lx}" y1="${py}" x2="${lx}" y2="${Hd - 16}" stroke="var(--c-accent-line)"/>`;
+    s += `<text x="${px}" y="${Hd - 4}" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="10">시작</text><text x="${Wd - px}" y="${Hd - 4}" text-anchor="end" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="10">끝</text>`;
+    document.getElementById(id).innerHTML = s;
+  }
+  spark('sp1', t => 9.21 + 0.28 * Math.exp(-t * 7) - 0.07 * t, 5, 9.21, 9.0, 9.6, 0.82);
+  spark('sp2', t => 9.21 + 1.9 * Math.exp(-t * 9) + 0.42 - 0.3 * t, 9, 9.21, 9.0, 11.6, 0.31);
+})();
+</script>
+</body>
+</html>

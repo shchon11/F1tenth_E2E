@@ -1,0 +1,160 @@
+[gd_resource type="Theme" format=3]
+
+[ext_resource type="FontFile" path="res://assets/fonts/IBMPlexSansKR-Regular.woff2" id="1_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/SairaCondensed-SemiBold.woff2" id="2_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/IBMPlexSansKR-SemiBold.woff2" id="3_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/IBMPlexSansKR-Bold.woff2" id="4_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/SairaSemiCondensed-SemiBold.woff2" id="5_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/IBMPlexMono-Medium.woff2" id="6_font"]
+[ext_resource type="FontFile" path="res://assets/fonts/IBMPlexSansKR-Medium.woff2" id="7_font"]
+
+[sub_resource type="FontVariation" id="fv_ui_400"]
+base_font = ExtResource("1_font")
+
+[sub_resource type="StyleBoxFlat" id="sb_plate"]
+bg_color = Color(0.0352941, 0.0392157, 0.0431373, 0.82)
+border_color = Color(0.94902, 0.956863, 0.945098, 0.09)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+content_margin_left = 16
+content_margin_top = 12
+content_margin_right = 16
+content_margin_bottom = 12
+
+[sub_resource type="StyleBoxFlat" id="sb_panel"]
+bg_color = Color(0.0666667, 0.0745098, 0.0823529, 1)
+border_color = Color(0.94902, 0.956863, 0.945098, 0.09)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+content_margin_left = 16
+content_margin_top = 16
+content_margin_right = 16
+content_margin_bottom = 16
+
+[sub_resource type="StyleBoxFlat" id="sb_strip"]
+bg_color = Color(0.027451, 0.0313725, 0.0313725, 1)
+border_color = Color(0.94902, 0.956863, 0.945098, 0.2)
+border_width_bottom = 1
+content_margin_left = 16
+content_margin_top = 0
+content_margin_right = 16
+content_margin_bottom = 0
+
+[sub_resource type="StyleBoxFlat" id="sb_hint"]
+bg_color = Color(0.027451, 0.0313725, 0.0313725, 1)
+border_color = Color(0.94902, 0.956863, 0.945098, 0.09)
+border_width_top = 1
+content_margin_left = 16
+content_margin_top = 0
+content_margin_right = 16
+content_margin_bottom = 0
+
+[sub_resource type="StyleBoxFlat" id="sb_key"]
+bg_color = Color(0.0352941, 0.0392157, 0.0431373, 1)
+border_color = Color(0.94902, 0.956863, 0.945098, 0.2)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 2
+content_margin_left = 6
+content_margin_top = 1
+content_margin_right = 6
+content_margin_bottom = 1
+
+[sub_resource type="StyleBoxFlat" id="sb_chip_accent"]
+bg_color = Color(0.776471, 0.945098, 0.207843, 1)
+content_margin_left = 8
+content_margin_top = 2
+content_margin_right = 8
+content_margin_bottom = 2
+
+[sub_resource type="FontVariation" id="fv_display_600"]
+base_font = ExtResource("2_font")
+fallbacks = Array[Font]([ExtResource("3_font")])
+
+[sub_resource type="FontVariation" id="fv_ui_700"]
+base_font = ExtResource("4_font")
+
+[sub_resource type="FontVariation" id="fv_ui_600"]
+base_font = ExtResource("3_font")
+
+[sub_resource type="FontVariation" id="fv_label_600"]
+base_font = ExtResource("5_font")
+fallbacks = Array[Font]([ExtResource("3_font")])
+
+[sub_resource type="FontVariation" id="fv_data_500"]
+base_font = ExtResource("6_font")
+fallbacks = Array[Font]([ExtResource("7_font")])
+
+[resource]
+default_font = SubResource("fv_ui_400")
+default_font_size = 15
+Label/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+Panel/styles/panel = SubResource("sb_panel")
+PanelContainer/styles/panel = SubResource("sb_panel")
+ReadoutXL/base_type = &"Label"
+ReadoutXL/fonts/font = SubResource("fv_display_600")
+ReadoutXL/font_sizes/font_size = 104
+ReadoutXL/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+ReadoutL/base_type = &"Label"
+ReadoutL/fonts/font = SubResource("fv_display_600")
+ReadoutL/font_sizes/font_size = 56
+ReadoutL/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+ReadoutM/base_type = &"Label"
+ReadoutM/fonts/font = SubResource("fv_display_600")
+ReadoutM/font_sizes/font_size = 34
+ReadoutM/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+ReadoutS/base_type = &"Label"
+ReadoutS/fonts/font = SubResource("fv_display_600")
+ReadoutS/font_sizes/font_size = 22
+ReadoutS/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+TitleL/base_type = &"Label"
+TitleL/fonts/font = SubResource("fv_ui_700")
+TitleL/font_sizes/font_size = 28
+TitleL/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+TitleM/base_type = &"Label"
+TitleM/fonts/font = SubResource("fv_ui_600")
+TitleM/font_sizes/font_size = 20
+TitleM/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+TitleS/base_type = &"Label"
+TitleS/fonts/font = SubResource("fv_ui_600")
+TitleS/font_sizes/font_size = 16
+TitleS/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+Body/base_type = &"Label"
+Body/fonts/font = SubResource("fv_ui_400")
+Body/font_sizes/font_size = 15
+Body/colors/font_color = Color(0.94902, 0.956863, 0.945098, 1)
+BodyS/base_type = &"Label"
+BodyS/fonts/font = SubResource("fv_ui_400")
+BodyS/font_sizes/font_size = 13
+BodyS/colors/font_color = Color(0.658824, 0.686275, 0.662745, 1)
+Caps/base_type = &"Label"
+Caps/fonts/font = SubResource("fv_label_600")
+Caps/font_sizes/font_size = 12
+Caps/colors/font_color = Color(0.517647, 0.545098, 0.52549, 1)
+Micro/base_type = &"Label"
+Micro/fonts/font = SubResource("fv_label_600")
+Micro/font_sizes/font_size = 11
+Micro/colors/font_color = Color(0.517647, 0.545098, 0.52549, 1)
+Data/base_type = &"Label"
+Data/fonts/font = SubResource("fv_data_500")
+Data/font_sizes/font_size = 14
+Data/colors/font_color = Color(0.788235, 0.807843, 0.784314, 1)
+DataS/base_type = &"Label"
+DataS/fonts/font = SubResource("fv_data_500")
+DataS/font_sizes/font_size = 12
+DataS/colors/font_color = Color(0.658824, 0.686275, 0.662745, 1)
+Plate/base_type = &"PanelContainer"
+Plate/styles/panel = SubResource("sb_plate")
+Strip/base_type = &"PanelContainer"
+Strip/styles/panel = SubResource("sb_strip")
+HintBar/base_type = &"PanelContainer"
+HintBar/styles/panel = SubResource("sb_hint")
+KeyCap/base_type = &"PanelContainer"
+KeyCap/styles/panel = SubResource("sb_key")
+ChipAccent/base_type = &"PanelContainer"
+ChipAccent/styles/panel = SubResource("sb_chip_accent")

@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>레이스 · 주행 HUD — 피트 월 목업</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="base.css">
+<style>
+  /* 주행 중에는 위 띠가 얇은 세션 띠로 바뀐다(몰입 상태) */
+  .strip { position: absolute; left: 0; top: 0; width: 1920px; height: 44px; z-index: var(--z-nav); display: flex; align-items: center; background: var(--c-bg-void); border-bottom: 1px solid var(--c-line-strong); }
+  .strip .brand { padding: 0 20px 0 32px; }
+  .strip .brand .mark { width: 30px; height: 22px; font-size: 13px; line-height: 22px; }
+  .crumb { display: flex; align-items: center; gap: 10px; font: 500 13px/1 var(--font-ui); color: var(--c-text-3); }
+  .crumb b { color: var(--c-text); font-weight: 600; }
+  .crumb i { font-style: normal; color: var(--c-text-4); }
+  .strip .mid { position: absolute; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 14px; font: 600 13px/1 var(--font-ui); }
+  .strip .right { margin-left: auto; display: flex; gap: 8px; padding-right: 32px; }
+  .strip .btn { height: 28px; }
+  .strip .btn .key { margin: 0 0 0 4px; height: 18px; line-height: 15px; }
+
+  #scene { position: absolute; left: 0; top: 44px; }
+  .vig { position: absolute; left: 0; top: 44px; width: 1920px; height: 1120px; pointer-events: none;
+    background: linear-gradient(180deg, rgba(7,8,8,.72) 0, rgba(7,8,8,0) 20%, rgba(7,8,8,0) 66%, rgba(7,8,8,.86) 100%),
+                linear-gradient(90deg, rgba(7,8,8,.5) 0, rgba(7,8,8,0) 22%, rgba(7,8,8,0) 78%, rgba(7,8,8,.5) 100%); }
+
+  .plate { position: absolute; z-index: var(--z-hud); background: var(--c-bg-overlay); border: 1px solid var(--c-line-strong); backdrop-filter: blur(8px); }
+  .plate .cap { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-bottom: 1px solid var(--c-line); font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-3); white-space: nowrap; }
+  .plate .cap .r { margin-left: auto; font: var(--t-data-s); color: var(--c-text-4); }
+  .lbl { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-3); }  /* 3D 위 판에서는 라벨도 한 단 밝게 */
+
+  /* 세션 판 */
+  #session { left: 32px; top: 68px; width: 404px; }
+  #session .top { display: flex; align-items: center; gap: 10px; padding: 12px 14px 0; }
+  #session .clock { display: flex; align-items: baseline; gap: 10px; padding: 10px 14px 4px; }
+  #session .clock .t { font: var(--t-readout-l); letter-spacing: .01em; }
+  #session .sched { margin: 6px 14px 0; position: relative; height: 26px; }
+  #session .sched .trk { position: absolute; left: 0; right: 0; top: 8px; height: 8px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); }
+  #session .sched .boxes { position: absolute; left: 0; top: 8px; height: 8px; width: 55.56%; background: repeating-linear-gradient(-60deg, var(--c-ent-box) 0 4px, transparent 4px 8px); opacity: .85; }
+  #session .sched .now { position: absolute; top: 2px; width: 2px; height: 20px; background: var(--c-text); left: 43.45%; }
+  #session .sched .fill { position: absolute; left: 0; top: 8px; height: 8px; width: 43.45%; background: rgba(242,244,241,.28); }
+  #session .legend { display: flex; justify-content: space-between; padding: 2px 14px 10px; font: 500 12px/16px var(--font-ui); color: var(--c-text-3); }
+  #session .score { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--c-line); }
+  #session .score > div { padding: 10px 14px 12px; }
+  #session .score > div + div { border-left: 1px solid var(--c-line); }
+  #session .score .v { font: var(--t-readout-m); margin-top: 6px; display: flex; align-items: baseline; gap: 6px; }
+  #session .score .v small { font: 500 12px/1 var(--font-ui); color: var(--c-text-3); }
+
+  /* 랩 타이밍 */
+  #timing { left: 690px; top: 68px; width: 540px; }
+  #timing .row1 { display: grid; grid-template-columns: 84px 1fr 150px; align-items: stretch; }
+  #timing .lapno { background: var(--c-text); color: var(--c-bg-void); display: flex; flex-direction: column; align-items: center; justify-content: center; clip-path: polygon(0 0, 100% 0, 82% 100%, 0 100%); }
+  #timing .lapno span { font: 700 11px/1 var(--font-label); letter-spacing: .1em; }
+  #timing .lapno b { font: 700 40px/1 var(--font-display); margin-top: 2px; }
+  #timing .cur { padding: 10px 6px 8px 10px; }
+  #timing .cur .t { font: var(--t-readout-l); }
+  #timing .delta { padding: 10px 14px 8px; border-left: 1px solid var(--c-line); text-align: right; }
+  #timing .delta .t { font: var(--t-readout-m); color: var(--c-time-own); margin-top: 8px; }
+  #timing .sectors { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 0 12px 10px; }
+  #timing .sectors > div { border-top: 4px solid var(--c-line-strong); padding-top: 5px; display: flex; justify-content: space-between; align-items: baseline; font: var(--t-data-s); }
+  #timing .sectors .s-own { border-color: var(--c-time-own); } #timing .sectors .s-best { border-color: var(--c-time-best); }
+  #timing .sectors .live { border-image: linear-gradient(90deg, var(--c-text) 31%, var(--c-line-strong) 31%) 1; }
+  #timing .refs { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--c-line); }
+  #timing .refs > div { padding: 8px 12px 9px; display: flex; justify-content: space-between; align-items: baseline; }
+  #timing .refs > div + div { border-left: 1px solid var(--c-line); }
+  #timing .refs b { font: var(--t-readout-s); }
+
+  /* 미니맵 + 바퀴 기록 */
+  #map { right: 32px; top: 68px; width: 372px; }
+  #laps { right: 32px; top: 404px; width: 372px; }
+  #laps table { width: 100%; }
+  #laps td { height: 30px; padding: 0 12px; border-bottom: 1px solid var(--c-line); font: var(--t-body-s); white-space: nowrap; }
+  #laps tr:last-child td { border-bottom: 0; }
+  #laps td.n { font: 600 20px/1 var(--font-display); text-align: right; letter-spacing: .01em; }
+  #laps td.l { width: 44px; font: 700 13px/1 var(--font-display); color: var(--c-text-3); }
+  #laps .mk { display: inline-block; width: 9px; height: 9px; margin-right: 8px; background: var(--c-ok); }
+  #laps .mk.x { background: none; position: relative; }
+  #laps .mk.x::before, #laps .mk.x::after { content: ""; position: absolute; left: -1px; top: 3.5px; width: 11px; height: 2px; background: var(--c-danger); transform: rotate(45deg); }
+  #laps .mk.x::after { transform: rotate(-45deg); }
+
+  /* 드라이버 판 */
+  #driver { left: 32px; bottom: 60px; width: 404px; }
+  #driver dt, #laps td.l { color: var(--c-text-3); }
+  #driver .who { display: flex; align-items: center; gap: 12px; padding: 12px 14px 10px; }
+  #driver .who .sig { width: 44px; height: 44px; border: 1px solid var(--c-accent-line); background: var(--c-accent-tint); display: grid; place-items: center; font: 700 20px/1 var(--font-display); color: var(--c-accent); }
+  #driver .who b { font: var(--t-title-s); display: block; }
+  #driver .who span { font: var(--t-body-s); color: var(--c-text-3); }
+  #driver dl { display: grid; grid-template-columns: 96px 1fr auto; row-gap: 8px; align-items: center; padding: 4px 14px 12px; }
+  #driver dt { font: var(--t-label); letter-spacing: var(--ls-label-ko); color: var(--c-text-4); }
+  #driver dd { font: var(--t-data-s); color: var(--c-text-2); }
+  #driver .budget { position: relative; height: 8px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); margin-right: 12px; }
+  #driver .budget i { position: absolute; left: 0; top: 0; bottom: 0; width: 24.8%; background: var(--c-accent); }
+  #driver .budget u { position: absolute; left: 60%; top: -4px; bottom: -4px; width: 1px; background: var(--c-warn); }
+  #layers { display: flex; gap: 5px; padding: 10px 12px 12px; border-top: 1px solid var(--c-line); }
+  #layers .tg { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 6px 0 3px; white-space: nowrap; border: 1px solid var(--c-line-strong); border-radius: 2px; font: 600 12px/1 var(--font-ui); color: var(--c-text-3); }
+  #layers .tg .key { margin: 0; }
+  #layers .tg.on { color: var(--c-text); border-color: var(--c-text-3); }
+  #layers .tg.on::after { content: ""; width: 8px; height: 8px; background: var(--sw, var(--c-accent)); }
+
+  /* 계기판 */
+  #dash { left: 560px; bottom: 60px; width: 800px; height: 196px; display: grid; grid-template-columns: 196px 1fr 196px; }
+  #dash > div + div { border-left: 1px solid var(--c-line); }
+  #dash .mid { display: flex; flex-direction: column; }
+  #dash .spd { flex: 1; display: flex; align-items: flex-end; justify-content: center; gap: 12px; padding-bottom: 2px; }
+  #dash .spd .v { font: var(--t-readout-xl); display: flex; }
+  #dash .spd .v span { display: inline-block; width: 50px; text-align: center; } #dash .spd .v span.p { width: 22px; }
+  #dash .spd .u { padding-bottom: 12px; text-align: left; }
+  #dash .spd .u b { display: block; font: 700 18px/1 var(--font-display); letter-spacing: .04em; }
+  #dash .spd .u span { font: var(--t-data-s); color: var(--c-accent); display: block; margin-top: 6px; white-space: nowrap; }
+  #dash .steer { padding: 6px 20px 12px; border-top: 1px solid var(--c-line); }
+  #dash .steer .hd { display: flex; justify-content: space-between; font: var(--t-data-s); color: var(--c-text-3); margin-bottom: 5px; }
+  #dash .steer .hd b { color: var(--c-text); font-weight: 500; }
+  #dash .steer .trk { position: relative; height: 12px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); }
+  #dash .steer .trk::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--c-text-3); }
+  #dash .steer .act { position: absolute; top: 0; bottom: 0; right: 50%; width: 15.8%; background: var(--c-text-2); }
+  #dash .steer .cmd { position: absolute; top: -4px; bottom: -4px; width: 3px; background: var(--c-accent); left: calc(50% - 19.2%); }
+  #dash .side { padding: 10px 14px; position: relative; }
+  #dash .side .lbl { display: block; }
+  #dash .acc { display: flex; gap: 14px; align-items: flex-end; height: 128px; margin-top: 8px; }
+  #dash .acc .col { position: relative; width: 22px; height: 128px; background: var(--c-bg-well); border: 1px solid var(--c-line-strong); }
+  #dash .acc .col::before { content: ""; position: absolute; left: -4px; right: -4px; top: 50%; height: 1px; background: var(--c-text-3); }
+  #dash .acc .col i { position: absolute; left: 0; right: 0; bottom: 50%; height: 26%; background: var(--c-text-2); }
+  #dash .acc .col u { position: absolute; left: -4px; right: -4px; bottom: calc(50% + 31%); height: 3px; background: var(--c-accent); }
+  #dash .acc .rd { font: var(--t-data-s); color: var(--c-text-3); line-height: 20px; }
+  #dash .acc .rd b { display: block; font: 600 26px/1 var(--font-display); color: var(--c-text); }
+
+  /* LiDAR 스코프 */
+  #lidar { right: 32px; bottom: 60px; width: 372px; }
+
+  /* 장면 속 꼬리표 */
+  .world { position: absolute; z-index: var(--z-hud); transform: translate(-50%, -100%); display: flex; flex-direction: column; align-items: center; white-space: nowrap; }
+  .world .b { background: var(--c-bg-overlay); border: 1px solid var(--c-ent-box); padding: 5px 9px 4px; font: 600 12px/1.2 var(--font-ui); display: flex; gap: 8px; align-items: baseline; }
+  .world .b .num { color: var(--c-ent-box); font-size: 13px; }
+  .world .stem { width: 1px; height: 34px; background: var(--c-ent-box); }
+  #ticker { position: absolute; left: 690px; top: 244px; z-index: var(--z-hud); display: flex; align-items: stretch; }
+  #ticker .a { background: var(--c-time-best); color: #120722; font: 700 13px/1 var(--font-label); letter-spacing: .06em; padding: 9px 16px 8px 12px; clip-path: polygon(0 0, 100% 0, calc(100% - 9px) 100%, 0 100%); }
+  #ticker .b { background: var(--c-bg-overlay); border: 1px solid var(--c-line-strong); border-left: 0; margin-left: -5px; padding: 0 14px 0 16px; display: flex; align-items: center; gap: 10px; font: 500 13px/1 var(--font-ui); }
+  #ticker .b b { font: 600 20px/1 var(--font-display); color: var(--c-time-best); }
+</style>
+</head>
+<body>
+  <header class="strip">
+    <div class="brand"><div class="mark">1/10</div></div>
+    <div class="crumb">레이스 <i>/</i> <b>예선 형식</b> <i>/</i> 2026 한국 대회장 <i>·</i> 상자 3개, 50초에 치움 <i>·</i> 그립 0.86 <span class="src e" style="margin-left:2px"><i></i>추정</span></div>
+    <div class="mid"><i class="dot lime"></i>주행 중<span class="num dim" style="font-size:12px">배속 1.00×</span></div>
+    <div class="right">
+      <button class="btn">일시정지<span class="key">Space</span></button>
+      <button class="btn">처음부터<span class="key">R</span></button>
+      <button class="btn sel">끝내고 결과 보기<span class="key">Esc</span></button>
+    </div>
+  </header>
+
+  <canvas id="scene" width="1920" height="1120"></canvas>
+  <div class="vig"></div>
+
+  <!-- 세션: 규칙이 곧 화면 -->
+  <section class="plate ticks" id="session">
+    <div class="top"><span class="slanttag lime">예선 형식</span><span class="lbl">타임 트라이얼 · 90초 한 번</span></div>
+    <div class="clock"><span class="t disp">0:50.9</span><span class="lbl">남은 시간</span></div>
+    <div class="sched"><div class="trk"></div><div class="boxes"></div><div class="fill"></div><div class="now"></div></div>
+    <div class="legend"><span>상자 3개 놓임</span><span><b class="num" style="color:var(--c-ent-box)">10.9초</b> 뒤 치움</span><span class="num dim2">1:30</span></div>
+    <div class="score">
+      <div><span class="lbl">① 무충돌 연속 바퀴</span><div class="v disp">3 <small>바퀴 · 이어가는 중</small></div></div>
+      <div><span class="lbl">② 최고 랩</span><div class="v disp best">9.268 <small>초 · 4번째 바퀴</small></div></div>
+    </div>
+  </section>
+
+  <!-- 랩 타이밍 -->
+  <section class="plate" id="timing">
+    <div class="row1">
+      <div class="lapno"><span>바퀴</span><b>5</b></div>
+      <div class="cur"><span class="lbl">이번 바퀴</span><div class="t disp">0:00.612</div></div>
+      <div class="delta"><span class="lbl">최고 랩 대비</span><div class="t disp">−0.021</div></div>
+    </div>
+    <div class="sectors">
+      <div class="live"><span class="dim">구간 1</span><span class="dim2">진행 중</span></div>
+      <div class="s-best"><span class="dim">구간 2</span><span class="best">3.402</span></div>
+      <div class="s-best"><span class="dim">구간 3</span><span class="best">2.885</span></div>
+    </div>
+    <div class="refs">
+      <div><span class="lbl">직전</span><b class="disp best">9.268</b></div>
+      <div><span class="lbl">이 세션 최고</span><b class="disp best">9.268</b></div>
+      <div><span class="lbl">이 장소 내 기록</span><b class="disp">9.214</b></div>
+    </div>
+  </section>
+
+  <div id="ticker"><div class="a">세션 최고</div><div class="b">4번째 바퀴 <b>9.268</b> <span class="dim">직전보다 −0.058</span></div></div>
+
+  <!-- 미니맵 -->
+  <section class="plate" id="map">
+    <div class="cap">코스 · 46.7 m · 구간 3개<span class="r">북쪽 위</span></div>
+    <svg id="mini" width="370" height="296"></svg>
+  </section>
+  <section class="plate" id="laps">
+    <div class="cap">바퀴 기록<span class="r"><b class="ok">■</b> 무충돌 &nbsp;<b class="danger">✕</b> 접촉</span></div>
+    <table>
+      <tr><td class="l">1</td><td><i class="mk x"></i>상자 접촉 · 약함 <span class="dim2">(구간 1)</span></td><td class="n">10.412</td></tr>
+      <tr><td class="l">2</td><td><i class="mk"></i>무충돌</td><td class="n own">9.487</td></tr>
+      <tr><td class="l">3</td><td><i class="mk"></i>무충돌</td><td class="n own">9.326</td></tr>
+      <tr><td class="l">4</td><td><i class="mk"></i>무충돌</td><td class="n best">9.268</td></tr>
+      <tr><td class="l lime">5</td><td class="dim">달리는 중</td><td class="n dim">—</td></tr>
+    </table>
+  </section>
+
+  <!-- 드라이버 -->
+  <section class="plate" id="driver">
+    <div class="who"><div class="sig">43</div><div><b>미르 43</b><span>학습된 드라이버 · 실차 2호(AGX Orin)에 탑승</span></div></div>
+    <dl>
+      <dt>판단 시간</dt><dd><div class="budget"><i></i><u></u></div></dd><dd>6.2 / 25 ms</dd>
+      <dt>내는 것</dt><dd style="grid-column: span 2">1.0초 앞까지 궤적 10점 + 속도</dd>
+      <dt>따라가는 방식</dt><dd style="grid-column: span 2">지도 기반 추종 · 지연 30 ms 반영</dd>
+    </dl>
+    <div id="layers">
+      <span class="tg on"><span class="key">T</span>궤적</span>
+      <span class="tg on" style="--sw: var(--c-ent-lidar)"><span class="key">L</span>LiDAR</span>
+      <span class="tg on" style="--sw: var(--c-text-3)"><span class="key">J</span>자취</span>
+      <span class="tg"><span class="key">G</span>그립</span>
+      <span class="tg"><span class="key">N</span>근거</span>
+    </div>
+  </section>
+
+  <!-- 계기판 -->
+  <section class="plate ticks" id="dash">
+    <div class="side">
+      <span class="lbl">가속 · 감속</span>
+      <div class="acc">
+        <div class="col"><i></i><u></u></div>
+        <div class="rd"><b>+1.3</b>m/s² 실제<br><span class="lime">+1.6 요구</span></div>
+      </div>
+    </div>
+    <div class="mid">
+      <div class="spd">
+        <div class="v"><span>5</span><span class="p">.</span><span>8</span><span>4</span></div>
+        <div class="u"><b>m/s</b><span>계획 6.10</span></div>
+      </div>
+      <div class="steer">
+        <div class="hd"><span>◀ 왼쪽 24°</span><span>조향 <b>−7.6°</b> · <span class="lime">요구 −9.2°</span></span><span>오른쪽 24° ▶</span></div>
+        <div class="trk"><div class="act"></div><div class="cmd"></div></div>
+      </div>
+    </div>
+    <div class="side">
+      <span class="lbl">타이어 한계 사용</span>
+      <svg id="gg" width="168" height="150" style="margin-top:4px"></svg>
+    </div>
+  </section>
+
+  <!-- LiDAR -->
+  <section class="plate" id="lidar">
+    <div class="cap">LiDAR · 1081줄 · 초당 40번<span class="r">가장 가까움 <b id="near" style="color:var(--c-text)"></b></span></div>
+    <svg id="scope" width="370" height="226"></svg>
+  </section>
+
+  <div class="world" id="boxtag"><div class="b">상자 <span class="num">10.9초 뒤 치움</span></div><div class="stem"></div></div>
+
+<script src="scene.js"></script>
+<script>
+(function () {
+  const P = PW, cv = document.getElementById('scene');
+  const r = P.race(cv, { frac: 0.063, oy: -36 });
+  // 상자 꼬리표
+  const b = P.boxes[0], q = r.S.proj([b.x, b.y, b.sz + 0.02]);
+  const tag = document.getElementById('boxtag'); tag.style.left = q[0] + 'px'; tag.style.top = (44 + q[1]) + 'px';
+
+  // 미니맵
+  const m = P.mapPaths(0, 0, 370, 296, 22), lp = []; for (let i = 0; i < P.track.N; i++) lp.push(P.linePoint(i));
+  let h = `<path d="${m.left}${m.right}" fill="rgba(242,244,241,0.05)" fill-rule="evenodd" stroke="none"/>`;
+  h += `<path d="${m.left}" fill="none" stroke="var(--c-ent-duct)" stroke-width="2.2" stroke-linejoin="round"/><path d="${m.right}" fill="none" stroke="var(--c-ent-duct)" stroke-width="2.2" stroke-linejoin="round"/>`;
+  // 구간 경계
+  [0.02, 0.34, 0.70].forEach((f, k) => { const a = P.at(f), n = P.track.nor[a.i], hw = P.track.hw[a.i]; const p0 = m.T([a.x + n[0] * hw, a.y + n[1] * hw]), p1 = m.T([a.x - n[0] * hw, a.y - n[1] * hw]); h += `<line x1="${p0[0]}" y1="${p0[1]}" x2="${p1[0]}" y2="${p1[1]}" stroke="var(--c-text)" stroke-width="${k ? 1 : 3}" ${k ? 'stroke-dasharray="3 3"' : ''}/>`; const sg = ((a.x - 6.4) * n[0] + (a.y - 4.6) * n[1]) > 0 ? 1 : -1; const c = m.T([a.x + sg * n[0] * (hw + 0.8), a.y + sg * n[1] * (hw + 0.8)]); const e = sg > 0 ? p0 : p1, lab = k ? String(k + 1) : '출발', bw = k ? 16 : 30; h += `<rect x="${e[0] - bw / 2}" y="${e[1] - 8 + (c[1] - e[1]) * 0.55}" width="${bw}" height="16" fill="var(--c-text)"/><text x="${e[0]}" y="${e[1] + 4 + (c[1] - e[1]) * 0.55}" text-anchor="middle" fill="var(--c-bg-void)" font-family="IBM Plex Sans KR" font-weight="700" font-size="11">${lab}</text>`; });
+  // 지나온 자취(이번 세션 직전 바퀴)
+  h += `<path d="${m.path(lp)}" fill="none" stroke="rgba(242,244,241,0.28)" stroke-width="1"/>`;
+  // 궤적
+  const pl = []; for (let k = 0; k <= 50; k++) pl.push(P.linePoint(r.i0 + k)); h += `<path d="${m.path(pl, false)}" fill="none" stroke="var(--c-ent-plan)" stroke-width="3" stroke-linecap="round"/>`;
+  P.boxes.forEach(bx => { const c = m.T([bx.x, bx.y]); h += `<rect x="${c[0] - 4.5}" y="${c[1] - 4.5}" width="9" height="9" fill="var(--c-ent-box)" transform="rotate(${-bx.yaw * 57.3} ${c[0]} ${c[1]})"/>`; });
+  const c = m.T([r.pose.x, r.pose.y]), ang = -r.pose.yaw * 57.3;
+  h += `<g transform="translate(${c[0]} ${c[1]}) rotate(${ang})"><circle r="11" fill="none" stroke="var(--c-text)" stroke-opacity=".5"/><path d="M9 0 L-6 -5.5 L-3 0 L-6 5.5Z" fill="var(--c-text)"/></g>`;
+  document.getElementById('mini').innerHTML = h;
+
+  // LiDAR 스코프: 실제로 쏜 광선
+  const fw = [Math.cos(r.pose.yaw), Math.sin(r.pose.yaw)], sc = P.scan({ x: r.pose.x + fw[0] * 0.297, y: r.pose.y + fw[1] * 0.297, yaw: r.pose.yaw });
+  const cx = 185, cy = 150, R = 136, RM = 4; // 4 m까지 그림
+  const pol = (a, d) => [cx - Math.sin(a) * d / RM * R, cy - Math.cos(a) * d / RM * R];
+  let g = '';
+  for (const d of [1, 2, 3, 4]) { const a0 = pol(-2.356, d), a1 = pol(2.356, d); g += `<path d="M${a0[0].toFixed(1)} ${a0[1].toFixed(1)} A${d / RM * R} ${d / RM * R} 0 1 0 ${a1[0].toFixed(1)} ${a1[1].toFixed(1)}" fill="none" stroke="var(--c-line-strong)" stroke-dasharray="2 4"/>`; const t = pol(0, d); g += `<text x="${t[0] + 4}" y="${t[1] - 3}" fill="var(--c-text-4)" font-family="IBM Plex Mono" font-size="10">${d} m</text>`; }
+  for (const a of [-2.356, 2.356]) { const e = pol(a, RM); g += `<line x1="${cx}" y1="${cy}" x2="${e[0]}" y2="${e[1]}" stroke="var(--c-line-strong)"/>`; }
+  { const e0 = pol(2.356, 1.2), e1 = pol(-2.356, 1.2); g += `<path d="M${cx} ${cy} L${e0[0]} ${e0[1]} A${1.2 / RM * R} ${1.2 / RM * R} 0 0 0 ${e1[0]} ${e1[1]}Z" fill="url(#hatch)" stroke="none"/>`; }
+  let fill = `M${cx} ${cy}`, near = 99, nearA = 0;
+  sc.forEach(p => { const d = Math.min(p.r, RM), e = pol(p.ang, d); fill += `L${e[0].toFixed(1)} ${e[1].toFixed(1)}`; if (p.hit && p.r < near) { near = p.r; nearA = p.ang; } });
+  g += `<path d="${fill}Z" fill="rgba(127,227,242,0.07)"/>`;
+  sc.forEach((p, i) => { if (!p.hit || p.r > RM || i % 2) return; const e = pol(p.ang, p.r); g += `<rect x="${(e[0] - 1).toFixed(1)}" y="${(e[1] - 1).toFixed(1)}" width="2" height="2" fill="${p.kind === 1 ? '#fff' : 'var(--c-ent-lidar)'}"/>`; });
+  const ne = pol(nearA, near); g += `<line x1="${cx}" y1="${cy}" x2="${ne[0]}" y2="${ne[1]}" stroke="var(--c-text)" stroke-width="1"/><circle cx="${ne[0]}" cy="${ne[1]}" r="4" fill="none" stroke="var(--c-text)"/>`;
+  g += `<path d="M${cx} ${cy - 9} l5 14 l-5 -3 l-5 3Z" fill="var(--c-text)"/>`;
+  g += `<text x="${cx}" y="${cy + 58}" text-anchor="middle" fill="var(--c-warn)" font-family="IBM Plex Sans KR" font-weight="600" font-size="11">뒤 90°는 안 보임</text>`;
+  document.getElementById('scope').innerHTML = `<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="rgba(255,184,31,.5)" stroke-width="1"/></pattern></defs>` + g;
+  document.getElementById('near').textContent = near.toFixed(2) + ' m · ' + (nearA < 0 ? '오른쪽' : '왼쪽');
+
+  // 타이어 한계 원: 최근 2초의 가로·세로 가속도
+  const R2 = P.rng(11), gx = 84, gy = 74, GR = 62; let s = `<circle cx="${gx}" cy="${gy}" r="${GR}" fill="none" stroke="var(--c-line-strong)"/><circle cx="${gx}" cy="${gy}" r="${GR * 0.95}" fill="none" stroke="var(--c-warn)" stroke-dasharray="3 3" opacity=".8"/><line x1="${gx - GR}" y1="${gy}" x2="${gx + GR}" y2="${gy}" stroke="var(--c-line)"/><line x1="${gx}" y1="${gy - GR}" x2="${gx}" y2="${gy + GR}" stroke="var(--c-line)"/>`;
+  let px = 0.1, py = 0.5, d = '';
+  for (let k = 0; k < 80; k++) { const t = k / 79; const tx = 0.62 * Math.sin(t * 2.4 + 0.2) * (0.5 + t * 0.6), ty = 0.55 * Math.cos(t * 3.1) * (1 - t * 0.6) + 0.1; px += (tx - px) * 0.25 + (R2() - 0.5) * 0.05; py += (ty - py) * 0.25 + (R2() - 0.5) * 0.05; d += (k ? 'L' : 'M') + (gx + px * GR).toFixed(1) + ' ' + (gy - py * GR).toFixed(1); }
+  s += `<path d="${d}" fill="none" stroke="var(--c-text-3)" stroke-width="1"/><circle cx="${gx + px * GR}" cy="${gy - py * GR}" r="5" fill="var(--c-text)"/>`;
+  s += `<text x="${gx + GR + 6}" y="${gy - GR + 12}" fill="var(--c-text)" font-family="Saira Condensed" font-weight="600" font-size="26" text-anchor="end">71%</text>`;
+  s += `<text x="${gx - GR}" y="${gy + GR + 12}" fill="var(--c-text-4)" font-family="IBM Plex Sans KR" font-size="11">점선 = 한계의 95%</text>`;
+  document.getElementById('gg').innerHTML = s;
+})();
+</script>
+<script src="chrome.js"></script>
+<script>
+  // 주행 중에는 아래 키 안내 띠만 쓴다
+  (function () { const h = document.createElement('footer'); h.className = 'hints';
+    h.innerHTML = [['C', '카메라 · 추격'], ['[ ]', '보는 차 바꾸기'], ['− +', '배속'], ['F', '되감아 다시 보기'], ['M', '직접 몰기'], ['B', '이 장면 표시해 두기'], ['F9', '녹화']].map(x => `<span><span class="key">${x[0]}</span>${x[1]}</span>`).join('') + '<span class="sp diag">시뮬 서버 · 연구실 PC · 화면 60 fps · 물리 초당 400번</span>';
+    document.body.appendChild(h); })();
+</script>
+</body>
+</html>

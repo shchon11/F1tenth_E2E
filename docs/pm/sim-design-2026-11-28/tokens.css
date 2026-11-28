@@ -1,0 +1,199 @@
+/* =====================================================================
+   피트 월(Pit Wall) 디자인 토큰  ·  2026-11-28  ·  v0.1
+   - 이 파일이 색·글자·간격·모션의 단일 기준이다. 컴포넌트는 여기 변수만 쓴다.
+   - 3단: (1) 원색 팔레트 --p-*  (2) 의미 토큰 --c-* (컴포넌트는 이것만)  (3) 치수·글자·모션
+   - 파란 강조색 없음. 강조는 "라임 라인"(정책이 낸 궤적의 색) 하나.
+   ===================================================================== */
+
+:root {
+  /* ---------- (1) 원색 팔레트 : 컴포넌트에서 직접 쓰지 말 것 ---------- */
+  /* 카본: 남색이 아닌, 아주 약하게 따뜻한 중성 흑연 */
+  --p-carbon-950: #070808;
+  --p-carbon-900: #0c0d0e;
+  --p-carbon-850: #111315;
+  --p-carbon-800: #16191b;
+  --p-carbon-750: #1d2023;
+  --p-carbon-700: #262a2d;
+  --p-carbon-600: #353a3e;
+  --p-carbon-500: #474d49;
+  /* 잉크: 종이 흰색(약간 따뜻함) */
+  --p-ink-100: #f2f4f1;
+  --p-ink-200: #c9cec8;
+  --p-ink-300: #a8afa9;
+  --p-ink-400: #848b86;
+  /* 신호색 */
+  --p-lime-300: #dcf97a;
+  --p-lime-500: #c6f135;   /* 라임 라인 */
+  --p-lime-700: #8fae22;
+  --p-green-500: #2edc8c;
+  --p-purple-500: #b46cff;
+  --p-amber-500: #ffb81f;
+  --p-red-500: #ff4d3d;
+  --p-cyan-400: #7fe3f2;
+  --p-pink-400: #ff6fb5;
+  --p-duct-300: #c3c8cb;   /* 덕트 호스 은회색 */
+  --p-duct-600: #5a5f63;
+  --p-box-400: #c9a26b;    /* 골판지 상자 */
+
+  /* ---------- (2) 의미 토큰 ---------- */
+  /* 바탕 */
+  --c-bg-void: var(--p-carbon-950);      /* 3D 뒤, 화면 가장 아래 */
+  --c-bg-app: var(--p-carbon-900);       /* 앱 바탕 */
+  --c-bg-panel: var(--p-carbon-850);     /* 패널 */
+  --c-bg-raised: var(--p-carbon-800);    /* 패널 위 한 단(행 호버, 머리줄) */
+  --c-bg-well: #090a0b;                  /* 입력칸·차트 바닥(패널보다 어둡다) */
+  --c-bg-hover: var(--p-carbon-750);
+  --c-bg-overlay: rgba(9, 10, 11, 0.82); /* 3D 위 HUD 판 */
+  --c-scrim: rgba(4, 5, 5, 0.66);
+
+  /* 선 */
+  --c-line: rgba(242, 244, 241, 0.09);        /* 기본 가는 선 */
+  --c-line-strong: rgba(242, 244, 241, 0.2);  /* 구획·머리줄 */
+  --c-line-ink: var(--p-ink-100);             /* 시트 머리 굵은 선 */
+
+  /* 글자 */
+  --c-text: var(--p-ink-100);
+  --c-text-2: var(--p-ink-200);
+  --c-text-3: var(--p-ink-300);       /* 보조 설명 */
+  --c-text-4: var(--p-ink-400);       /* 라벨·단위. 패널 바탕 대비 5.3:1 (1차 비평에서 3.8:1 → 올림) */
+  --c-text-disabled: var(--p-carbon-500);
+  --c-text-on-accent: #0b0c0c;
+
+  /* 강조 = 라임 라인 : 선택, 주 행동, 정책이 낸 궤적 */
+  --c-accent: var(--p-lime-500);
+  --c-accent-hover: var(--p-lime-300);
+  --c-accent-press: var(--p-lime-700);
+  --c-accent-tint: rgba(198, 241, 53, 0.12);
+  --c-accent-line: rgba(198, 241, 53, 0.45);
+  --c-focus: var(--p-lime-300);
+
+  /* 기록 문법 (모터스포츠 타이밍 관례) */
+  --c-time-best: var(--p-purple-500);    /* 전체 최고 */
+  --c-time-own: var(--p-green-500);      /* 자기 최고·개선 */
+  --c-time-slower: var(--p-amber-500);   /* 개선 없음 */
+
+  /* 상태 */
+  --c-ok: var(--p-green-500);
+  --c-warn: var(--p-amber-500);
+  --c-danger: var(--p-red-500);
+  --c-ok-tint: rgba(46, 220, 140, 0.12);
+  --c-warn-tint: rgba(255, 184, 31, 0.12);
+  --c-danger-tint: rgba(255, 77, 61, 0.14);
+
+  /* 출처 배지: 색이 아니라 "채움의 양"이 믿음의 양. 가정과 하한만 주의색. */
+  --c-src-measured: var(--p-ink-100);    /* 실측 ■ 꽉 채움 */
+  --c-src-estimated: var(--p-ink-100);   /* 추정 ◧ 반 채움 */
+  --c-src-spec: var(--p-ink-200);        /* 규격 ▣ 점 찍힌 네모 (제조사 값. PM 결정 전 제안) */
+  --c-src-assumed: var(--p-amber-500);   /* 가정 □ 빈 칸 + 점선 */
+  --c-src-lower: var(--p-amber-500);     /* 하한만 ▬ 아래만 참 + 값 앞에 ≥ */
+
+  /* 장면 속 개체 (3D·미니맵·차트 공통) */
+  --c-ent-plan: var(--p-lime-500);       /* 드라이버가 낸 궤적 */
+  --c-ent-ego: var(--p-ink-100);         /* 내 차 */
+  --c-ent-rival: var(--p-pink-400);      /* 상대 차 */
+  --c-ent-lidar: var(--p-cyan-400);      /* LiDAR 점 */
+  --c-ent-duct: var(--p-duct-300);
+  --c-ent-box: var(--p-box-400);
+  --c-ent-contact: var(--p-red-500);
+
+  /* 차트 계열 순서: 1 지금 보는 것, 2 기준(점선), 3~6 비교 */
+  --c-series-1: var(--p-lime-500);
+  --c-series-2: var(--p-ink-200);
+  --c-series-3: var(--p-purple-500);
+  --c-series-4: var(--p-cyan-400);
+  --c-series-5: var(--p-amber-500);
+  --c-series-6: var(--p-pink-400);
+  --c-chart-grid: rgba(242, 244, 241, 0.07);
+  --c-chart-band: rgba(198, 241, 53, 0.14);   /* 신뢰 구간 띠 */
+
+  /* ---------- (3) 글자 ---------- */
+  --font-ui: "IBM Plex Sans KR", "Noto Sans KR", "Noto Sans CJK KR", "Apple SD Gothic Neo", sans-serif;
+  /* 라틴·숫자는 Saira, 한글은 Plex KR로 떨어진다 (스택 순서가 곧 혼식 규칙) */
+  --font-display: "Saira Condensed", "IBM Plex Sans KR", "Noto Sans KR", sans-serif;
+  --font-label: "Saira Semi Condensed", "IBM Plex Sans KR", "Noto Sans KR", sans-serif;
+  --font-data: "IBM Plex Mono", "IBM Plex Sans KR", ui-monospace, monospace;
+
+  /* 크기/행간 (1920×1200 기준. 1440 이하에서는 --scale 0.9) */
+  --t-readout-xl: 600 104px/0.9 var(--font-display);  /* HUD 속도 */
+  --t-readout-l: 600 56px/1 var(--font-display);      /* 랩 타임, 허브 큰 숫자 */
+  --t-readout-m: 600 34px/1 var(--font-display);
+  --t-readout-s: 600 22px/1 var(--font-display);
+  --t-title-l: 700 28px/36px var(--font-ui);          /* 화면 제목 */
+  --t-title-m: 600 20px/28px var(--font-ui);          /* 패널 제목 */
+  --t-title-s: 600 16px/24px var(--font-ui);
+  --t-body: 400 15px/24px var(--font-ui);             /* 본문 기본 (한글 15px) */
+  --t-body-s: 400 13px/20px var(--font-ui);
+  --t-label: 600 12px/16px var(--font-label);         /* 칸 이름, 표 머리 */
+  --t-micro: 600 11px/14px var(--font-label);         /* 눈금, 단위 */
+  --t-data: 500 14px/20px var(--font-data);           /* 표 숫자 */
+  --t-data-s: 500 12px/16px var(--font-data);
+  --ls-label: 0.06em;    /* 라벨 자간 (라틴 대문자·숫자 기준, 한글에는 0.02em) */
+  --ls-label-ko: 0.02em;
+
+  /* ---------- 간격·격자 ---------- */
+  --u: 4px;
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 64px;
+  --page-margin: 32px;
+  --gutter: 24px;
+  --cols: 12;
+  --nav-h: 56px;         /* 위 띠 */
+  --hint-h: 36px;        /* 아래 키 안내 띠 */
+  --row-h: 36px;         /* 시트 행 */
+  --row-h-dense: 28px;   /* 표 행 */
+  --control-h: 32px;
+  --control-h-l: 48px;   /* 주 행동 */
+
+  /* ---------- 모양 ---------- */
+  --radius-0: 0px;       /* 패널·판·표: 항상 직각 */
+  --radius-1: 2px;       /* 입력칸·칩·버튼 */
+  --slant: 14deg;        /* 사선 모티프(탭 표시, 태그, 구획 번호) */
+  --chamfer: 10px;       /* 주 행동 버튼의 깎은 모서리 */
+  --tick: 10px;          /* 뷰포트 모서리 눈금 길이 */
+  --line-w: 1px;
+  --line-w-head: 2px;
+
+  /* ---------- 깊이: 그림자 대신 선과 명도 ---------- */
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.6);   /* 팝업·메뉴에만 */
+  --glow-accent: 0 0 0 1px var(--c-accent), 0 0 18px rgba(198, 241, 53, 0.25);
+
+  /* ---------- 모션 ---------- */
+  --dur-1: 90ms;    /* 호버 */
+  --dur-2: 160ms;   /* 누름·선택 */
+  --dur-3: 280ms;   /* 판 등장(사선 와이프) */
+  --dur-4: 600ms;   /* 기록 숫자 확정 */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.6, 0, 0.2, 1);
+
+  /* ---------- 겹침 순서 ---------- */
+  --z-scene: 0; --z-hud: 10; --z-nav: 50; --z-pop: 100; --z-toast: 200; --z-modal: 300;
+}
+
+/* 시트(밝은 종이) 변형: 결과지·성적표·빌드 시트를 내보내거나 인쇄할 때만 */
+[data-theme="sheet"] {
+  --c-bg-app: #ecebe6;
+  --c-bg-panel: #f6f5f1;
+  --c-bg-raised: #ffffff;
+  --c-bg-well: #e4e3dd;
+  --c-bg-hover: #e9e8e2;
+  --c-line: rgba(12, 13, 14, 0.12);
+  --c-line-strong: rgba(12, 13, 14, 0.32);
+  --c-line-ink: #0c0d0e;
+  --c-text: #0c0d0e;
+  --c-text-2: #2b2f2c;
+  --c-text-3: #555b57;
+  --c-text-4: #626964;
+  --c-accent: #4f6600;            /* 종이 위에서는 어두운 라임 (대비 6.0:1) */
+  --c-accent-tint: rgba(143, 174, 34, 0.18);
+  --c-src-measured: #0c0d0e;
+  --c-src-estimated: #0c0d0e;
+  --c-src-assumed: #8a5600;
+  --c-time-best: #7a2fd0;
+  --c-time-own: #0a7445;
+  --c-time-slower: #8a5600;
+  --c-danger: #c8281a;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-1: 0ms; --dur-2: 0ms; --dur-3: 0ms; --dur-4: 0ms; }
+}

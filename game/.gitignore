@@ -1,0 +1,12 @@
+# Godot 바이너리(내려받은 고정 버전)와 엔진 캐시는 저장소에 넣지 않는다.
+# (*.import / *.uid 사이드카 파일은 Godot 관례대로 저장소에 둔다.)
+.godot_bin/
+.godot/
+# 화면 밖 캡처용 프로젝트 거울(tools/tenth.py가 만든다)
+.capture_host/
+# 실행 산출물(스크린샷·측정 결과·로그)
+out/
+*.log
+# 내보내기 결과
+build/
+export/
