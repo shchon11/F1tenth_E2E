@@ -1,0 +1,17 @@
+{
+ "display": "Korea 2026 (bag 스캔 지도)",
+ "note": "0827 fastest bag의 /scan+/odom으로 만든 지도 (깨끗한 3바퀴, 루프 닫기), bag /map과 차선 IoU 0.95",
+ "boundary": "duct",
+ "min_clearance": 0.35,
+ "seed_xy": [
+  0.0,
+  0.5
+ ],
+ "despeckle_m2": 0.15,
+ "direction": "ccw",
+ "from_ros_map": {
+  "keep_region": true
+ },
+ "source": {},
+ "slug": "korea26-scan"
+}
