@@ -534,6 +534,35 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         oh.addWidget(self.layout_chip, 1)
         h.addWidget(self.cb_obstacles, 1)
 
+        # -- the plan follower (11-28, the user: "콘솔에 제어기 고르는거는 씨발 어디갔어"): it lived only in the left panel's
+        # 구성 card, out of sight with the panel folded. Here in the bar, the same choice as `combo_follower` (kept in step
+        # both ways); on a running session a change starts it again with that follower.
+        self.cb_follower = QtWidgets.QWidget()
+        fh = QtWidgets.QHBoxLayout(self.cb_follower)
+        fh.setContentsMargins(0, 0, 0, 0)
+        fh.setSpacing(8)
+        sep_f = QtWidgets.QFrame()
+        sep_f.setObjectName("BarSep")
+        sep_f.setFrameShape(QtWidgets.QFrame.VLine)
+        sep_f.setFixedWidth(1)
+        fh.addWidget(sep_f)
+        fh.addWidget(lab("제어기"))
+        self.combo_follower_bar = QtWidgets.QComboBox()
+        self.combo_follower_bar.setFixedHeight(36)
+        self.combo_follower_bar.setMinimumWidth(170)
+        for text_, data_ in (("MAP (실차 방식)", "map"), ("MPC (모델 예측)", "mpc"), ("ideal (plan대로 정확히)", "ideal"),
+                             ("체크포인트대로", "auto")):
+            self.combo_follower_bar.addItem(text_, data_)
+        i_ = self.combo_follower.findData(self.combo_follower.currentData())
+        self.combo_follower_bar.setCurrentIndex(max(0, i_))
+        self.combo_follower_bar.setToolTip("정책이 낸 plan을 누가 따라가는지. MAP: 실차와 같은 제어기. MPC: 차 모델로 앞을 예측해 "
+                                           "따라감(콘솔에선 실제 시간보다 느리게 돎). ideal: 제어기 없이 plan을 정확히 그대로 "
+                                           "달림 -- 학습·시험 조건.\n주행 중에 바꾸면 그 제어기로 처음부터 다시 달립니다.")
+        self.combo_follower_bar.activated.connect(lambda _i: self._on_follower_bar())
+        self.combo_follower.currentIndexChanged.connect(lambda _i: self._sync_follower_bar())
+        fh.addWidget(self.combo_follower_bar)
+        h.addWidget(self.cb_follower, 0)
+
         # -- opponents
         self.cb_opponents = QtWidgets.QWidget()
         ph = QtWidgets.QHBoxLayout(self.cb_opponents)
@@ -630,6 +659,23 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         import random as _random
         self._set_seed(_random.randint(*self.SEED_RANGE))
         self._apply_seed()
+
+    def _on_follower_bar(self):
+        """the bar's follower picked: the left panel's box follows, and a running session starts again with it"""
+        d_ = self.combo_follower_bar.currentData()
+        i_ = self.combo_follower.findData(d_)
+        if i_ >= 0 and self.combo_follower.currentIndex() != i_:
+            self.combo_follower.setCurrentIndex(i_)
+        if self.state in (STATE_RUNNING, STATE_PAUSED):
+            self.viewport.notify(f"제어기 {self.combo_follower_bar.currentText()} — 처음부터 다시", "info", 1.8)
+            self._on_start()
+
+    def _sync_follower_bar(self):
+        i_ = self.combo_follower_bar.findData(self.combo_follower.currentData())
+        if i_ >= 0 and self.combo_follower_bar.currentIndex() != i_:
+            self.combo_follower_bar.blockSignals(True)
+            self.combo_follower_bar.setCurrentIndex(i_)
+            self.combo_follower_bar.blockSignals(False)
 
     def _on_seed_entered(self):
         if self._seed() != getattr(self, "_seed_applied", None):
