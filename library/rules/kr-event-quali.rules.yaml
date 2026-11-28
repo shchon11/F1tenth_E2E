@@ -1,0 +1,19 @@
+schema: tenth.rules/1
+id: kr-event-quali
+name: 국내 대회 예선
+short: 예선
+format: qualifier
+default: true
+order: 1
+summary: 혼자 달립니다. 상자를 놓고 달리다가 정해진 시각에 치웁니다. 무충돌 연속 바퀴가 많은 순, 같으면 최고 랩이 빠른 순입니다.
+source: {src: measured, ref: "팀이 겪은 RoboRacer Korea 대회(2025·2026) 진행 방식, 사용자 10-29 설명", note: "세션 길이와 치우는 시각은 대회마다 달랐음 — 값은 고를 수 있게 둠"}
+duration_s: {v: 90, choices: [60, 90, 120, 300]}
+boxes: {count: 3, choices: [0, 1, 2, 3], remove_at_s: 50, remove_choices: [20, 30, 50, 60, 90, 150]}
+start: {grid: standing, at: start_line, behind_m: 1.0, note: 출발선 1 m 뒤에 멈춘 채로 출발}
+lap_timing: {from: first_crossing, note: 출발선을 처음 지날 때부터 바퀴를 셈(첫 바퀴는 달리면서 시작)}
+clean_lap: {breaks_on: any, kinds: [wall, box], hard_mps: 1.0, note: 벽이나 상자에 한 번이라도 닿으면 그 바퀴는 무충돌이 아님. 세게 닿음(1.0 m/s 이상)은 따로 표시}
+contact_handling: continue
+scoring:
+  - {key: best_clean_streak, order: desc, label: 무충돌 연속 바퀴}
+  - {key: best_lap, order: asc, label: 최고 랩}
+time_base: sim

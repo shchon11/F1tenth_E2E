@@ -1,0 +1,42 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>C 레이스 준비</title>
+<link rel="stylesheet" href="assets/base.css"><style>
+body{background:#1a3bbf;color:#fff}
+.back{left:96px;top:60px;width:80px;height:80px;border-radius:40px;background:rgba(255,255,255,.16)}
+.back:before{content:"";position:absolute;left:33px;top:30px;width:18px;height:18px;border:solid #fff;border-width:0 0 5px 5px;transform:rotate(45deg)}
+.steps{left:0;right:0;top:56px;display:flex;justify-content:center;gap:28px}
+.step{width:330px;height:124px;border-radius:24px;padding:20px 28px 0 96px;position:relative;color:rgba(255,255,255,.55)}
+.step i{position:absolute;left:28px;top:36px;width:52px;height:52px;border-radius:26px;background:rgba(255,255,255,.16);font-style:normal;font-size:28px;font-weight:800;display:flex;align-items:center;justify-content:center}
+.step b{display:block;font-size:36px;font-weight:800}
+.step span{display:block;font-size:24px;font-weight:600;margin-top:6px;white-space:nowrap}
+.step.on{background:#fff;color:#1a3bbf}
+.step.on i{background:#1a3bbf;color:#fff}
+.card{border-radius:36px;background:#fff;color:#1a3bbf}
+.card .pic{position:absolute;inset:56px}
+.c0{left:-170px;top:330px;width:440px;height:440px;opacity:.5}
+.c1{left:560px;top:236px;width:800px;height:620px}
+.c2{left:1650px;top:330px;width:440px;height:440px;opacity:.5}
+.arrow{top:502px;width:88px;height:88px;border-radius:44px;background:rgba(255,255,255,.16)}
+.arrow:before{content:"";position:absolute;top:33px;width:20px;height:20px;border:solid #fff;border-width:0 0 5px 5px}
+.al{left:400px}.al:before{left:37px;transform:rotate(45deg)}
+.ar{left:1432px}.ar:before{left:28px;transform:rotate(-135deg)}
+.name{left:0;right:0;top:896px;text-align:center;font-size:76px;font-weight:800;letter-spacing:-.01em}
+.dots{left:0;right:0;top:1014px;display:flex;justify-content:center;gap:16px}
+.dots i{width:16px;height:16px;border-radius:8px;background:rgba(255,255,255,.3)}
+.dots .on{background:#fff}
+.go{right:96px;top:1014px;width:420px;height:120px;border-radius:60px;background:#ff6a1a;color:#fff;font-size:50px;font-weight:800;display:flex;align-items:center;justify-content:center}
+</style></head><body>
+<div class="abs back"></div>
+<div class="abs steps">
+  <div class="step on"><i>1</i><b>코스</b><span>2026 한국 대회장</span></div>
+  <div class="step"><i>2</i><b>드라이버</b><span>미르 43</span></div>
+  <div class="step"><i>3</i><b>규칙</b><span class="num">혼자 90초 상자 3개</span></div>
+</div>
+<div class="abs card c0"><div class="pic" data-course="oval"></div></div>
+<div class="abs card c2"><div class="pic" data-course="kr25"></div></div>
+<div class="abs card c1"><div class="pic" data-course="kr26"></div></div>
+<div class="abs arrow al"></div><div class="abs arrow ar"></div>
+<div class="abs name">2026 한국 대회장</div>
+<div class="abs dots"><i class="on"></i><i></i><i></i><i></i></div>
+<div class="abs go">출발</div>
+<script src="assets/courses.js"></script><script src="assets/course.js"></script>
+</body></html>

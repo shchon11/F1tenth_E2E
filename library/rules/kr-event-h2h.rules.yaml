@@ -1,0 +1,18 @@
+schema: tenth.rules/1
+id: kr-event-h2h
+name: 국내 대회 1대1
+short: 1대1
+format: head_to_head
+available_from: M6
+order: 2
+summary: 두 차가 코스 반대편(반 바퀴 떨어져)에서 동시에 출발합니다. 바퀴는 각자 자기 출발선 기준으로 셉니다. 양보 의무는 없습니다. 먼저 정한 바퀴를 채우거나, 제한 시간 안에 더 많이 간 차가 이깁니다.
+source: {src: measured, ref: "팀이 겪은 국내 대회 1대1 진행(사용자 11-12 설명: 반대편 출발)"}
+duration_s: {v: 120, choices: [90, 120, 300]}
+boxes: {count: 3, choices: [0, 1, 2, 3], remove_at_s: 60, remove_choices: [30, 60, 90]}
+start: {grid: opposite, offset_lap_frac: 0.5, note: 반 바퀴 떨어진 두 출발선}
+lap_counting: own_start_line
+yield_rule: none
+win: {first_to_laps: 10, else: more_laps_at_time_limit, tie_within_m: 0.5}
+clean_lap: {breaks_on: any, kinds: [wall, box, car], hard_mps: 1.0}
+contact_handling: continue
+time_base: sim

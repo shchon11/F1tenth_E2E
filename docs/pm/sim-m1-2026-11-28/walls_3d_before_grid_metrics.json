@@ -1,0 +1,27 @@
+{
+  "ack_ms": [],
+  "adapter": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "apply_ms_p50": 0.517,
+  "bytes": 2757463,
+  "cmd_to_state_ms": [
+    141.509056091309
+  ],
+  "decode_us_p50": 230.0,
+  "driver": "vulkan",
+  "elapsed_s": 5.502,
+  "fps_median": 60.00600060006,
+  "frame_ms_p50": 16.665,
+  "frame_ms_p95": 16.71,
+  "frame_ms_p99": 50.189,
+  "frames_rendered": 310,
+  "godot": "4.7.2-stable (official)",
+  "latency_ms_p50": 9.48596000671387,
+  "latency_ms_p95": 59.4847202301025,
+  "method": "forward_plus",
+  "rtt_ms_p50": 16.7219638824463,
+  "rtt_ms_p95": 141.804933547974,
+  "seq_gaps": 0,
+  "state_frames": 126,
+  "torn": 0,
+  "transport": "tcp"
+}

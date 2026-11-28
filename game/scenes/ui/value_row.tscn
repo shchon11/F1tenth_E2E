@@ -1,0 +1,48 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/value_row.gd" id="1_row"]
+
+[node name="ValueRow" type="Button"]
+custom_minimum_size = Vector2(636, 72)
+theme_type_variation = &"Row"
+script = ExtResource("1_row")
+
+[node name="H" type="HBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 36.0
+offset_right = -22.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+theme_override_constants/separation = 12
+
+[node name="Name" type="Label" parent="H"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_type_variation = &"Name"
+vertical_alignment = 1
+text = "—"
+
+[node name="Prev" type="Button" parent="H"]
+custom_minimum_size = Vector2(44, 0)
+layout_mode = 2
+focus_mode = 0
+theme_type_variation = &"Arrow"
+text = "‹"
+
+[node name="Value" type="Label" parent="H"]
+layout_mode = 2
+theme_type_variation = &"Value"
+horizontal_alignment = 1
+vertical_alignment = 1
+text = "—"
+
+[node name="Next" type="Button" parent="H"]
+custom_minimum_size = Vector2(44, 0)
+layout_mode = 2
+focus_mode = 0
+theme_type_variation = &"Arrow"
+text = "›"

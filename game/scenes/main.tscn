@@ -1,0 +1,26 @@
+[gd_scene load_steps=7 format=3]
+
+[ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
+[ext_resource type="PackedScene" path="res://scenes/race_world.tscn" id="2_world"]
+[ext_resource type="PackedScene" path="res://scenes/screens/setup.tscn" id="3_setup"]
+[ext_resource type="PackedScene" path="res://scenes/screens/live_hud.tscn" id="4_live"]
+[ext_resource type="PackedScene" path="res://scenes/screens/result.tscn" id="5_result"]
+[ext_resource type="PackedScene" path="res://scenes/screens/main_menu.tscn" id="6_menu"]
+
+[node name="Main" type="Node"]
+script = ExtResource("1_main")
+
+[node name="World" parent="." instance=ExtResource("2_world")]
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Menu" parent="UI" instance=ExtResource("6_menu")]
+
+[node name="Setup" parent="UI" instance=ExtResource("3_setup")]
+visible = false
+
+[node name="Live" parent="UI" instance=ExtResource("4_live")]
+visible = false
+
+[node name="Result" parent="UI" instance=ExtResource("5_result")]
+visible = false

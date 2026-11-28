@@ -1,0 +1,16 @@
+schema: tenth.course/1
+id: kr25-iccas
+name: ICCAS 2025
+summary: 2025 한국 대회(ICCAS) 코스. 팀이 SLAM으로 만든 지도(실제보다 20~25 % 작게 나온 것으로 알려짐).
+order: 4
+track: real:korea_2025_iccas+duct
+walls: smooth
+duct_diameter: {v: 0.30, u: m, src: assumed}
+direction: as_mapped
+start: {at: centerline_s0, behind_m: 1.0}
+sectors: 3
+layouts:
+  random:
+    refline: centerline
+    note: 매끄럽게 한 중심선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.
+trained_here: []

@@ -1,0 +1,75 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scripts/screens/setup.gd" id="1_setup"]
+[ext_resource type="Script" path="res://scripts/ui/shade.gd" id="2_shade"]
+
+[node name="Setup" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("1_setup")
+
+[node name="Shade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_shade")
+
+[node name="Title" type="Label" parent="."]
+layout_mode = 0
+offset_left = 96.0
+offset_top = 96.0
+offset_right = 696.0
+offset_bottom = 176.0
+theme_type_variation = &"Title"
+text = "달리기"
+
+[node name="Column" type="VBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 60.0
+offset_top = 206.0
+offset_right = 696.0
+offset_bottom = 1170.0
+theme_override_constants/separation = 6
+
+[node name="Rows" type="VBoxContainer" parent="Column"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="Gap" type="Control" parent="Column"]
+custom_minimum_size = Vector2(0, 22)
+layout_mode = 2
+
+[node name="Go" type="Button" parent="Column"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(636, 108)
+layout_mode = 2
+theme_type_variation = &"Primary"
+disabled = true
+text = "출발"
+
+[node name="Back" type="Button" parent="Column"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 0
+theme_type_variation = &"Word"
+text = "뒤로"
+
+[node name="Message" type="Label" parent="."]
+unique_name_in_owner = true
+layout_mode = 0
+offset_left = 760.0
+offset_top = 1100.0
+offset_right = 1860.0
+offset_bottom = 1140.0
+theme_type_variation = &"Name"
+autowrap_mode = 3
+text = ""

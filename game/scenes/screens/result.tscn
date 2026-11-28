@@ -1,0 +1,194 @@
+[gd_scene load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://scripts/screens/result.gd" id="1_res"]
+[ext_resource type="Script" path="res://scripts/ui/minimap.gd" id="2_map"]
+[ext_resource type="Script" path="res://scripts/ui/shade.gd" id="3_shade"]
+
+[node name="Result" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("1_res")
+
+[node name="Shade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("3_shade")
+reach = 1.0
+strength = 1.05
+min_alpha = 0.62
+
+[node name="Title" type="Label" parent="."]
+unique_name_in_owner = true
+layout_mode = 0
+offset_left = 96.0
+offset_top = 96.0
+offset_right = 696.0
+offset_bottom = 176.0
+theme_type_variation = &"Title"
+text = "결과"
+
+[node name="Column" type="VBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 60.0
+offset_top = 206.0
+offset_right = 696.0
+offset_bottom = 1170.0
+theme_override_constants/separation = 18
+
+[node name="Score" type="GridContainer" parent="Column"]
+layout_mode = 2
+theme_override_constants/h_separation = 48
+theme_override_constants/v_separation = 8
+columns = 2
+
+[node name="N1" type="Label" parent="Column/Score"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "무충돌 연속 바퀴"
+
+[node name="N2" type="Label" parent="Column/Score"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "최고 랩"
+
+[node name="Streak" type="Label" parent="Column/Score"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "—"
+
+[node name="Best" type="Label" parent="Column/Score"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "—"
+
+[node name="N3" type="Label" parent="Column/Score"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "바퀴"
+
+[node name="N4" type="Label" parent="Column/Score"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "접촉"
+
+[node name="NLaps" type="Label" parent="Column/Score"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Value"
+text = "—"
+
+[node name="NContacts" type="Label" parent="Column/Score"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Value"
+text = "—"
+
+[node name="Facts" type="GridContainer" parent="Column"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/h_separation = 28
+theme_override_constants/v_separation = 2
+columns = 2
+
+[node name="Gap" type="Control" parent="Column"]
+custom_minimum_size = Vector2(0, 8)
+layout_mode = 2
+
+[node name="Again" type="Button" parent="Column"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(636, 108)
+layout_mode = 2
+theme_type_variation = &"Primary"
+text = "다시 달리기"
+
+[node name="Words" type="HBoxContainer" parent="Column"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Change" type="Button" parent="Column/Words"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "준비로"
+
+[node name="DetailBtn" type="Button" parent="Column/Words"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+toggle_mode = true
+text = "상세"
+
+[node name="Laps" type="VBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 780.0
+offset_top = 206.0
+offset_right = 1340.0
+offset_bottom = 1170.0
+mouse_filter = 2
+
+[node name="N" type="Label" parent="Laps"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "바퀴별"
+
+[node name="LapTable" type="GridContainer" parent="Laps"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/h_separation = 30
+theme_override_constants/v_separation = 2
+columns = 6
+
+[node name="Gap" type="Control" parent="Laps"]
+custom_minimum_size = Vector2(0, 24)
+layout_mode = 2
+
+[node name="N2" type="Label" parent="Laps"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "접촉"
+
+[node name="ContactTable" type="GridContainer" parent="Laps"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/h_separation = 30
+theme_override_constants/v_separation = 2
+columns = 5
+
+[node name="Minimap" type="Control" parent="."]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -520.0
+offset_top = 206.0
+offset_right = -60.0
+offset_bottom = 1060.0
+grow_horizontal = 0
+mouse_filter = 2
+script = ExtResource("2_map")
+
+[node name="Detail" type="Label" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 0
+offset_left = 780.0
+offset_top = 940.0
+offset_right = 1860.0
+offset_bottom = 1180.0
+theme_type_variation = &"Small"
+autowrap_mode = 3
+text = ""

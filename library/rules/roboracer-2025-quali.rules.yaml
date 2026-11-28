@@ -1,0 +1,18 @@
+schema: tenth.rules/1
+id: roboracer-2025-quali
+name: RoboRacer 2025 예선
+short: 예선
+format: qualifier
+order: 3
+summary: 5분 동안 혼자 달립니다. 무충돌 연속 바퀴가 많은 순, 같으면 최고 랩이 빠른 순입니다. 상자는 놓지 않습니다.
+source: {src: spec, ref: "RoboRacer 2025 규칙 문서(README) — 예선 5분 히트 2회 중 한 번", note: "히트 2회 중 좋은 것은 M1에서 고르지 않음"}
+duration_s: {v: 300, choices: [120, 300]}
+boxes: {count: 0, choices: [0], remove_at_s: 0, remove_choices: [0]}
+start: {grid: standing, at: start_line, behind_m: 1.0}
+lap_timing: {from: first_crossing}
+clean_lap: {breaks_on: any, kinds: [wall, box], hard_mps: 1.0}
+contact_handling: continue
+scoring:
+  - {key: best_clean_streak, order: desc, label: 무충돌 연속 바퀴}
+  - {key: best_lap, order: asc, label: 최고 랩}
+time_base: sim

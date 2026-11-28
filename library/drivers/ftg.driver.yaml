@@ -1,0 +1,11 @@
+schema: tenth.driver/1
+id: ftg
+name: Follow-the-Gap
+kind: baseline
+order: 3
+summary: 기준선(학습 없음). LiDAR의 가장 넓은 빈틈 쪽으로 조향.
+note: 설정은 korea_2026_competition 지도에서 튜닝한 값(baseline_settings, solo).
+output: {kind: direct}
+baseline: {kind: ftg, setting: {from: baseline_settings, track: korea_2026_competition, solo: true}}
+host_checkpoint: "~/f1sim_runs/pick_scan31b_u475/state_latest.pt"
+trained_on: []

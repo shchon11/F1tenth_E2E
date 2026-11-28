@@ -1,0 +1,36 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>B 메인</title>
+<link rel="stylesheet" href="assets/base.css"><style>
+body{background:#ecebe6;color:#141416}
+.mark{left:96px;top:66px;font-size:30px;font-weight:800;letter-spacing:.06em}
+.top{right:96px;top:68px;font-size:26px;font-weight:600;color:#6a6a66;display:flex;gap:44px}
+.hero{left:96px;top:150px;width:1004px;height:954px;border-radius:14px;background:#ffd21e;overflow:hidden}
+.hero h1{position:absolute;left:56px;top:48px;font-size:112px;font-weight:800;letter-spacing:-.01em}
+.hero .map{position:absolute;right:-60px;top:40px;width:560px;height:860px;color:rgba(20,20,22,.10)}
+.hero .car{position:absolute;left:150px;top:300px;width:900px}
+.hero dl{position:absolute;left:56px;bottom:52px}
+.hero dt{font-size:26px;font-weight:600;color:rgba(20,20,22,.6);margin-bottom:8px}
+.hero dd{font-size:44px;font-weight:800}
+.tile{width:350px;height:465px;border-radius:14px;background:#fbfaf7;color:#141416;overflow:hidden}
+.tile dt{position:absolute;left:36px;top:32px;font-size:40px;font-weight:800}
+.tile dd{position:absolute;left:36px;bottom:34px;font-size:28px;font-weight:600;color:#6a6a66}
+.tile .pic{position:absolute;left:36px;right:36px;top:118px;height:228px}
+.t1{left:1124px;top:150px}.t2{left:1498px;top:150px}.t3{left:1124px;top:639px}.t4{left:1498px;top:639px}
+.bar{position:absolute;left:0;right:0;top:186px;height:16px;border-radius:8px;background:rgba(20,20,22,.12)}
+.bar i{display:block;width:82%;height:100%;border-radius:8px;background:#141416}
+.big small{font-size:36px;font-weight:700;margin-left:6px}
+.big{position:absolute;left:0;top:60px;font-size:88px;font-weight:800;letter-spacing:-.02em}
+</style></head><body>
+<div class="abs mark">TENTH</div>
+<div class="abs top"><span>설정</span><span>종료</span></div>
+<div class="abs hero">
+  <div class="map" data-course="kr26"></div>
+  <h1>달리기</h1>
+  <img class="car" src="assets/car_ink.png" alt="">
+  <dl><dt>드라이버</dt><dd>미르 43</dd></dl>
+</div>
+<dl class="abs tile t1"><dt>차고</dt><div class="pic"><img src="assets/carside_yellow.png" style="position:absolute;left:-170px;top:-10px;width:620px" alt=""></div><dd>실차 2호</dd></dl>
+<dl class="abs tile t2"><dt>코스</dt><div class="pic" data-course="kr26" data-fill="#141416"></div><dd>2026 한국 대회장</dd></dl>
+<dl class="abs tile t3"><dt>훈련</dt><div class="pic"><div class="big">82%</div><div class="bar"><i></i></div></div><dd>가람 45</dd></dl>
+<dl class="abs tile t4"><dt>기록</dt><div class="pic"><div class="big">9.214<small>초</small></div></div><dd>미르 43</dd></dl>
+<script src="assets/courses.js"></script><script src="assets/course.js"></script>
+</body></html>

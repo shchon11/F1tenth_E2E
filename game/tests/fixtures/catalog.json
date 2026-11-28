@@ -1,0 +1,515 @@
+{
+ "courses": [
+  {
+   "id": "kr26-hall",
+   "name": "IFAC 2026",
+   "summary": "IFAC 2026 대회장. 대회 bag의 스캔으로 만든 지도(korea26_scan). 덕트 호스를 제자리에 다시 깔고(+duct) 벽을 매끄러운 판으로(+smooth).",
+   "walls": "smooth",
+   "sectors": 3,
+   "saved_layouts": 64,
+   "saved_name": "대회 형식 시험 세트",
+   "saved_note": "빈 코스를 달린 길 위에 상자 3개씩, 64가지. 최소 시간 경로가 0.10 m 여유로 지나갈 수 있다고 판정된 것만.",
+   "random_layouts": true,
+   "random_note": "기준 주행선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.",
+   "no_boxes_reason": "",
+   "trained_here": [
+    "scan31b-u475",
+    "hs43b-u900"
+   ],
+   "detail": {
+    "track": "real:korea26_scan+duct",
+    "file": "library/courses/kr26-hall.course.yaml",
+    "bank": "/data/compbench/banks/exam3_k26scan"
+   }
+  },
+  {
+   "id": "lab-12x16",
+   "name": "실측 12×16 m",
+   "summary": "대회 전 시험 장소의 실측 지도(12.3×16.4 m). 덕트 호스를 제자리에 다시 깔고 벽을 매끄러운 판으로 만듦.",
+   "walls": "smooth",
+   "sectors": 3,
+   "saved_layouts": 64,
+   "saved_name": "사전 시험장 시험 세트",
+   "saved_note": "매끄럽게 한 중심선 위에 상자 3개씩, 64가지. 지나갈 수 있다고 판정된 것만.",
+   "random_layouts": true,
+   "random_note": "기준 주행선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.",
+   "no_boxes_reason": "",
+   "trained_here": [],
+   "detail": {
+    "track": "real:map12x16+duct",
+    "file": "library/courses/lab-12x16.course.yaml",
+    "bank": "/data/compbench/banks/labconf_map12x16"
+   }
+  },
+  {
+   "id": "lab-16x07",
+   "name": "실측 16×7 m",
+   "summary": "대회 전 시험 장소의 실측 지도(15.5×7.0 m, 헤어핀). 차로 폭 1.4 m로 가장 좁음.",
+   "walls": "smooth",
+   "sectors": 3,
+   "saved_layouts": 0,
+   "saved_name": "",
+   "saved_note": "",
+   "random_layouts": false,
+   "random_note": "",
+   "no_boxes_reason": "차로 폭 1.4 m에서 지나갈 수 있는 상자 배치가 64개 중 2개뿐이라 상자 규칙을 아직 정하지 않았습니다.",
+   "trained_here": [],
+   "detail": {
+    "track": "real:map16x07+duct",
+    "file": "library/courses/lab-16x07.course.yaml",
+    "bank": ""
+   }
+  },
+  {
+   "id": "kr25-iccas",
+   "name": "ICCAS 2025",
+   "summary": "2025 한국 대회(ICCAS) 코스. 팀이 SLAM으로 만든 지도(실제보다 20~25 % 작게 나온 것으로 알려짐).",
+   "walls": "smooth",
+   "sectors": 3,
+   "saved_layouts": 0,
+   "saved_name": "",
+   "saved_note": "",
+   "random_layouts": true,
+   "random_note": "매끄럽게 한 중심선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.",
+   "no_boxes_reason": "",
+   "trained_here": [],
+   "detail": {
+    "track": "real:korea_2025_iccas+duct",
+    "file": "library/courses/kr25-iccas.course.yaml",
+    "bank": ""
+   }
+  }
+ ],
+ "drivers": [
+  {
+   "id": "scan31b-u475",
+   "name": "scan31b u475",
+   "kind": "learned",
+   "kind_label": "학습된 드라이버",
+   "summary": "학습된 드라이버(궤적 + 속도). IFAC 2026 지도에서 훈련.",
+   "note": "11-24 예선용 선정. 감사 C(120 s 세션 128개) 실차 방식에서 상자 세게 닿음이 hs43b u900보다 적음.",
+   "output": "plan",
+   "trained_on": [
+    "kr26-hall"
+   ],
+   "available": true,
+   "why_not": "",
+   "detail": {
+    "run": "scan31b",
+    "update": 475,
+    "path": "/home/shchon11/f1sim_runs/pick_scan31b_u475/state_latest.pt",
+    "sha256": "a9903057f91aa239e1d881ee64b7dd0958f624bef6252a823ec940481b9389af",
+    "file": "library/drivers/scan31b-u475.driver.yaml",
+    "baseline": null
+   }
+  },
+  {
+   "id": "hs43b-u900",
+   "name": "hs43b u900",
+   "kind": "learned",
+   "kind_label": "학습된 드라이버",
+   "summary": "학습된 드라이버(궤적 + 속도). IFAC 2026 지도에서 훈련.",
+   "note": "11-28 콘솔 목록 '예선 가장 빠름'(이상 실행 시험 기준). 감사 C 실차 방식에서는 scan31b u475보다 120 s에 62 m 덜 감.",
+   "output": "plan",
+   "trained_on": [
+    "kr26-hall"
+   ],
+   "available": true,
+   "why_not": "",
+   "detail": {
+    "run": "hs43b",
+    "update": 900,
+    "path": "/home/shchon11/f1sim_runs/pick_hs43b_u900/state_latest.pt",
+    "sha256": "d8019496d9fa0d451fd6c50b89c3f80ad960c93f40cf045a296bf9455e360cd7",
+    "file": "library/drivers/hs43b-u900.driver.yaml",
+    "baseline": null
+   }
+  },
+  {
+   "id": "ftg",
+   "name": "Follow-the-Gap",
+   "kind": "baseline",
+   "kind_label": "기준선",
+   "summary": "기준선(학습 없음). LiDAR의 가장 넓은 빈틈 쪽으로 조향.",
+   "note": "설정은 korea_2026_competition 지도에서 튜닝한 값(baseline_settings, solo).",
+   "output": "direct",
+   "trained_on": [],
+   "available": true,
+   "why_not": "",
+   "detail": {
+    "run": "",
+    "update": null,
+    "path": "/home/shchon11/f1sim_runs/pick_scan31b_u475/state_latest.pt",
+    "sha256": "",
+    "file": "library/drivers/ftg.driver.yaml",
+    "baseline": {
+     "kind": "ftg",
+     "setting": {
+      "from": "baseline_settings",
+      "track": "korea_2026_competition",
+      "solo": true
+     }
+    }
+   }
+  }
+ ],
+ "rules": [
+  {
+   "id": "kr-event-quali",
+   "name": "국내 대회 예선",
+   "short": "예선",
+   "format": "qualifier",
+   "summary": "혼자 달립니다. 상자를 놓고 달리다가 정해진 시각에 치웁니다. 무충돌 연속 바퀴가 많은 순, 같으면 최고 랩이 빠른 순입니다.",
+   "available": true,
+   "available_from": "",
+   "duration_s": {
+    "v": 90,
+    "choices": [
+     60,
+     90,
+     120,
+     300
+    ]
+   },
+   "boxes": {
+    "count": 3,
+    "choices": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "remove_at_s": 50,
+    "remove_choices": [
+     20,
+     30,
+     50,
+     60,
+     90,
+     150
+    ]
+   },
+   "start": {
+    "grid": "standing",
+    "at": "start_line",
+    "behind_m": 1.0,
+    "note": "출발선 1 m 뒤에 멈춘 채로 출발"
+   },
+   "clean_lap": {
+    "breaks_on": "any",
+    "kinds": [
+     "wall",
+     "box"
+    ],
+    "hard_mps": 1.0,
+    "note": "벽이나 상자에 한 번이라도 닿으면 그 바퀴는 무충돌이 아님. 세게 닿음(1.0 m/s 이상)은 따로 표시"
+   },
+   "scoring": [
+    {
+     "key": "best_clean_streak",
+     "order": "desc",
+     "label": "무충돌 연속 바퀴"
+    },
+    {
+     "key": "best_lap",
+     "order": "asc",
+     "label": "최고 랩"
+    }
+   ],
+   "win": null,
+   "source": {
+    "src": "measured",
+    "ref": "팀이 겪은 RoboRacer Korea 대회(2025·2026) 진행 방식, 사용자 10-29 설명",
+    "note": "세션 길이와 치우는 시각은 대회마다 달랐음 — 값은 고를 수 있게 둠"
+   },
+   "default": true,
+   "detail": {
+    "file": "library/rules/kr-event-quali.rules.yaml"
+   }
+  },
+  {
+   "id": "kr-event-h2h",
+   "name": "국내 대회 1대1",
+   "short": "1대1",
+   "format": "head_to_head",
+   "summary": "두 차가 코스 반대편(반 바퀴 떨어져)에서 동시에 출발합니다. 바퀴는 각자 자기 출발선 기준으로 셉니다. 양보 의무는 없습니다. 먼저 정한 바퀴를 채우거나, 제한 시간 안에 더 많이 간 차가 이깁니다.",
+   "available": false,
+   "available_from": "M6",
+   "duration_s": {
+    "v": 120,
+    "choices": [
+     90,
+     120,
+     300
+    ]
+   },
+   "boxes": {
+    "count": 3,
+    "choices": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "remove_at_s": 60,
+    "remove_choices": [
+     30,
+     60,
+     90
+    ]
+   },
+   "start": {
+    "grid": "opposite",
+    "offset_lap_frac": 0.5,
+    "note": "반 바퀴 떨어진 두 출발선"
+   },
+   "clean_lap": {
+    "breaks_on": "any",
+    "kinds": [
+     "wall",
+     "box",
+     "car"
+    ],
+    "hard_mps": 1.0
+   },
+   "scoring": [],
+   "win": {
+    "first_to_laps": 10,
+    "else": "more_laps_at_time_limit",
+    "tie_within_m": 0.5
+   },
+   "source": {
+    "src": "measured",
+    "ref": "팀이 겪은 국내 대회 1대1 진행(사용자 11-12 설명: 반대편 출발)"
+   },
+   "default": false,
+   "detail": {
+    "file": "library/rules/kr-event-h2h.rules.yaml"
+   }
+  },
+  {
+   "id": "roboracer-2025-quali",
+   "name": "RoboRacer 2025 예선",
+   "short": "예선",
+   "format": "qualifier",
+   "summary": "5분 동안 혼자 달립니다. 무충돌 연속 바퀴가 많은 순, 같으면 최고 랩이 빠른 순입니다. 상자는 놓지 않습니다.",
+   "available": true,
+   "available_from": "",
+   "duration_s": {
+    "v": 300,
+    "choices": [
+     120,
+     300
+    ]
+   },
+   "boxes": {
+    "count": 0,
+    "choices": [
+     0
+    ],
+    "remove_at_s": 0,
+    "remove_choices": [
+     0
+    ]
+   },
+   "start": {
+    "grid": "standing",
+    "at": "start_line",
+    "behind_m": 1.0
+   },
+   "clean_lap": {
+    "breaks_on": "any",
+    "kinds": [
+     "wall",
+     "box"
+    ],
+    "hard_mps": 1.0
+   },
+   "scoring": [
+    {
+     "key": "best_clean_streak",
+     "order": "desc",
+     "label": "무충돌 연속 바퀴"
+    },
+    {
+     "key": "best_lap",
+     "order": "asc",
+     "label": "최고 랩"
+    }
+   ],
+   "win": null,
+   "source": {
+    "src": "spec",
+    "ref": "RoboRacer 2025 규칙 문서(README) — 예선 5분 히트 2회 중 한 번",
+    "note": "히트 2회 중 좋은 것은 M1에서 고르지 않음"
+   },
+   "default": false,
+   "detail": {
+    "file": "library/rules/roboracer-2025-quali.rules.yaml"
+   }
+  }
+ ],
+ "physics": [
+  {
+   "id": "default-car-pre-place",
+   "name": "default_comp_car_pre_place",
+   "car_label": "대회 차 설정",
+   "summary": "대회 차 설정(8월 대회 bag)의 차 값 + 대회 이전 시험 장소의 장소 값. 11-28 다시 식별.",
+   "default": true,
+   "counts": {
+    "lower_bound": 3,
+    "estimated": 10,
+    "assumed": 8,
+    "measured": 4,
+    "spec": 4
+   },
+   "status": {
+    "lower_bound": 3,
+    "measured": 16,
+    "not_identified": 10
+   },
+   "n": 29,
+   "head": [
+    {
+     "key": "vehicle.mu",
+     "v": 1.0,
+     "u": "-",
+     "err": [
+      0.875,
+      1.35
+     ],
+     "src": "estimated",
+     "badge": "lower_bound",
+     "status": "lower_bound",
+     "tier": "place",
+     "note": "사전 장소: 모델 없이 본 하한 0.87 (0.3 s 버틴 최대 a_y 8.6 m/s²); map16x07 의 유일한 실제 스핀이 μ≈1.0 에서 재현되고 1.35 에서는 안 됨 (사건 1개, 약한 근거). 대회장은 ≥1.1",
+     "applied": true,
+     "label": "그립(최대 마찰)"
+    },
+    {
+     "key": "vehicle.a_max",
+     "v": 5.604184,
+     "u": "m/s^2",
+     "err": null,
+     "src": "estimated",
+     "badge": "estimated",
+     "status": "measured",
+     "tier": "car",
+     "note": "전류 한계 구간 직접 측정 중앙값 4.67 (bag 8개)",
+     "applied": true,
+     "label": "가속 한계"
+    },
+    {
+     "key": "vehicle.a_brake",
+     "v": 5.0,
+     "u": "m/s^2",
+     "err": [
+      4.59774,
+      5.007417
+     ],
+     "src": "measured",
+     "badge": "measured",
+     "status": "measured",
+     "tier": "car",
+     "note": "시뮬 기본값 5.0 유지(11-09 최강 200 ms 측정); bag별 중앙값은 5.0보다 낮음 -> err 범위로 표시",
+     "applied": true,
+     "label": "제동 한계"
+    },
+    {
+     "key": "vehicle.m",
+     "v": 3.74,
+     "u": "kg",
+     "err": null,
+     "src": "spec",
+     "badge": "spec",
+     "status": "not_identified",
+     "tier": "geometry",
+     "note": "저울로 잴 것 (필요할 때 잴 목록)",
+     "applied": false,
+     "label": "질량"
+    },
+    {
+     "key": "actuator.cmd_delay",
+     "v": 0.043,
+     "u": "s",
+     "err": [
+      0.04,
+      0.05
+     ],
+     "src": "estimated",
+     "badge": "estimated",
+     "status": "measured",
+     "tier": "car",
+     "note": "순수 지연. 차 설정(스택·VESC)에 붙음",
+     "applied": true,
+     "label": "명령 지연"
+    },
+    {
+     "key": "actuator.servo_tau",
+     "v": 0.029818,
+     "u": "s",
+     "err": [
+      0.025,
+      0.035
+     ],
+     "src": "estimated",
+     "badge": "estimated",
+     "status": "measured",
+     "tier": "car",
+     "note": "요 관성 Iz와 맞바뀜 (Iz/m ×1.5 이면 0.020)",
+     "applied": true,
+     "label": "조향 응답"
+    }
+   ],
+   "note": "",
+   "detail": {
+    "profile": "default_comp_car_pre_place",
+    "file": "library/physics/default-car-pre-place.physics.yaml",
+    "ref": "docs/pm/sysid-2026-11-28/REPORT.md",
+    "unapplied": [
+     "vehicle.m: 저울로 잴 것 (필요할 때 잴 목록)",
+     "vehicle.Iz: 데이터는 1.5배 쪽을 약간 선호하나 서보 지연과 맞바뀜",
+     "vehicle.lf: 무게중심 앞뒤 위치: 바퀴별 저울로 잴 것",
+     "vehicle.lr: not applied",
+     "vehicle.c_roll: 코스트다운 T4로 잴 것",
+     "vehicle.c_drag: not applied"
+    ]
+   }
+  },
+  {
+   "id": "legacy-venue-fit",
+   "name": "params.py 기본값",
+   "car_label": "params.py 기본값",
+   "summary": "지금까지 학습·시험에 쓴 시뮬 기본값(params.py). 9월 대회장 요 응답에 맞춘 값으로, 시뮬에만 있는 스핀이 13 % 나옴(11-28 재식별 보고서).",
+   "default": false,
+   "counts": {},
+   "status": {},
+   "n": 0,
+   "head": [],
+   "note": "params.py 기본값. 값마다 출처가 기록돼 있지 않습니다(코드 주석에만 있음).",
+   "detail": {
+    "profile": null,
+    "file": "library/physics/legacy-venue-fit.physics.yaml",
+    "ref": "f1sim/f1sim/params.py",
+    "unapplied": []
+   }
+  }
+ ],
+ "execs": [
+  {
+   "id": "real",
+   "name": "실차 방식",
+   "long": "실차 방식",
+   "default": true,
+   "summary": "드라이버가 낸 궤적을 실차와 같은 추종기(지도 기반 추종, MAP)가 따라가고, 차는 타이어·지연·서보가 있는 동역학으로 움직입니다."
+  },
+  {
+   "id": "ideal",
+   "name": "이상 실행 (참고용)",
+   "long": "이상 실행 (참고용)",
+   "default": false,
+   "reference_only": true,
+   "summary": "궤적을 계획대로 정확히 달립니다. 훈련 조건이며 실차에서는 일어나지 않으므로 참고용입니다."
+  }
+ ]
+}

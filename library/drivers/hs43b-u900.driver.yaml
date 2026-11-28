@@ -1,0 +1,10 @@
+schema: tenth.driver/1
+id: hs43b-u900
+name: hs43b u900
+kind: learned
+order: 2
+summary: 학습된 드라이버(궤적 + 속도). IFAC 2026 지도에서 훈련.
+note: 11-28 콘솔 목록 '예선 가장 빠름'(이상 실행 시험 기준). 감사 C 실차 방식에서는 scan31b u475보다 120 s에 62 m 덜 감.
+output: {kind: plan, follower: map}
+checkpoint: {path: "~/f1sim_runs/pick_hs43b_u900/state_latest.pt", run: hs43b, update: 900, sha256: d8019496d9fa0d451fd6c50b89c3f80ad960c93f40cf045a296bf9455e360cd7}
+trained_on: [kr26-hall]

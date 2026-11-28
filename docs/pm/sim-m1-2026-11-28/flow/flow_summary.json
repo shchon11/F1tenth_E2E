@@ -1,0 +1,148 @@
+{
+ "captures": [
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/01_main_3s.png",
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/02_setup_3s.png",
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/03_live_11s.png",
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/04_live_27s.png",
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/05_live_52s.png",
+  "/home/shchon11/F1tenth_E2E/docs/pm/sim-m1-2026-11-28/flow/06_result_4s.png"
+ ],
+ "app_exit": 0,
+ "server_cpu_pct": 84.3,
+ "app_cpu_pct": 14.9,
+ "server_peak_rss_mb": 2655,
+ "app_peak_rss_mb": 758,
+ "rt_running": [
+  0.894,
+  0.943,
+  0.923,
+  0.937,
+  0.887,
+  0.924,
+  0.907,
+  0.887,
+  0.916,
+  0.938,
+  0.922,
+  0.905,
+  0.928
+ ],
+ "session": {
+  "id": "20261129-002321-scan31b-u475",
+  "build_s": 6.69,
+  "facts": {
+   "track": "real:korea26_scan+duct",
+   "resolution_m": 0.0125,
+   "walls": "smooth",
+   "device": "cuda",
+   "cuda_graphs": true,
+   "build_s": 6.48,
+   "mode": "plan",
+   "kind": "plan",
+   "ego": "policy",
+   "policy_idle": false,
+   "exec": "real",
+   "info": "planner(재설계 v2): pick_scan31b_u475/state_latest.pt · update 475 · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, 속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> MAP(11-15 튜닝, 실차와 같음), 10 Hz",
+   "log": []
+  },
+  "physics_check": {
+   "profile": "default_comp_car_pre_place",
+   "checked": 23,
+   "same": 23,
+   "differs": [],
+   "not_in_P": []
+  }
+ },
+ "result": {
+  "id": "20261129-002321-scan31b-u475",
+  "score": {
+   "best_clean_streak": 2,
+   "best_lap": 7.512286097763997
+  },
+  "n_laps": 7,
+  "contacts": 6,
+  "files": {
+   "json": "/data/tenth/results/20261129-002321-scan31b-u475.json",
+   "steps": "/data/tenth/results/20261129-002321-scan31b-u475.steps.npz",
+   "replay": "/data/tenth/replays/20261129-002321-scan31b-u475.tenthrec"
+  },
+  "measured": {
+   "rt_mean": 0.941,
+   "step_ms_median": 19.2,
+   "step_ms_mean": 26.6,
+   "device": "cuda",
+   "speed_setting": 1.0
+  }
+ },
+ "verify": {
+  "server": {
+   "best_clean_streak": 2,
+   "best_lap": 7.512286097763997,
+   "n_laps": 7,
+   "contacts": 6,
+   "lap_times": [
+    7.939709568007335,
+    8.092934500515014,
+    8.624353663933594,
+    8.325122384515335,
+    7.709657305445624,
+    7.756256845228052,
+    7.512286097763997
+   ],
+   "contacts_per_lap": [
+    0,
+    3,
+    0,
+    2,
+    1,
+    0,
+    0
+   ]
+  },
+  "independent": {
+   "n_laps": 7,
+   "lap_times": [
+    7.950000000000001,
+    8.078646906233311,
+    8.641202797494778,
+    8.326578788375947,
+    7.717744302013614,
+    7.7427369166033415,
+    7.514518781383039
+   ],
+   "best_lap": 7.514518781383039,
+   "best_clean_streak": 2,
+   "contacts_per_lap": [
+    0.0,
+    3.0,
+    0.0,
+    2.0,
+    1.0,
+    0.0,
+    0.0
+   ],
+   "hard_per_lap": [
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "contacts_total": 6.0,
+   "hard_total": 2.0,
+   "first_crossing_t": 0.875
+  },
+  "lap_time_max_abs_diff_s": 0.016849133561184004,
+  "lap1_abs_diff_s": 0.010290431992665994,
+  "later_laps_max_abs_diff_s": 0.016849133561184004,
+  "same_streak": true,
+  "same_streak_common_laps": true,
+  "same_contacts_per_lap": true,
+  "same_n_laps": true,
+  "n_laps_ok": true,
+  "best_lap_diff_s": 0.002232683619041609,
+  "agree": true
+ }
+}

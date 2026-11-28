@@ -1,0 +1,10 @@
+schema: tenth.driver/1
+id: scan31b-u475
+name: scan31b u475
+kind: learned
+order: 1
+summary: 학습된 드라이버(궤적 + 속도). IFAC 2026 지도에서 훈련.
+note: 11-24 예선용 선정. 감사 C(120 s 세션 128개) 실차 방식에서 상자 세게 닿음이 hs43b u900보다 적음.
+output: {kind: plan, follower: map}
+checkpoint: {path: "~/f1sim_runs/pick_scan31b_u475/state_latest.pt", run: scan31b, update: 475, sha256: a9903057f91aa239e1d881ee64b7dd0958f624bef6252a823ec940481b9389af}
+trained_on: [kr26-hall]

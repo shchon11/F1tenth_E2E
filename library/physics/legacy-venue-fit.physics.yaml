@@ -1,0 +1,8 @@
+schema: tenth.physics/1
+id: legacy-venue-fit
+name: params.py 기본값
+car_label: params.py 기본값
+order: 2
+summary: 지금까지 학습·시험에 쓴 시뮬 기본값(params.py). 9월 대회장 요 응답에 맞춘 값으로, 시뮬에만 있는 스핀이 13 % 나옴(11-28 재식별 보고서).
+profile: null
+ref: f1sim/f1sim/params.py

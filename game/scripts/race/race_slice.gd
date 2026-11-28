@@ -33,7 +33,7 @@ func _on_track(track: Dictionary) -> void:
 	lidar_view.configure(track.get("lidar", {}))
 	cam.track_rect = track_view.bounds
 	_set_camera(cam.mode)
-	var name_map := {"korea_2026_competition": "Korea 2026"}
+	var name_map := {"korea_2026_competition": "IFAC 2026"}
 	hud.title_venue = name_map.get(track.get("name", ""), String(track.get("name", "")))
 	print("TENTH_TRACK %s %.1f m" % [track.get("name", "?"), float(track.get("length_m", 0.0))])
 

@@ -1,0 +1,9 @@
+/* shared by all six mockups: one family, 1920x1200 stage */
+@font-face{font-family:"Pretendard";src:url(../fonts/PretendardVariable.woff2) format("woff2");font-weight:100 900}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1920px;height:1200px;overflow:hidden}
+body{font-family:"Pretendard",sans-serif;font-weight:500;font-size:24px;line-height:1.2;position:relative;
+  -webkit-font-smoothing:antialiased;word-break:keep-all}
+.num{font-feature-settings:"tnum" 1}
+.abs{position:absolute}
+img{display:block}

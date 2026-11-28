@@ -1,0 +1,9 @@
+schema: tenth.physics/1
+id: default-car-pre-place
+name: default_comp_car_pre_place
+car_label: 대회 차 설정
+default: true
+order: 1
+summary: 대회 차 설정(8월 대회 bag)의 차 값 + 대회 이전 시험 장소의 장소 값. 11-28 다시 식별.
+profile: default_comp_car_pre_place
+ref: docs/pm/sysid-2026-11-28/REPORT.md

@@ -1,0 +1,34 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>B 레이스 준비</title>
+<link rel="stylesheet" href="assets/base.css"><style>
+body{background:#ecebe6;color:#141416}
+.back{left:96px;top:56px;width:76px;height:76px;border-radius:38px;background:#18181b}
+.back:before{content:"";position:absolute;left:31px;top:28px;width:18px;height:18px;border:solid #f3f2ee;border-width:0 0 5px 5px;transform:rotate(45deg)}
+.title{left:200px;top:54px;font-size:64px;font-weight:800}
+.slot{top:168px;width:560px;height:196px;border-radius:14px;background:#fbfaf7;color:#141416}
+.slot dt{position:absolute;left:36px;top:30px;font-size:28px;font-weight:600;color:#6a6a66}
+.slot dd{position:absolute;left:36px;bottom:34px;font-size:42px;font-weight:800;display:flex;gap:34px}
+.slot .mini{position:absolute;right:30px;top:26px;width:150px;height:198px}
+.slot.on{background:#ffd21e;color:#141416}
+.slot.on dt{color:rgba(20,20,22,.62)}
+.slot.on:after{content:"";position:absolute;left:60px;bottom:-22px;border:24px solid transparent;border-top-color:#ffd21e;border-bottom:0}
+.s1{left:96px}.s2{left:680px}.s3{left:1264px}
+.opt{top:416px;width:414px;height:520px;border-radius:14px;background:#fbfaf7}
+.opt .pic{position:absolute;left:44px;right:44px;top:44px;height:356px;color:#18181b}
+.opt b{position:absolute;left:36px;bottom:34px;font-size:32px;font-weight:700}
+.opt.sel{background:#ffd21e}
+.opt.sel:after{content:"";position:absolute;right:30px;top:30px;width:48px;height:48px;border-radius:14px;background:#141416}
+.opt.sel:before{content:"";position:absolute;right:45px;top:44px;width:20px;height:11px;border:solid #fbfaf7;border-width:0 0 5px 5px;transform:rotate(-45deg);z-index:1}
+.o1{left:96px}.o2{left:534px}.o3{left:972px}.o4{left:1410px}
+.go{right:96px;top:994px;width:520px;height:124px;border-radius:14px;background:#141416;color:#fbfaf7;font-size:50px;font-weight:800;display:flex;align-items:center;justify-content:center}
+</style></head><body>
+<div class="abs back"></div><div class="abs title">달리기</div>
+<dl class="abs slot s1 on"><dt>코스</dt><dd>2026 한국 대회장</dd></dl>
+<dl class="abs slot s2"><dt>드라이버</dt><dd>미르 43</dd></dl>
+<dl class="abs slot s3"><dt>규칙</dt><dd><span>혼자</span><span class="num">90초</span><span class="num">상자 3개</span></dd></dl>
+<div class="abs opt o1 sel"><div class="pic" data-course="kr26"></div><b>2026 한국 대회장</b></div>
+<div class="abs opt o2"><div class="pic" data-course="kr25"></div><b>2025 한국 대회장</b></div>
+<div class="abs opt o3"><div class="pic" data-course="lab"></div><b>연구실 복도</b></div>
+<div class="abs opt o4"><div class="pic" data-course="oval"></div><b>연습 타원</b></div>
+<div class="abs go">출발</div>
+<script src="assets/courses.js"></script><script src="assets/course.js"></script>
+</body></html>

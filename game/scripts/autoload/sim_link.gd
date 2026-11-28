@@ -10,6 +10,13 @@ signal track_received(track: Dictionary)
 signal state_received(state: Dictionary)
 signal event_received(ev: Dictionary)
 signal ack_received(ack: Dictionary)
+# M1: 레이스 화면(준비 -> 주행 -> 결과)
+signal catalog_received(catalog: Dictionary)
+signal preview_received(preview: Dictionary)
+signal stage_received(stage: Dictionary)
+signal session_received(session: Dictionary)
+signal result_received(result: Dictionary)
+signal error_received(text: String)
 
 const SCHEMA_VERSION := 1
 
@@ -21,6 +28,9 @@ var hello: Dictionary = {}
 var track: Dictionary = {}
 var state: Dictionary = {}    # 가장 최근 상태
 var gen := 0
+var catalog: Dictionary = {}
+var session: Dictionary = {}
+var result: Dictionary = {}
 
 # 측정
 var stats := {
@@ -88,6 +98,29 @@ func command(op: String) -> int:
 	_send({"k": "cmd", "v": SCHEMA_VERSION, "op": op, "seq": _cmd_seq})
 	print("TENTH_CMD %s seq=%d" % [op, _cmd_seq])
 	return _cmd_seq
+
+
+## 명령에 값을 붙여 보낸다(예: 배속 {x: 2.0}).
+func command_with(op: String, extra: Dictionary) -> int:
+	_cmd_seq += 1
+	var m := {"k": "cmd", "v": SCHEMA_VERSION, "op": op, "seq": _cmd_seq}
+	m.merge(extra)
+	_cmd_pending = {"seq": _cmd_seq, "t": Time.get_unix_time_from_system(), "status": state.get("status", ""), "gen": gen, "op": op}
+	_send(m)
+	print("TENTH_CMD %s seq=%d" % [op, _cmd_seq])
+	return _cmd_seq
+
+
+func request(op: String, fields: Dictionary = {}) -> void:
+	var m := {"k": "req", "v": SCHEMA_VERSION, "op": op}
+	m.merge(fields)
+	_send(m)
+
+
+func start_session(spec: Dictionary, autostart: bool = true) -> void:
+	result = {}
+	_send({"k": "session", "v": SCHEMA_VERSION, "op": "start", "spec": spec, "autostart": autostart})
+	print("TENTH_SESSION_REQUEST " + JSON.stringify(spec))
 
 
 func ping() -> void:
@@ -250,6 +283,20 @@ func _on_payload(p: PackedByteArray) -> void:
 			state_received.emit(m)
 		"event":
 			event_received.emit(m)
+		"catalog":
+			catalog = m
+			catalog_received.emit(m)
+		"preview":
+			preview_received.emit(m)
+		"stage":
+			stage_received.emit(m)
+		"session":
+			session = m
+			gen = maxi(gen, int(m.get("gen", gen)))
+			session_received.emit(m)
+		"result":
+			result = m
+			result_received.emit(m)
 		"ack":
 			if not _cmd_pending.is_empty() and int(m.get("seq", -1)) == int(_cmd_pending.seq):
 				_push(stats.ack_ms, (Time.get_unix_time_from_system() - float(_cmd_pending.t)) * 1000.0)
@@ -258,6 +305,8 @@ func _on_payload(p: PackedByteArray) -> void:
 			_push(stats.rtt_ms, (Time.get_unix_time_from_system() - float(m.get("t", 0.0))) * 1000.0)
 		"error":
 			push_warning("서버 오류: %s" % m.get("note", ""))
+			print("TENTH_SERVER_ERROR ", m.get("note", ""))
+			error_received.emit(String(m.get("note", "")))
 
 
 func _push(arr: Array, v: float) -> void:

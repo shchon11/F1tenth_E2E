@@ -1,0 +1,14 @@
+schema: tenth.course/1
+id: lab-16x07
+name: 실측 16×7 m
+summary: 대회 전 시험 장소의 실측 지도(15.5×7.0 m, 헤어핀). 차로 폭 1.4 m로 가장 좁음.
+order: 3
+track: real:map16x07+duct
+walls: smooth
+duct_diameter: {v: 0.30, u: m, src: assumed}
+direction: as_mapped
+start: {at: centerline_s0, behind_m: 1.0}
+sectors: 3
+layouts:
+  none_reason: 차로 폭 1.4 m에서 지나갈 수 있는 상자 배치가 64개 중 2개뿐이라 상자 규칙을 아직 정하지 않았습니다.
+trained_here: []

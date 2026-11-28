@@ -1,0 +1,20 @@
+schema: tenth.course/1
+id: lab-12x16
+name: 실측 12×16 m
+summary: 대회 전 시험 장소의 실측 지도(12.3×16.4 m). 덕트 호스를 제자리에 다시 깔고 벽을 매끄러운 판으로 만듦.
+order: 2
+track: real:map12x16+duct
+walls: smooth
+duct_diameter: {v: 0.30, u: m, src: assumed, note: 지도 호스 띠 두께 0.34 m와 비슷}
+direction: as_mapped
+start: {at: centerline_s0, behind_m: 1.0}
+sectors: 3
+layouts:
+  saved:
+    bank: /data/compbench/banks/labconf_map12x16
+    name: labconf
+    note: 매끄럽게 한 중심선 위에 상자 3개씩, 64가지. 지나갈 수 있다고 판정된 것만.
+  random:
+    refline: /data/compbench/banks/map12x16_refline.npz
+    note: 기준 주행선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.
+trained_here: []

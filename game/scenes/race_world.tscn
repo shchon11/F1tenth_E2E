@@ -1,0 +1,62 @@
+[gd_scene load_steps=10 format=3]
+
+[ext_resource type="Script" path="res://scripts/race/world.gd" id="1_world"]
+[ext_resource type="Script" path="res://scripts/race/track_view.gd" id="2_track"]
+[ext_resource type="Script" path="res://scripts/race/car_view.gd" id="3_car"]
+[ext_resource type="Script" path="res://scripts/race/lidar_view.gd" id="4_lidar"]
+[ext_resource type="Script" path="res://scripts/race/race_camera.gd" id="5_cam"]
+[ext_resource type="Script" path="res://scripts/race/boxes_view.gd" id="6_boxes"]
+[ext_resource type="Script" path="res://scripts/race/plan_view.gd" id="7_plan"]
+
+[sub_resource type="Environment" id="env_night"]
+background_mode = 1
+background_color = Color(0.027451, 0.031373, 0.031373, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.78, 0.8, 0.82, 1)
+ambient_light_energy = 0.38
+tonemap_mode = 2
+fog_enabled = true
+fog_mode = 1
+fog_light_color = Color(0.027451, 0.031373, 0.031373, 1)
+fog_depth_begin = 8.0
+fog_depth_end = 32.0
+fog_depth_curve = 1.0
+ssao_enabled = true
+ssao_radius = 0.5
+
+[sub_resource type="BoxMesh" id="dummy"]
+
+[node name="RaceWorld" type="Node3D"]
+script = ExtResource("1_world")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("env_night")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+rotation = Vector3(-0.959931, -0.610865, 0)
+light_energy = 0.95
+shadow_enabled = true
+directional_shadow_max_distance = 25.0
+
+[node name="Fill" type="OmniLight3D" parent="."]
+light_energy = 0.0
+
+[node name="Track" type="Node3D" parent="."]
+script = ExtResource("2_track")
+
+[node name="Boxes" type="Node3D" parent="."]
+script = ExtResource("6_boxes")
+
+[node name="Plan" type="MeshInstance3D" parent="."]
+script = ExtResource("7_plan")
+
+[node name="Car" type="Node3D" parent="."]
+script = ExtResource("3_car")
+
+[node name="Lidar" type="MeshInstance3D" parent="."]
+script = ExtResource("4_lidar")
+
+[node name="Camera" type="Camera3D" parent="."]
+current = true
+fov = 58.0
+script = ExtResource("5_cam")

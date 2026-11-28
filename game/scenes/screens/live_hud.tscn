@@ -1,0 +1,427 @@
+[gd_scene load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://scripts/screens/live_hud.gd" id="1_hud"]
+[ext_resource type="Script" path="res://scripts/ui/minimap.gd" id="2_map"]
+[ext_resource type="Script" path="res://scripts/ui/lidar_scope.gd" id="3_scope"]
+[ext_resource type="Script" path="res://scripts/ui/shade.gd" id="4_shade"]
+
+[node name="LiveHud" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("1_hud")
+
+[node name="TopShade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 420.0
+grow_horizontal = 2
+script = ExtResource("4_shade")
+vertical = true
+reach = 1.0
+strength = 0.75
+
+[node name="BottomShade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = -300.0
+grow_horizontal = 2
+grow_vertical = 0
+flip_v = true
+script = ExtResource("4_shade")
+vertical = true
+reach = 1.0
+strength = 0.7
+
+[node name="TopLeft" type="VBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 60.0
+offset_top = 44.0
+offset_right = 1100.0
+offset_bottom = 400.0
+mouse_filter = 2
+theme_override_constants/separation = 14
+
+[node name="Row1" type="HBoxContainer" parent="TopLeft"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 56
+
+[node name="A" type="VBoxContainer" parent="TopLeft/Row1"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row1/A"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "바퀴"
+
+[node name="Lap" type="Label" parent="TopLeft/Row1/A"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(80, 0)
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "—"
+
+[node name="B" type="VBoxContainer" parent="TopLeft/Row1"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row1/B"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "이번 바퀴"
+
+[node name="LapTime" type="Label" parent="TopLeft/Row1/B"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(190, 0)
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "—"
+
+[node name="C" type="VBoxContainer" parent="TopLeft/Row1"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row1/C"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "최고 랩"
+
+[node name="Best" type="Label" parent="TopLeft/Row1/C"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(190, 0)
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "—"
+
+[node name="D" type="VBoxContainer" parent="TopLeft/Row1"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row1/D"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "무충돌 연속"
+
+[node name="Streak" type="Label" parent="TopLeft/Row1/D"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Big"
+text = "0"
+
+[node name="Row2" type="HBoxContainer" parent="TopLeft"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 56
+
+[node name="A" type="VBoxContainer" parent="TopLeft/Row2"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row2/A"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "남은 시간"
+
+[node name="TimeLeft" type="Label" parent="TopLeft/Row2/A"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(130, 0)
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="B" type="VBoxContainer" parent="TopLeft/Row2"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row2/B"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "상자"
+
+[node name="BoxState" type="Label" parent="TopLeft/Row2/B"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="C" type="VBoxContainer" parent="TopLeft/Row2"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row2/C"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "직전"
+
+[node name="Last" type="Label" parent="TopLeft/Row2/C"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="D" type="VBoxContainer" parent="TopLeft/Row2"]
+layout_mode = 2
+mouse_filter = 2
+
+[node name="N" type="Label" parent="TopLeft/Row2/D"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "지금 연속"
+
+[node name="StreakNow" type="Label" parent="TopLeft/Row2/D"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "0"
+
+[node name="Sectors" type="HBoxContainer" parent="TopLeft"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 56
+
+[node name="Minimap" type="Control" parent="."]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -500.0
+offset_top = 36.0
+offset_right = -60.0
+offset_bottom = 356.0
+grow_horizontal = 0
+mouse_filter = 2
+script = ExtResource("2_map")
+
+[node name="Rate" type="Label" parent="."]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -500.0
+offset_top = 360.0
+offset_right = -60.0
+offset_bottom = 392.0
+grow_horizontal = 0
+theme_type_variation = &"Small"
+horizontal_alignment = 2
+text = ""
+
+[node name="Speed" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+offset_left = -200.0
+offset_top = -190.0
+offset_right = 200.0
+offset_bottom = -40.0
+grow_horizontal = 2
+grow_vertical = 0
+mouse_filter = 2
+alignment = 2
+
+[node name="Speed" type="Label" parent="Speed"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Huge"
+horizontal_alignment = 1
+text = "0.00"
+
+[node name="Sub" type="Label" parent="Speed"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Name"
+horizontal_alignment = 1
+text = "m/s"
+
+[node name="LapsPanel" type="VBoxContainer" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -500.0
+offset_top = 420.0
+offset_right = -60.0
+offset_bottom = 860.0
+grow_horizontal = 0
+mouse_filter = 2
+
+[node name="N" type="Label" parent="LapsPanel"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "바퀴 기록"
+
+[node name="LapRows" type="GridContainer" parent="LapsPanel"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/h_separation = 36
+columns = 3
+
+[node name="GaugePanel" type="GridContainer" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 2
+anchor_top = 1.0
+anchor_bottom = 1.0
+offset_left = 60.0
+offset_top = -190.0
+offset_right = 620.0
+offset_bottom = -40.0
+grow_vertical = 0
+mouse_filter = 2
+theme_override_constants/h_separation = 36
+columns = 2
+
+[node name="N1" type="Label" parent="GaugePanel"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "조향 실제 / 요구"
+
+[node name="Steer" type="Label" parent="GaugePanel"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="N2" type="Label" parent="GaugePanel"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "가감속 m/s²"
+
+[node name="Accel" type="Label" parent="GaugePanel"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="N3" type="Label" parent="GaugePanel"]
+layout_mode = 2
+theme_type_variation = &"Name"
+text = "옆 가속 m/s²"
+
+[node name="Lat" type="Label" parent="GaugePanel"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"ValueNum"
+text = "—"
+
+[node name="ScopePanel" type="Control" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 3
+anchor_left = 1.0
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -420.0
+offset_top = -360.0
+offset_right = -60.0
+offset_bottom = -40.0
+grow_horizontal = 0
+grow_vertical = 0
+mouse_filter = 2
+
+[node name="Scope" type="Control" parent="ScopePanel"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("3_scope")
+
+[node name="Banner" type="Label" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -400.0
+offset_top = -120.0
+offset_right = 400.0
+offset_bottom = -40.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_type_variation = &"Title"
+horizontal_alignment = 1
+vertical_alignment = 1
+text = ""
+
+[node name="PauseMenu" type="HBoxContainer" parent="."]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -700.0
+offset_right = 700.0
+offset_bottom = 72.0
+grow_horizontal = 2
+grow_vertical = 2
+alignment = 1
+theme_override_constants/separation = 12
+
+[node name="Resume" type="Button" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "계속"
+
+[node name="Restart" type="Button" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "다시"
+
+[node name="CamBtn" type="Button" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "카메라 추격"
+
+[node name="SpeedBtn" type="Button" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "배속 1×"
+
+[node name="ViewBtn" type="MenuButton" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "표시"
+flat = false
+
+[node name="End" type="Button" parent="PauseMenu"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "끝내기"

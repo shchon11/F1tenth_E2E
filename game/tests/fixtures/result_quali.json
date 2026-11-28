@@ -1,0 +1,349 @@
+{
+ "schema": "tenth.result/1",
+ "id": "20261128-233646-quali-a-1124",
+ "format": "qualifier",
+ "time_base": "sim",
+ "finished": true,
+ "t_end": 59.999999999997655,
+ "labels": {
+  "course": "2026 한국 대회장",
+  "driver": "예선 드라이버 A (11-24)",
+  "driver_kind": "learned",
+  "driver_summary": "학습된 드라이버 · LiDAR와 속도계만 보고 앞으로 달릴 궤적과 속도를 냄 · 2026 한국 대회장에서 훈련",
+  "exec": "real",
+  "exec_label": "실차 방식 (지도 기반 추종 + 동역학)",
+  "physics": "기본 차 + 기본 장소",
+  "rules": "예선 형식 · 국내 대회",
+  "rules_short": "예선 형식",
+  "rules_line": "예선 형식 · 60초 한 번 · 상자 3개, 30초에 치움",
+  "layout": "대회 형식 시험 세트 1번 / 64",
+  "layout_unchecked": false,
+  "walls": "매끄러운 판"
+ },
+ "spec": {
+  "course": "kr26-hall",
+  "driver": "quali-a-1124",
+  "rules": "kr-event-quali",
+  "physics": "default-car-pre-place",
+  "exec": "real",
+  "duration_s": 60.0,
+  "remove_at_s": 30.0,
+  "boxes": {
+   "source": "saved",
+   "count": 3,
+   "index": 0,
+   "seed": 1
+  }
+ },
+ "detail": {
+  "driver": {
+   "run": "scan31b",
+   "update": 475,
+   "path": "/home/shchon11/f1sim_runs/pick_scan31b_u475/state_latest.pt"
+  },
+  "course_track": "real:korea26_scan+duct",
+  "profile": "default_comp_car_pre_place",
+  "rules_file": "library/rules/kr-event-quali.rules.yaml"
+ },
+ "boxes": [
+  {
+   "i": 0,
+   "sid": 33,
+   "x": -2.0582401752471924,
+   "y": -7.592682838439941,
+   "yaw": 0.31629207730293274,
+   "w": 0.25,
+   "d": 0.2,
+   "h": 0.3,
+   "cx": 0.0,
+   "cy": 0.0,
+   "style": "cardboard_box",
+   "label": "골판지 상자 25×20 cm"
+  },
+  {
+   "i": 1,
+   "sid": 38,
+   "x": -0.3602152168750763,
+   "y": 5.80138635635376,
+   "yaw": 1.7009646892547607,
+   "w": 0.36,
+   "d": 0.3,
+   "h": 0.3,
+   "cx": 0.0,
+   "cy": 0.0,
+   "style": "cardboard_box",
+   "label": "골판지 상자 36×30 cm"
+  },
+  {
+   "i": 2,
+   "sid": 35,
+   "x": -4.379246711730957,
+   "y": 4.9446821212768555,
+   "yaw": 0.6882253289222717,
+   "w": 0.29,
+   "d": 0.23,
+   "h": 0.3,
+   "cx": 0.0,
+   "cy": 0.0,
+   "style": "cardboard_box",
+   "label": "골판지 상자 29×23 cm"
+  }
+ ],
+ "remove_at_s": 30.0,
+ "removed_at": 30.024999999999356,
+ "duration_s": 60.0,
+ "physics_check": {
+  "profile": "default_comp_car_pre_place",
+  "checked": 23,
+  "same": 23,
+  "differs": [],
+  "not_in_P": [],
+  "skipped": [
+   "vehicle.m: 저울로 잴 것 (필요할 때 잴 목록)",
+   "vehicle.Iz: 데이터는 1.5배 쪽을 약간 선호하나 서보 지연과 맞바뀜",
+   "vehicle.lf: 무게중심 앞뒤 위치: 바퀴별 저울로 잴 것",
+   "vehicle.lr: not applied",
+   "vehicle.c_roll: 코스트다운 T4로 잴 것",
+   "vehicle.c_drag: not applied"
+  ]
+ },
+ "facts": {
+  "track": "real:korea26_scan+duct",
+  "resolution_m": 0.0125,
+  "walls": "smooth",
+  "device": "cuda",
+  "cuda_graphs": true,
+  "build_s": 6.4,
+  "mode": "plan",
+  "kind": "plan",
+  "ego": "policy",
+  "policy_idle": false,
+  "exec": "real",
+  "info": "planner(재설계 v2): pick_scan31b_u475/state_latest.pt · update 475 · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, 속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> MAP(11-15 튜닝, 실차와 같음), 10 Hz",
+  "log": []
+ },
+ "scoring": [
+  {
+   "key": "best_clean_streak",
+   "order": "desc",
+   "label": "무충돌 연속 바퀴"
+  },
+  {
+   "key": "best_lap",
+   "order": "asc",
+   "label": "최고 랩"
+  }
+ ],
+ "measured": {
+  "rt": 1.0042383569877997
+ },
+ "score": {
+  "best_clean_streak": 2,
+  "best_lap": 7.512286097763997
+ },
+ "streak_check": 2,
+ "best_streak_end_lap": 7,
+ "laps": [
+  {
+   "n": 1,
+   "time": 7.939709568007335,
+   "t_start": 0.8529604500953692,
+   "t_end": 8.792670018102704,
+   "clean": true,
+   "contacts": 0,
+   "hard": 0,
+   "sectors": [
+    2.2982606398583907,
+    3.0551806850687924,
+    2.586268243080152
+   ],
+   "boxes_on": true,
+   "is_best": false
+  },
+  {
+   "n": 2,
+   "time": 8.092934500515014,
+   "t_start": 8.792670018102704,
+   "t_end": 16.88560451861772,
+   "clean": false,
+   "contacts": 3,
+   "hard": 1,
+   "sectors": [
+    2.2118628807006733,
+    3.0299069712435482,
+    2.8511646485707924
+   ],
+   "boxes_on": true,
+   "is_best": false
+  },
+  {
+   "n": 3,
+   "time": 8.624353663933594,
+   "t_start": 16.88560451861772,
+   "t_end": 25.509958182551312,
+   "clean": true,
+   "contacts": 0,
+   "hard": 0,
+   "sectors": [
+    2.143254858424644,
+    2.986473076173855,
+    3.4946257293350946
+   ],
+   "boxes_on": true,
+   "is_best": false
+  },
+  {
+   "n": 4,
+   "time": 8.325122384515335,
+   "t_start": 25.509958182551312,
+   "t_end": 33.83508056706665,
+   "clean": false,
+   "contacts": 2,
+   "hard": 1,
+   "sectors": [
+    2.1315451345605183,
+    3.0318854340002446,
+    3.1616918159545726
+   ],
+   "boxes_on": true,
+   "is_best": false
+  },
+  {
+   "n": 5,
+   "time": 7.709657305445624,
+   "t_start": 33.83508056706665,
+   "t_end": 41.54473787251227,
+   "clean": false,
+   "contacts": 1,
+   "hard": 0,
+   "sectors": [
+    2.0169720420207042,
+    2.9934651486281822,
+    2.699220114796738
+   ],
+   "boxes_on": false,
+   "is_best": false
+  },
+  {
+   "n": 6,
+   "time": 7.756256845228052,
+   "t_start": 41.54473787251227,
+   "t_end": 49.30099471774032,
+   "clean": true,
+   "contacts": 0,
+   "hard": 0,
+   "sectors": [
+    2.2140796696025333,
+    2.912009018007346,
+    2.630168157618172
+   ],
+   "boxes_on": false,
+   "is_best": false
+  },
+  {
+   "n": 7,
+   "time": 7.512286097763997,
+   "t_start": 49.30099471774032,
+   "t_end": 56.81328081550432,
+   "clean": true,
+   "contacts": 0,
+   "hard": 0,
+   "sectors": [
+    2.0043515784347576,
+    2.9206832542858336,
+    2.587251265043406
+   ],
+   "boxes_on": false,
+   "is_best": true
+  }
+ ],
+ "n_laps": 7,
+ "n_clean": 4,
+ "best_clean_lap": 7.512286097763997,
+ "best_lap_boxes": 7.939709568007335,
+ "best_lap_no_boxes": 7.512286097763997,
+ "contacts": [
+  {
+   "t": 10.450000000000083,
+   "kind": "box",
+   "kind_label": "상자",
+   "severity": 0.6293740272521973,
+   "hard": false,
+   "severity_label": "약하게 닿음",
+   "x": -0.4898502230644226,
+   "y": 5.644980430603027,
+   "lap": 2,
+   "sector": 1,
+   "counted": true
+  },
+  {
+   "t": 10.600000000000085,
+   "kind": "box",
+   "kind_label": "상자",
+   "severity": 0.2173682451248169,
+   "hard": false,
+   "severity_label": "약하게 닿음",
+   "x": -0.5309801697731018,
+   "y": 5.933019161224365,
+   "lap": 2,
+   "sector": 1,
+   "counted": true
+  },
+  {
+   "t": 15.575000000000156,
+   "kind": "box",
+   "kind_label": "상자",
+   "severity": 2.810046672821045,
+   "hard": true,
+   "severity_label": "세게 닿음",
+   "x": -2.114386796951294,
+   "y": -7.418760299682617,
+   "lap": 2,
+   "sector": 3,
+   "counted": true
+  },
+  {
+   "t": 31.87499999999925,
+   "kind": "wall",
+   "kind_label": "벽",
+   "severity": 0.0,
+   "hard": false,
+   "severity_label": "약하게 닿음",
+   "x": -3.185051679611206,
+   "y": -6.06781005859375,
+   "lap": 4,
+   "sector": 3,
+   "counted": true
+  },
+  {
+   "t": 33.14999999999918,
+   "kind": "wall",
+   "kind_label": "벽",
+   "severity": 1.7441383600234985,
+   "hard": true,
+   "severity_label": "세게 닿음",
+   "x": -1.3734159469604492,
+   "y": -6.316390037536621,
+   "lap": 4,
+   "sector": 3,
+   "counted": true
+  },
+  {
+   "t": 35.349999999999056,
+   "kind": "wall",
+   "kind_label": "벽",
+   "severity": 0.0,
+   "hard": false,
+   "severity_label": "약하게 닿음",
+   "x": -0.15723936259746552,
+   "y": 4.06054162979126,
+   "lap": 5,
+   "sector": 1,
+   "counted": true
+  }
+ ],
+ "contacts_counted": 6,
+ "contacts_hard": 2,
+ "breaks_on": "any",
+ "hard_mps": 1.0
+}

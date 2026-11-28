@@ -10,7 +10,7 @@ var _accum := 0.0
 var _car: Dictionary = {}
 var _state: Dictionary = {}
 var title_venue := "Korea 2026"
-var title_driver := "벽 간격 따라가기 · 기준선"
+var title_driver := "Follow-the-Gap"
 
 
 func _ready() -> void:

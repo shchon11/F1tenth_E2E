@@ -1,0 +1,23 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>C 메인</title>
+<link rel="stylesheet" href="assets/base.css"><style>
+body{background:#1a3bbf;color:#fff}
+.mark{left:96px;top:66px;font-size:30px;font-weight:800;letter-spacing:.06em}
+.top{right:96px;top:68px;font-size:26px;font-weight:600;color:rgba(255,255,255,.6);display:flex;gap:44px}
+.map{left:-120px;top:80px;width:900px;height:1080px;color:rgba(255,255,255,.07)}
+.car{left:-150px;top:250px;width:1360px}
+.menu{left:1080px;top:170px}
+.menu div{font-size:148px;font-weight:800;line-height:1.15;letter-spacing:-.02em;color:rgba(255,255,255,.34);white-space:nowrap}
+.menu .on{color:#fff}
+.menu .on:before{content:"";position:absolute;left:-78px;margin-top:70px;width:44px;height:44px;border-radius:22px;background:#ff6a1a}
+.now{left:120px;bottom:84px;display:flex;gap:64px}
+.now dt{font-size:24px;font-weight:600;color:rgba(255,255,255,.6);margin-bottom:8px}
+.now dd{font-size:36px;font-weight:800}
+</style></head><body>
+<div class="abs map" data-course="kr26"></div>
+<div class="abs mark">TENTH</div>
+<div class="abs top"><span>설정</span><span>종료</span></div>
+<img class="abs car" src="assets/carside_orange.png" alt="">
+<div class="abs menu"><div class="on">달리기</div><div>차고</div><div>코스</div><div>훈련</div><div>기록</div></div>
+<dl class="abs now"><div><dt>차</dt><dd>실차 2호</dd></div><div><dt>코스</dt><dd>2026 한국 대회장</dd></div><div><dt>드라이버</dt><dd>미르 43</dd></div></dl>
+<script src="assets/courses.js"></script><script src="assets/course.js"></script>
+</body></html>

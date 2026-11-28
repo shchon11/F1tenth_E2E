@@ -1,0 +1,178 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scripts/screens/main_menu.gd" id="1_menu"]
+[ext_resource type="Script" path="res://scripts/ui/shade.gd" id="2_shade"]
+
+[node name="MainMenu" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("1_menu")
+
+[node name="Shade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_shade")
+reach = 0.52
+
+[node name="TopShade" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 260.0
+grow_horizontal = 2
+script = ExtResource("2_shade")
+vertical = true
+reach = 1.0
+strength = 0.8
+
+[node name="Mark" type="Label" parent="."]
+layout_mode = 0
+offset_left = 96.0
+offset_top = 70.0
+offset_right = 400.0
+offset_bottom = 110.0
+theme_type_variation = &"Mark"
+text = "TENTH"
+
+[node name="Menu" type="VBoxContainer" parent="."]
+unique_name_in_owner = true
+layout_mode = 0
+offset_left = 60.0
+offset_top = 286.0
+offset_right = 390.0
+offset_bottom = 830.0
+theme_override_constants/separation = 0
+
+[node name="Run" type="Button" parent="Menu"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(330, 108)
+layout_mode = 2
+theme_type_variation = &"MenuItem"
+alignment = 0
+text = "달리기"
+
+[node name="Garage" type="Button" parent="Menu"]
+custom_minimum_size = Vector2(330, 108)
+layout_mode = 2
+theme_type_variation = &"MenuItem"
+disabled = true
+alignment = 0
+text = "차고"
+
+[node name="Courses" type="Button" parent="Menu"]
+custom_minimum_size = Vector2(330, 108)
+layout_mode = 2
+theme_type_variation = &"MenuItem"
+disabled = true
+alignment = 0
+text = "코스"
+
+[node name="Training" type="Button" parent="Menu"]
+custom_minimum_size = Vector2(330, 108)
+layout_mode = 2
+theme_type_variation = &"MenuItem"
+disabled = true
+alignment = 0
+text = "훈련"
+
+[node name="Records" type="Button" parent="Menu"]
+custom_minimum_size = Vector2(330, 108)
+layout_mode = 2
+theme_type_variation = &"MenuItem"
+disabled = true
+alignment = 0
+text = "기록"
+
+[node name="Sub" type="HBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 78.0
+offset_top = 860.0
+offset_right = 600.0
+offset_bottom = 920.0
+theme_override_constants/separation = 8
+
+[node name="Settings" type="Button" parent="Sub"]
+layout_mode = 2
+theme_type_variation = &"Word"
+disabled = true
+text = "설정"
+
+[node name="Quit" type="Button" parent="Sub"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Word"
+text = "종료"
+
+[node name="Now" type="HBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -1100.0
+offset_top = 62.0
+offset_right = -96.0
+offset_bottom = 140.0
+grow_horizontal = 0
+alignment = 2
+theme_override_constants/separation = 64
+
+[node name="Car" type="VBoxContainer" parent="Now"]
+layout_mode = 2
+
+[node name="N" type="Label" parent="Now/Car"]
+layout_mode = 2
+theme_type_variation = &"Small"
+text = "차"
+
+[node name="NowCar" type="Label" parent="Now/Car"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Value"
+text = "—"
+
+[node name="Course" type="VBoxContainer" parent="Now"]
+layout_mode = 2
+
+[node name="N" type="Label" parent="Now/Course"]
+layout_mode = 2
+theme_type_variation = &"Small"
+text = "코스"
+
+[node name="NowCourse" type="Label" parent="Now/Course"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Value"
+text = "—"
+
+[node name="Driver" type="VBoxContainer" parent="Now"]
+layout_mode = 2
+
+[node name="N" type="Label" parent="Now/Driver"]
+layout_mode = 2
+theme_type_variation = &"Small"
+text = "드라이버"
+
+[node name="NowDriver" type="Label" parent="Now/Driver"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_type_variation = &"Value"
+text = "—"
+
+[node name="Message" type="Label" parent="."]
+unique_name_in_owner = true
+layout_mode = 0
+offset_left = 96.0
+offset_top = 1100.0
+offset_right = 1800.0
+offset_bottom = 1140.0
+theme_type_variation = &"Name"
+text = ""

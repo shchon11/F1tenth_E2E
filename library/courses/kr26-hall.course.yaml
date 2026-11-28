@@ -1,0 +1,20 @@
+schema: tenth.course/1
+id: kr26-hall
+name: IFAC 2026
+summary: IFAC 2026 대회장. 대회 bag의 스캔으로 만든 지도(korea26_scan). 덕트 호스를 제자리에 다시 깔고(+duct) 벽을 매끄러운 판으로(+smooth).
+order: 1
+track: real:korea26_scan+duct
+walls: smooth
+duct_diameter: {v: 0.30, u: m, src: assumed, note: 지도에 보이는 호스 띠는 9 cm(스캔된 겉면)뿐이라 화면에는 지름 0.30 m 관으로 그림. 차와 LiDAR가 닿는 면은 호스의 차로 쪽 면 그대로}
+direction: as_mapped
+start: {at: centerline_s0, behind_m: 1.0}
+sectors: 3
+layouts:
+  saved:
+    bank: /data/compbench/banks/exam3_k26scan
+    name: exam3
+    note: 빈 코스를 달린 길 위에 상자 3개씩, 64가지. 최소 시간 경로가 0.10 m 여유로 지나갈 수 있다고 판정된 것만.
+  random:
+    refline: /data/compbench/banks/exam3_refline.npz
+    note: 기준 주행선 위에 구간마다 하나씩 무작위로 놓음. 지나갈 수 있는지는 검사하지 않음.
+trained_here: [scan31b-u475, hs43b-u900]
